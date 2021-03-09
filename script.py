@@ -11,6 +11,10 @@ import phonopy
 from ruamel.yaml import YAML
 yaml = YAML(typ='rt')
 
+from collections.abc import Sequence
+from abc import ABC, abstractmethod
+from typing import Generic, TypeVar
+T = TypeVar("T")
 
 def main():
     from ase.build import molecule
@@ -255,6 +259,7 @@ def expand_raman_by_symmetry(cachepath,
         disp_atoms,
         disp_carts,
         disp_tensors,
+        Tensor2Callbacks(),
         oper_cart_rots,
         oper_deperms,
     )
@@ -355,13 +360,37 @@ def get_deperm(
         fracs_to, fracs_from, lattice[...].T, tol,
     )
 
+class SymmetryCallbacks(ABC, Generic[T]):
+    @abstractmethod
+    def flatten(self, obj: T) -> np.ndarray:
+        raise NotImplementedError
+
+    @abstractmethod
+    def restore(self, arr: np.ndarray) -> T:
+        raise NotImplementedError
+
+    @abstractmethod
+    def rotate(self, obj: T, inv_deperm, cart_rot) -> T:
+        raise NotImplementedError
+
+class Tensor2Callbacks(SymmetryCallbacks):
+    def flatten(self, obj):
+        return obj.reshape((9,))
+
+    def restore(self, arr):
+        return arr.reshape((3, 3))
+
+    def rotate(self, obj, inv_deperm, cart_rot):
+        return _rotate_rank_2_tensor(obj, cart_rot=cart_rot)
+
 def rank_2_tensor_derivs_by_symmetry(
     disp_atoms,       # disp -> atom
     disp_carts,       # disp -> 3-vec
-    disp_tensors,     # disp -> 3x3  (displaced tensor, optionally subtracting equilibrium tensor)
+    disp_values,      # disp -> T  (displaced value, optionally minus equilibrium value)
+    callbacks,        # how to work with T
     oper_cart_rots,   # oper -> 3x3
     oper_perms,       # oper -> atom' -> atom
-):
+) -> np.ndarray:
     """
     Uses symmetry to expand finite difference data for derivatives of a rank 2 tensor.
 
@@ -371,17 +400,21 @@ def rank_2_tensor_derivs_by_symmetry(
 
     :param disp_atoms: shape (ndisp,), dtype int.  Index of the displaced atom for each displacement.
     :param disp_carts: shape (ndisp,3), dtype float.  The displacement vectors, in cartesian coords.
-    :param disp_tensors: shape (ndisp,3,3), dtype float or complex.  For each displacement, this should
-        be the quantity ``T_disp - T_eq``, where ``T_eq`` is the tensor at equilibrium and ``T_disp``
-        is the tensor after displacement.
+    :param disp_values: sequence type of length ``ndisp`` holding ``T`` objects for each displacement.
+        These are either ``T_disp - T_eq`` or ``T_disp``, where ``T_eq`` is the value at equilibrium and
+        ``T_disp`` is the value after displacement.
     :param oper_cart_rots: shape (nsym,3,3), dtype float.  For each spacegroup operator, its representation
         as a 3x3 rotation/mirror matrix that operates on column vectors containing Cartesian data.
     :param oper_perms: shape (nsym,nsite), dtype int.  For each spacegroup operator, its representation
         as a permutation that operates on site metadata.
     :return:
-        Returns a shape ``(natom, 3, 3, 3)`` ndarray with the same dtype as ``disp_tensors``,
-        where the ``(a, k)`` submatrix is the derivative of the tensor with respect to cartesian
-        component ``k`` of the displacement of atom ``a``.
+        Returns a shape ``(natom, 3)`` array of ``T`` where the item at ``(a, k)`` is the derivative of the
+        value with respect to cartesian component ``k`` of the displacement of atom ``a``.  (note that if ``T``
+        is itself an array-like type, its axes may be merged with the outer array as per the typical behavior
+        of arrays; e.g. if ``T`` is a 3x3 array you will likely get an array of shape ``(natom, 3, 3, 3)``)
+
+    ..note::
+        This function is serial and requires a process to have access to data for all atoms.
 
     ..note::
         This function does not require any assumptions of periodicity and should work equally well
@@ -413,7 +446,7 @@ def rank_2_tensor_derivs_by_symmetry(
         to the original ``carts``.
     """
 
-    assert len(disp_carts) == len(disp_atoms) == len(disp_tensors)
+    assert len(disp_carts) == len(disp_atoms) == len(disp_values)
     assert len(oper_cart_rots) == len(oper_perms)
 
     # Proper way to apply data permutations to sparse indices
@@ -436,9 +469,9 @@ def rank_2_tensor_derivs_by_symmetry(
                 continue  # not site-symmetry oper
 
             for disp in representative_disps[representative]:
-                rotated = _rotate_rank_2_tensor(disp_tensors[disp], cart_rot=cart_rot)
+                rotated = callbacks.rotate(disp_values[disp], inv_deperm=oper_inv_perms[oper], cart_rot=cart_rot)
                 eq_cart_disps.append(cart_rot @ disp_carts[disp])
-                eq_rhses.append(rotated.reshape([9]))  # flattened tensor
+                eq_rhses.append(callbacks.flatten(rotated))  # flattened tensor
 
         # Solve for Q in the overconstrained system   eq_cart_disps   Q   = eq_rhses
         #                                                (?x3)      (3x9) =  (?x9)
@@ -446,7 +479,7 @@ def rank_2_tensor_derivs_by_symmetry(
         # The columns of Q are the cartesian gradients of each tensor component
         # with respect to the representative atom.
         solved = np.linalg.pinv(eq_cart_disps) @ np.array(eq_rhses)
-        return solved.reshape((3, 3, 3))
+        return np.array([callbacks.restore(x) for x in solved])
 
     # atom -> 3x3x3 tensor where last two indices index the tensor.
     # I.e. atom,i,j,k -> partial T_jk / partial x_(atom,i)
@@ -454,10 +487,18 @@ def rank_2_tensor_derivs_by_symmetry(
 
     # Compute derivatives with respect to other atoms by symmetry
     for representative in representative_disps:
+        # Find which representative is related to this atom, and any symmetry operation that will send it here
         for oper, cart_rot in enumerate(oper_cart_rots):
             site = permute_index(oper, representative)
             if site not in site_derivatives:
-                site_derivatives[site] = _rotate_rank_3_tensor(site_derivatives[representative], cart_rot)
+                # Apply the rotation to the inner dimensions of the gradient (i.e. rotate each T)
+                t_derivs_by_axis = [callbacks.rotate(deriv, oper_inv_perms[oper], cart_rot) for deriv in site_derivatives[representative]]
+                # Apply the rotation to the outer axis of the gradient
+                array_derivs_by_axis = [callbacks.flatten(t) for t in t_derivs_by_axis]
+                array_derivs_by_axis = cart_rot @ array_derivs_by_axis
+                t_derivs_by_axis = [callbacks.restore(arr) for arr in array_derivs_by_axis]
+
+                site_derivatives[site] = t_derivs_by_axis
 
     # site_derivatives is now dense, so change to ndarray
     missing_indices = set(range(len(site_derivatives))) - set(site_derivatives)
