@@ -7,6 +7,7 @@ import os
 import numpy as np
 from ase.parallel import parprint, world
 import ase
+import gpaw
 import phonopy
 from ruamel.yaml import YAML
 yaml = YAML(typ='rt')
@@ -15,6 +16,7 @@ from collections.abc import Sequence
 from abc import ABC, abstractmethod
 from typing import Generic, TypeVar
 T = TypeVar("T")
+
 
 def main():
     from ase.build import molecule
@@ -370,7 +372,7 @@ class SymmetryCallbacks(ABC, Generic[T]):
         raise NotImplementedError
 
     @abstractmethod
-    def rotate(self, obj: T, inv_deperm, cart_rot) -> T:
+    def rotate(self, obj: T, sym: int, cart_rot) -> T:
         raise NotImplementedError
 
 class Tensor2Callbacks(SymmetryCallbacks):
@@ -380,8 +382,71 @@ class Tensor2Callbacks(SymmetryCallbacks):
     def restore(self, arr):
         return arr.reshape((3, 3))
 
-    def rotate(self, obj, inv_deperm, cart_rot):
+    def rotate(self, obj, sym, cart_rot):
         return _rotate_rank_2_tensor(obj, cart_rot=cart_rot)
+
+class GpawArrayDictCallbacks(SymmetryCallbacks):
+    """ Callbacks for a gpaw ``ArrayDict``. """
+    def __self__(self):
+        # A copy of one of the arraydicts so that we have access to the correct communicator, partition,
+        # and array shapes when unflattening data.
+        self.template_arraydict = None
+
+    def flatten(self, obj):
+        import gpaw
+        assert isinstance(obj, gpaw.arraydict.ArrayDict)
+
+        # FIXME: proper way to check this?
+        if len(obj) != obj.partition.natoms:
+            if len(obj) > 0:
+                raise RuntimeError('symmetry expansion must be done in serial; try arr.redistribute(arr.partition.as_serial())')
+            else:
+                raise RuntimeError('symmetry expansion must only be done on root node')
+
+        if self.template_arraydict is None:
+            self.template_arraydict = obj.copy()
+        else:
+            assert np.all(self.template_arraydict.shapes_a == obj.shapes_a), "instance of {} cannot be reused for different ArrayDicts".format(type(self).__name__)
+
+        return np.concatenate([a.reshape(-1) for a in obj.values()])
+
+    def restore(self, arr):
+        sizes = [np.product(shape) for shape in self.template_arraydict.shapes_a]
+        splits = np.cumsum(sizes)[:-1]
+        arrs_a = np.split(arr, splits)
+
+        out_a = self.template_arraydict.copy()
+        for a in range(out_a.partition.natoms):
+            out_a[a][...] = arrs_a[a].reshape(out_a.shapes_a[a])
+        return out_a
+
+class GpawLcaoDHCallbacks(GpawArrayDictCallbacks):
+    """ Callbacks for ``calc.hamiltonian.dH_asp`` in GPAW LCAO mode. """
+    def __init__(self, wfs_with_symmetry: gpaw.setup.Setups):
+        self.wfs = wfs_with_symmetry
+
+    def rotate(self, obj, sym, cart_rot):
+        from gpaw.utilities import pack, unpack2
+
+        # FIXME: It's *possible* that this is actually applying the inverse of sym instead of sym itself.
+        #        It's hard for me to tell since it would not ultimately impact program output, and the conventions
+        #        for how gpaw's a_sa and R_sii are stored are unclear to me.
+
+        dH_asp = obj
+        out_asp = obj.copy()
+        a_a = self.wfs.kd.symmetry.a_sa[sym]
+
+        for adest in dH_asp.keys():
+            asrc = a_a[adest]
+            R_ii = self.wfs.setups[adest].R_sii[sym]
+            for s in range(self.wfs.nspins):
+                dH_p = dH_asp[asrc][s]
+                dH_ii = unpack2(dH_p)
+                tmp_ii = R_ii @ dH_ii @ R_ii.T
+                tmp_p = pack(tmp_ii)
+                out_asp[adest][s][...] = tmp_p
+
+        return out_asp
 
 def rank_2_tensor_derivs_by_symmetry(
     disp_atoms,       # disp -> atom
@@ -469,7 +534,7 @@ def rank_2_tensor_derivs_by_symmetry(
                 continue  # not site-symmetry oper
 
             for disp in representative_disps[representative]:
-                rotated = callbacks.rotate(disp_values[disp], inv_deperm=oper_inv_perms[oper], cart_rot=cart_rot)
+                rotated = callbacks.rotate(disp_values[disp], oper, cart_rot=cart_rot)
                 eq_cart_disps.append(cart_rot @ disp_carts[disp])
                 eq_rhses.append(callbacks.flatten(rotated))  # flattened tensor
 
