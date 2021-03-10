@@ -13,6 +13,7 @@ import ase.build
 import gpaw
 from gpaw import GPAW
 from gpaw.cluster import Cluster
+from gpaw.lrtddft import LrTDDFT
 
 from ruamel.yaml import YAML
 yaml = YAML(typ='rt')
@@ -81,7 +82,6 @@ def main__raman_ch4(log):
     from ase.build import molecule
 
     from gpaw.lrtddft.spectrum import polarizability
-    from gpaw.lrtddft import LrTDDFT
 
     from gpaw.cluster import Cluster
     from gpaw import GPAW, FermiDirac
@@ -130,11 +130,9 @@ def main__raman_ch4(log):
 
     # ----------
     # Excitation settings (for polarizability)
-    ex_constructor = functools.partial(LrTDDFT.read, restrict={'jend':num_converged_bands-1})
+    ex_kw = {'restrict': {'jend':num_converged_bands-1}}
     omega = 5.0 # eV
-    get_polarizability = lambda fname: polarizability(
-        ex_constructor(fname), omega=omega, form='v', tensor=True,
-    )
+    get_polarizability = functools.partial(polarizability, omega=omega, form='v', tensor=True)
     subtract_equilibrium_polarizability = False
 
     # for testing purposes
@@ -169,14 +167,14 @@ def main__raman_ch4(log):
 
     force_sets = make_force_sets_and_excitations(cachepath='force-sets.npy',
             disp_filenames=disp_filenames, phonon=phonon,
-            atoms=eq_atoms, ex_constructor=ex_constructor,
+            atoms=eq_atoms, ex_kw=ex_kw,
     )
     phonon.set_forces(force_sets)
 
     # Applying symmetry
     cart_pol_derivs = expand_raman_by_symmetry(cachepath='raman-cart.npy',
             phonon=phonon,
-            disp_filenames=disp_filenames, get_polarizability=get_polarizability,
+            disp_filenames=disp_filenames, get_polarizability=get_polarizability, ex_kw=ex_kw,
             subtract_equilibrium_polarizability=subtract_equilibrium_polarizability,
     )
 
@@ -199,7 +197,7 @@ def main__raman_ch4(log):
 
         get_mode_raman_brute_force(
             eigendata=gamma_eigendata, atoms=eq_atoms, displacement_distance=displacement_distance,
-            get_polarizability=get_polarizability, ex_constructor=ex_constructor,
+            get_polarizability=get_polarizability, ex_kw=ex_kw,
         )
 
 # ==================================
@@ -238,7 +236,7 @@ def get_minimum_displacements(cachepath, structure_path, supercell_matrix, displ
     return phonopy.load(cachepath, produce_fc=False)
 
 
-def make_force_sets_and_excitations(cachepath, disp_filenames, phonon, atoms, ex_constructor):
+def make_force_sets_and_excitations(cachepath, disp_filenames, phonon, atoms, ex_kw):
     if os.path.exists(cachepath):
         parprint(f'Found existing {cachepath}')
         return np.load(cachepath)
@@ -262,7 +260,7 @@ def make_force_sets_and_excitations(cachepath, disp_filenames, phonon, atoms, ex
         atoms.set_positions(disp_atoms.get_positions())
 
         disp_forces = atoms.get_forces()
-        ex = ex_constructor(atoms.calc)
+        ex = LrTDDFT(atoms.calc, **ex_kw)
         if disp_kind == 'eq':
             # For inspecting the impact of differences in the calculator
             # between ionic relaxation and raman computation.
@@ -286,6 +284,7 @@ def expand_raman_by_symmetry(cachepath,
                              phonon,
                              disp_filenames,
                              get_polarizability,
+                             ex_kw,
                              subtract_equilibrium_polarizability):
     if os.path.exists(cachepath):
         parprint(f'Found existing {cachepath}')
@@ -311,11 +310,11 @@ def expand_raman_by_symmetry(cachepath,
     oper_deperms = np.array(oper_deperms)
 
     disp_tensors = np.array([
-        get_polarizability(disp_filenames['ex']['disp'].format(i))
+        get_polarizability(LrTDDFT.read(disp_filenames['ex']['disp'].format(i), **ex_kw))
         for i in range(len(disp_atoms))
     ])
     if subtract_equilibrium_polarizability:
-        disp_tensors -= get_polarizability(disp_filenames['ex']['eq'])
+        disp_tensors -= get_polarizability(LrTDDFT.read(disp_filenames['ex']['eq'], **ex_kw))
 
     pol_derivs = rank_2_tensor_derivs_by_symmetry(
         disp_atoms,
@@ -375,7 +374,7 @@ def get_mode_raman(outpath, eigendata, cart_pol_derivs):
 
 
 # For testing purposes: Compute raman by getting polarizability at +/- displacements along mode
-def get_mode_raman_brute_force(eigendata, atoms, displacement_distance, get_polarizability, ex_constructor):
+def get_mode_raman_brute_force(eigendata, atoms, displacement_distance, get_polarizability, ex_kw):
     if os.path.exists('mode-raman-gamma-expected.npy'):
         parprint('Found existing mode-raman-gamma-expected.npy')
         return
@@ -390,13 +389,15 @@ def get_mode_raman_brute_force(eigendata, atoms, displacement_distance, get_pola
 
         atoms.set_positions(eq_positions + mode_displacements * displacement_distance)
         atoms.get_forces()
-        ex_constructor(atoms.calc).write(f'mode-raman-{i}+.ex.gz')
-        pol_plus = get_polarizability(f'mode-raman-{i}+.ex.gz')
+        # FIXME: These seemingly redundant reads served a purpose at some point but I never documented it.
+        #        Now that LrTDDFT has this "redesigned API" they might not even do anything at all? Test this.
+        LrTDDFT(atoms.calc, **ex_kw).write(f'mode-raman-{i}+.ex.gz')
+        pol_plus = get_polarizability(LrTDDFT.read(f'mode-raman-{i}+.ex.gz', **ex_kw))
 
         atoms.set_positions(eq_positions - mode_displacements * displacement_distance)
         atoms.get_forces()
-        ex_constructor(atoms.calc).write(f'mode-raman-{i}-.ex.gz')
-        pol_minus = get_polarizability(f'mode-raman-{i}-.ex.gz')
+        LrTDDFT(atoms.calc, **ex_kw).write(f'mode-raman-{i}-.ex.gz')
+        pol_minus = get_polarizability(LrTDDFT.read(f'mode-raman-{i}-.ex.gz', **ex_kw))
 
         mode_pol_derivs.append((pol_plus - pol_minus)/(2*displacement_distance))
 
