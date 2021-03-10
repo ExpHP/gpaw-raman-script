@@ -25,22 +25,25 @@ T = TypeVar("T")
 def main():
     if sys.argv[1] == 'diamond':
         # Run new script
-        with paropen('gpaw.log', 'a') as logfile:
-            parprint(file=logfile)
-            parprint('=====================================', file=logfile)
-            parprint('===', datetime.now().isoformat(), file=logfile)
-            main__elph_diamond(log=Tee(logfile, sys.stdout))
+        with start_log_entry('gpaw.log') as log:
+            main__elph_diamond(log=log)
         return
     if sys.argv[1] == 'ch4':
         # Old script is still here so that we can maintain it and work towards
         # factoring out commonalities with the new script.
-        main__raman_ch4()
+        with start_log_entry('gpaw.log') as log:
+            main__raman_ch4(log=log)
         return
     assert False, 'invalid test {}'.format(sys.argv[1])
 
+def start_log_entry(path):
+    logfile = paropen(path, 'a')
+    parprint(file=logfile)
+    parprint('=====================================', file=logfile)
+    parprint('===', datetime.now().isoformat(), file=logfile)
+    return Tee(logfile, sys.stdout)
 
 def main__elph_diamond(log):
-
     from gpaw.elph.electronphonon import ElectronPhononCoupling
     from gpaw.lrtddft.spectrum import polarizability
     from gpaw.lrtddft import LrTDDFT
@@ -74,7 +77,7 @@ def main__elph_diamond(log):
         elph.run()
         return
 
-def main__raman_ch4():
+def main__raman_ch4(log):
     from ase.build import molecule
 
     from gpaw.lrtddft.spectrum import polarizability
@@ -99,6 +102,7 @@ def main__raman_ch4():
     make_calc = functools.partial(GPAW,
             occupations=FermiDirac(width=0.1),
             symmetry={'point_group': False},
+            txt=log,
     )
 
     # Relaxation settings
@@ -126,7 +130,7 @@ def main__raman_ch4():
 
     # ----------
     # Excitation settings (for polarizability)
-    ex_constructor = functools.partial(LrTDDFT, jend=num_converged_bands-1)
+    ex_constructor = functools.partial(LrTDDFT.read, restrict={'jend':num_converged_bands-1})
     omega = 5.0 # eV
     get_polarizability = lambda fname: polarizability(
         ex_constructor(fname), omega=omega, form='v', tensor=True,
@@ -662,17 +666,26 @@ def phonopy_atoms_to_ase(atoms):
     return atoms
 
 class Tee :
-    def __init__(self, _fd1, _fd2) :
-        self.fd1 = _fd1
-        self.fd2 = _fd2
+    def __init__(self, *fds):
+        self.fds = fds
 
-    def write(self, text) :
-        self.fd1.write(text)
-        self.fd2.write(text)
+    def write(self, text):
+        for fd in self.fds:
+            fd.write(text)
 
-    def flush(self) :
-        self.fd1.flush()
-        self.fd2.flush()
+    def flush(self):
+        for fd in self.fds:
+            fd.flush()
+
+    def __enter__(self, *args, **kw):
+        for fd in self.fds:
+            if fd not in [sys.stdout, sys.stderr]:
+                fd.__enter__(*args, **kw)
+
+    def __exit__(self, *args, **kw):
+        for fd in self.fds:
+            if fd not in [sys.stdout, sys.stderr]:
+                fd.__exit__(*args, **kw)
 
 if __name__ == '__main__':
     main()
