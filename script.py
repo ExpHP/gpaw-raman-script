@@ -3,12 +3,17 @@
 import functools
 from collections import defaultdict
 import os
+import sys
 
+from datetime import datetime
 import numpy as np
-from ase.parallel import parprint, world
-import ase
-import gpaw
+from ase.parallel import parprint, paropen, world
 import phonopy
+import ase.build
+import gpaw
+from gpaw import GPAW
+from gpaw.cluster import Cluster
+
 from ruamel.yaml import YAML
 yaml = YAML(typ='rt')
 
@@ -17,8 +22,59 @@ from abc import ABC, abstractmethod
 from typing import Generic, TypeVar
 T = TypeVar("T")
 
-
 def main():
+    if sys.argv[1] == 'diamond':
+        # Run new script
+        with paropen('gpaw.log', 'a') as logfile:
+            parprint(file=logfile)
+            parprint('=====================================', file=logfile)
+            parprint('===', datetime.now().isoformat(), file=logfile)
+            main__elph_diamond(log=Tee(logfile, sys.stdout))
+        return
+    if sys.argv[1] == 'ch4':
+        # Old script is still here so that we can maintain it and work towards
+        # factoring out commonalities with the new script.
+        main__raman_ch4()
+        return
+    assert False, 'invalid test {}'.format(sys.argv[1])
+
+
+def main__elph_diamond(log):
+
+    from gpaw.elph.electronphonon import ElectronPhononCoupling
+    from gpaw.lrtddft.spectrum import polarizability
+    from gpaw.lrtddft import LrTDDFT
+
+    from gpaw import GPAW, FermiDirac
+
+    atoms = Cluster(ase.build.bulk('C'))
+
+    params_fd = dict(
+        mode='lcao',
+        symmetry={"point_group": False},
+        nbands = "nao",
+        convergence={"bands":"all"},
+        basis='dzp',
+        h = 0.25,  # large for faster testing
+        # NOTE: normally kpt parallelism is better, but in this script we have code
+        #       that has to deal with domain parallelization, and so we need to test it
+        parallel = {'domain': world.size },
+        # occupations=FermiDirac(width=0.05),
+        # kpts={'size': (kx_gs, ky_gs,1), 'gamma': True},
+        xc='PBE',
+    )
+    supercell = (2, 2, 2)
+    params_fd_sym = dict(params_fd)
+    params_fd_sym['point_group'] = True
+
+    # BRUTE FORCE
+    if True:
+        calc_fd = GPAW(txt=log, **params_fd)
+        elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell, calculate_forces=True)
+        elph.run()
+        return
+
+def main__raman_ch4():
     from ase.build import molecule
 
     from gpaw.lrtddft.spectrum import polarizability
@@ -604,6 +660,19 @@ def phonopy_atoms_to_ase(atoms):
         cell=atoms.get_cell(),
     )
     return atoms
+
+class Tee :
+    def __init__(self, _fd1, _fd2) :
+        self.fd1 = _fd1
+        self.fd2 = _fd2
+
+    def write(self, text) :
+        self.fd1.write(text)
+        self.fd2.write(text)
+
+    def flush(self) :
+        self.fd1.flush()
+        self.fd2.flush()
 
 if __name__ == '__main__':
     main()
