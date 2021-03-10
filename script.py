@@ -106,7 +106,7 @@ def main__raman_ch4(log):
     )
 
     # Relaxation settings
-    make_calc_relax = functools.partial(GPAW,
+    make_calc_relax = functools.partial(make_calc,
             h=relax_grid_sep,
     )
 
@@ -668,7 +668,7 @@ def phonopy_atoms_to_ase(atoms):
 
 class Tee :
     def __init__(self, *fds):
-        self.fds = fds
+        self.fds = list(fds)
 
     def write(self, text):
         for fd in self.fds:
@@ -678,14 +678,18 @@ class Tee :
         for fd in self.fds:
             fd.flush()
 
+    def closed(self):
+        return False
+
     def __enter__(self, *args, **kw):
-        for fd in self.fds:
-            if fd not in [sys.stdout, sys.stderr]:
-                fd.__enter__(*args, **kw)
+        for i, fd in enumerate(self.fds):
+            if fd not in [sys.stdout, sys.stderr] and hasattr(fd, '__enter__'):
+                self.fds[i] = self.fds[i].__enter__(*args, **kw)
+        return self
 
     def __exit__(self, *args, **kw):
         for fd in self.fds:
-            if fd not in [sys.stdout, sys.stderr]:
+            if fd not in [sys.stdout, sys.stderr] and hasattr(fd, '__exit__'):
                 fd.__exit__(*args, **kw)
 
 if __name__ == '__main__':
