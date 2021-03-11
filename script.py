@@ -14,6 +14,7 @@ import gpaw
 from gpaw import GPAW
 from gpaw.cluster import Cluster
 from gpaw.lrtddft import LrTDDFT
+import pickle
 
 from ruamel.yaml import YAML
 yaml = YAML(typ='rt')
@@ -24,18 +25,28 @@ from typing import Generic, TypeVar
 T = TypeVar("T")
 
 def main():
-    if sys.argv[1] == 'diamond':
-        # Run new script
-        with start_log_entry('gpaw.log') as log:
-            main__elph_diamond(log=log)
-        return
-    if sys.argv[1] == 'ch4':
-        # Old script is still here so that we can maintain it and work towards
-        # factoring out commonalities with the new script.
-        with start_log_entry('gpaw.log') as log:
-            main__raman_ch4(log=log)
-        return
-    assert False, 'invalid test {}'.format(sys.argv[1])
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    subs = parser.add_subparsers()
+
+    parser.set_defaults(func=lambda args, log: parser.error('missing test name'))
+
+    # New script
+    p = subs.add_parser('diamond')
+    p.add_argument('--brute', dest='action', action='store_const', const='brute')
+    p.add_argument('--symmetry-test', dest='action', action='store_const', const='symmetry-test')
+    p.set_defaults(func=lambda args, log: main__elph_diamond(action=args.action, log=log))
+
+    # Old script is still here so that we can maintain it and work towards
+    # factoring out commonalities with the new script.
+    p = subs.add_parser('ch4')
+    p.set_defaults(func=lambda args, log: main__raman_ch4(log=log))
+
+    args = parser.parse_args()
+
+    with start_log_entry('gpaw.log') as log:
+        args.func(args, log)
 
 def start_log_entry(path):
     logfile = paropen(path, 'a')
@@ -44,7 +55,7 @@ def start_log_entry(path):
     parprint('===', datetime.now().isoformat(), file=logfile)
     return Tee(logfile, sys.stdout)
 
-def main__elph_diamond(log):
+def main__elph_diamond(action, log):
     from gpaw.elph.electronphonon import ElectronPhononCoupling
     from gpaw.lrtddft.spectrum import polarizability
     from gpaw.lrtddft import LrTDDFT
@@ -72,11 +83,78 @@ def main__elph_diamond(log):
     params_fd_sym['point_group'] = True
 
     # BRUTE FORCE
-    if True:
+    if action == 'brute':
         calc_fd = GPAW(txt=log, **params_fd)
         elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell, calculate_forces=True)
         elph.run()
         return
+
+    if action == 'symmetry-test':
+        # a supercell exactly like ElectronPhononCoupling makes
+        supercell_atoms = atoms * supercell
+
+        def get_wfs_with_sym():
+            # Make a supercell exactly like ElectronPhononCoupling makes, but with point_group = True
+            params_fd_sym = dict(params_fd)
+            if 'symmetry' not in params_fd_sym:
+                params_fd_sym['symmetry'] = dict(GPAW.default_parameters['symmetry'])
+            params_fd_sym['symmetry']['point_group'] = True
+
+            calc_fd_sym = GPAW(txt=log, **params_fd)
+            dummy_supercell_atoms = supercell_atoms.copy()
+            dummy_supercell_atoms.calc = calc_fd_sym
+            calc_fd_sym._set_atoms(dummy_supercell_atoms)  # FIXME private method
+            calc_fd_sym.initialize()
+            calc_fd_sym.set_positions(dummy_supercell_atoms)
+            return calc_fd_sym.wfs
+        wfs_with_sym = get_wfs_with_sym()
+
+        calc_fd = GPAW(txt=log, **params_fd)
+
+        elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell, calculate_forces=True)
+
+        def read_elph(path):
+            from gpaw.arraydict import ArrayDict
+
+            array_0, arr_dic = pickle.load(open(path, 'rb'))
+            atom_partition = wfs_with_sym.atom_partition
+            arr_dic = ArrayDict(
+                partition=atom_partition,
+                shapes_a=[arr_dic[a].shape for a in range(atom_partition.natoms)],
+                dtype=arr_dic[0].dtype,
+                d={a:arr_dic[a] for a in atom_partition.my_indices},
+            )
+            arr_dic.redistribute(atom_partition.as_serial())
+            return array_0, arr_dic
+
+        get_displaced_index = lambda prim_atom: elph.offset + prim_atom
+        disp_atoms = [
+            get_displaced_index(0),
+            get_displaced_index(0),
+        ]
+        disp_carts = [
+            np.array([+1e02, 0, 0]),
+            np.array([-1e02, 0, 0]),
+        ]
+
+        disp_values = [
+            read_elph('elph.0x+.pckl')[1],
+            read_elph('elph.0x-.pckl')[1],
+        ]
+
+        lattice = supercell_atoms.get_cell()[...]
+        oper_cart_rots = np.einsum('ki,slk,jl->sij', lattice, wfs_with_sym.kd.symmetry.op_scc, np.linalg.inv(lattice))
+        if world.rank == 0:
+            full_values = rank_2_tensor_derivs_by_symmetry(
+                disp_atoms,       # disp -> atom
+                disp_carts,       # disp -> 3-vec
+                disp_values,      # disp -> T  (displaced value, optionally minus equilibrium value)
+                GpawLcaoDHCallbacks(wfs_with_sym),        # how to work with T
+                oper_cart_rots,   # oper -> 3x3
+                oper_perms=wfs_with_sym.kd.symmetry.a_sa,       # oper -> atom' -> atom
+            )
+            pickle.dump(full_values, open('elph-full.pckl', 'wb'), protocol=2)
+
 
 def main__raman_ch4(log):
     from ase.build import molecule
@@ -448,7 +526,7 @@ class Tensor2Callbacks(SymmetryCallbacks):
 
 class GpawArrayDictCallbacks(SymmetryCallbacks):
     """ Callbacks for a gpaw ``ArrayDict``. """
-    def __self__(self):
+    def __init__(self):
         # A copy of one of the arraydicts so that we have access to the correct communicator, partition,
         # and array shapes when unflattening data.
         self.template_arraydict = None
@@ -483,7 +561,8 @@ class GpawArrayDictCallbacks(SymmetryCallbacks):
 
 class GpawLcaoDHCallbacks(GpawArrayDictCallbacks):
     """ Callbacks for ``calc.hamiltonian.dH_asp`` in GPAW LCAO mode. """
-    def __init__(self, wfs_with_symmetry: gpaw.setup.Setups):
+    def __init__(self, wfs_with_symmetry: gpaw.wavefunctions.base.WaveFunctions):
+        super().__init__()
         self.wfs = wfs_with_symmetry
 
     def rotate(self, obj, sym, cart_rot):
@@ -534,10 +613,12 @@ def rank_2_tensor_derivs_by_symmetry(
     :param oper_perms: shape (nsym,nsite), dtype int.  For each spacegroup operator, its representation
         as a permutation that operates on site metadata.
     :return:
-        Returns a shape ``(natom, 3)`` array of ``T`` where the item at ``(a, k)`` is the derivative of the
-        value with respect to cartesian component ``k`` of the displacement of atom ``a``.  (note that if ``T``
-        is itself an array-like type, its axes may be merged with the outer array as per the typical behavior
-        of arrays; e.g. if ``T`` is a 3x3 array you will likely get an array of shape ``(natom, 3, 3, 3)``)
+        Returns a shape ``(natom, 3)`` array of ``T`` where the item at ``(a, k)`` is the derivative of
+        the value with respect to cartesian component ``k`` of the displacement of atom ``a``.
+        Note that the output is *always* 2-dimensional with ``dtype=object``, even if ``T`` is an array type.
+        (so the output may be an array of arrays).  This is done because numpy's overly eager array detection
+        could easily lead to data loss if allowed to run unchecked on ``T``.  If you want to reconstruct a
+        single array, try ``np.array(output.tolist()).tolist()``.
 
     ..note::
         This function is serial and requires a process to have access to data for all atoms.
@@ -605,7 +686,10 @@ def rank_2_tensor_derivs_by_symmetry(
         # The columns of Q are the cartesian gradients of each tensor component
         # with respect to the representative atom.
         solved = np.linalg.pinv(eq_cart_disps) @ np.array(eq_rhses)
-        return np.array([callbacks.restore(x) for x in solved])
+        assert len(solved) == 3
+
+        # Important not to use array() here because this contains values of type T.
+        return [callbacks.restore(x) for x in solved]
 
     # atom -> 3x3x3 tensor where last two indices index the tensor.
     # I.e. atom,i,j,k -> partial T_jk / partial x_(atom,i)
@@ -618,7 +702,7 @@ def rank_2_tensor_derivs_by_symmetry(
             site = permute_index(oper, representative)
             if site not in site_derivatives:
                 # Apply the rotation to the inner dimensions of the gradient (i.e. rotate each T)
-                t_derivs_by_axis = [callbacks.rotate(deriv, oper_inv_perms[oper], cart_rot) for deriv in site_derivatives[representative]]
+                t_derivs_by_axis = [callbacks.rotate(deriv, oper, cart_rot) for deriv in site_derivatives[representative]]
                 # Apply the rotation to the outer axis of the gradient
                 array_derivs_by_axis = [callbacks.flatten(t) for t in t_derivs_by_axis]
                 array_derivs_by_axis = cart_rot @ array_derivs_by_axis
@@ -626,11 +710,16 @@ def rank_2_tensor_derivs_by_symmetry(
 
                 site_derivatives[site] = t_derivs_by_axis
 
-    # site_derivatives is now dense, so change to ndarray
-    missing_indices = set(range(len(site_derivatives))) - set(site_derivatives)
+    # site_derivatives should now be dense
+    natoms = len(site_derivatives)
+    missing_indices = set(range(natoms)) - set(site_derivatives)
     if missing_indices:
         raise RuntimeError(f'no displaced atoms were symmetrically equivalent to index {next(iter(missing_indices))}!')
-    return np.array([site_derivatives[i] for i in range(len(site_derivatives))])
+
+    # Convert to array, in a manner that prevents numpy from detecting the dimensions of T.
+    final_out = np.empty((natoms, 3), dtype=object)
+    final_out[...] = [site_derivatives[i] for i in range(len(site_derivatives))]
+    return final_out
 
 def _rotate_rank_2_tensor(tensor, cart_rot):
     assert tensor.shape == (3, 3)
