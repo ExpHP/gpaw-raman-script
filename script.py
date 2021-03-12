@@ -734,8 +734,8 @@ def expand_derivs_by_symmetry(
         The displacements chosen by `Phonopy <https://phonopy.github.io/phonopy/>` meet this criterion.
 
     ..note::
-        The precise definition of the permutations is as follows: Suppose that you have an
-        array of coordinates ``carts`` (shape ``(nsite,3)``) and an array of data ``data`` (shape ``(nsite,)``).
+        The precise definition of the permutations is as follows: Suppose that you have an array of
+        atom coordinates ``carts`` (shape ``(nsite,3)``) and an array of data ``data`` (shape ``(nsite,)``).
         Then, for any given spacegroup operation with rotation ``rot``, translation ``trans``, and permutation ``perm`,
         pairing ``carts @ rot.T + trans`` with ``data`` should produce a scenario equivalent to pairing ``carts``
         with ``data[perm]`` (using `integer array indexing <https://numpy.org/doc/stable/reference/arrays.indexing.html#integer-array-indexing>`).
@@ -747,6 +747,8 @@ def expand_derivs_by_symmetry(
         to the original ``carts``.
     """
 
+    # FIXME too many local variables visible in this function
+
     assert len(disp_carts) == len(disp_atoms) == len(disp_values)
     assert len(oper_cart_rots) == len(oper_perms)
 
@@ -757,7 +759,7 @@ def expand_derivs_by_symmetry(
 
     # For each representative atom that gets displaced, gather all of its displacements.
     representative_disps = defaultdict(list)
-    for (disp, representative) in enumerate(disp_atoms):
+    for (disp, representative) in enumerate(disp_atoms):   # FIXME: scope of these variables is uncomfortably large
         representative_disps[representative].append(disp)
 
     if quotient_perms is None:
@@ -784,6 +786,7 @@ def expand_derivs_by_symmetry(
             cart_rot = oper_cart_rots[combined_op.oper]
             for disp in representative_disps[representative]:
                 transformed = apply_combined_oper(disp_values[disp], combined_op)
+
                 eq_cart_disps.append(cart_rot @ disp_carts[disp])
                 eq_rhses.append(callbacks.flatten(transformed))
 
@@ -813,10 +816,16 @@ def expand_derivs_by_symmetry(
         # We'll just apply the first operator that sends us here
         rep = sym_info.data[atom].rep
         combined_op = sym_info.data[atom].operators[0]
-        site_derivatives[atom] = [
-            apply_combined_oper(derivative, combined_op)
-            for derivative in site_derivatives[rep]
-        ]
+
+        # Apply the rotation to the inner dimensions of the gradient (i.e. rotate each T)
+        t_derivs_by_axis = [apply_combined_oper(deriv, combined_op) for deriv in site_derivatives[rep]]
+
+        # Apply the rotation to the outer axis of the gradient (i.e. for each scalar element of T, rotate its gradient)
+        array_derivs_by_axis = [callbacks.flatten(t) for t in t_derivs_by_axis]
+        array_derivs_by_axis = oper_cart_rots[combined_op.oper] @ array_derivs_by_axis
+        t_derivs_by_axis = [callbacks.restore(arr) for arr in array_derivs_by_axis]
+
+        site_derivatives[atom] = t_derivs_by_axis
 
     # site_derivatives should now be dense
     assert set(range(natoms)) == set(site_derivatives)
@@ -882,7 +891,7 @@ class PrecomputedSymmetryIndexInfo:
 
             for quotient in range(len(quotient_inv_deperms)):
                 for oper in range(len(oper_inv_deperms)):
-                    # find the site that rep gets sent to
+                    # Find the site that rep gets sent to
                     site = oper_inv_deperms[oper][rep]
                     site = quotient_inv_deperms[quotient][site]
                     if site not in from_reps:
