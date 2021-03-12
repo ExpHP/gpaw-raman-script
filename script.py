@@ -148,7 +148,7 @@ def main__elph_diamond(action, log):
         lattice = supercell_atoms.get_cell()[...]
         oper_cart_rots = np.einsum('ki,slk,jl->sij', lattice, wfs_with_sym.kd.symmetry.op_scc, np.linalg.inv(lattice))
         if world.rank == 0:
-            full_values = rank_2_tensor_derivs_by_symmetry(
+            full_values = expand_derivs_by_symmetry(
                 disp_atoms,       # disp -> atom
                 disp_carts,       # disp -> 3-vec
                 disp_values,      # disp -> T  (displaced value, optionally minus equilibrium value)
@@ -398,7 +398,7 @@ def expand_raman_by_symmetry(cachepath,
     if subtract_equilibrium_polarizability:
         disp_tensors -= get_polarizability(LrTDDFT.read(disp_filenames['ex']['eq'], **ex_kw))
 
-    pol_derivs = rank_2_tensor_derivs_by_symmetry(
+    pol_derivs = expand_derivs_by_symmetry(
         disp_atoms,
         disp_carts,
         disp_tensors,
@@ -612,7 +612,7 @@ class GpawLcaoDHCallbacks(GpawArrayDictCallbacks):
 
         return out_asp
 
-def rank_2_tensor_derivs_by_symmetry(
+def expand_derivs_by_symmetry(
     disp_atoms,       # disp -> atom
     disp_carts,       # disp -> 3-vec
     disp_values,      # disp -> T  (displaced value, optionally minus equilibrium value)
@@ -622,11 +622,17 @@ def rank_2_tensor_derivs_by_symmetry(
     quotient_perms=None,   # oper -> atom' -> atom
 ) -> np.ndarray:
     """
-    Uses symmetry to expand finite difference data for derivatives of a rank 2 tensor.
+    Generic function that uses symmetry to expand finite difference data for derivatives of any
+    kind of data structure ``T``.
 
-    This takes data computed about a rank 2 tensor at a small number of displaced structures that
-    are distinct under symmetry, and applies the symmetry operators in the spacegroup to compute
-    derivatives with respect to all cartesian coordinates of all atoms in the structure.
+    This takes data computed at a small number of displaced structures that are distinct under
+    symmetry, and applies the symmetry operators in the spacegroup (and internal translational
+    symmetries for supercells) to compute derivatives with respect to all cartesian coordinates
+    of all atoms in the structure.
+
+    E.g. ``T`` could be risidual forces of shape (natom,3) to compute the force constants matrix,
+    or it could be 3x3 polarizability tensors to compute all raman tensors.  Or it could be something
+    else entirely; simply supply the appropriate ``callbacks``.
 
     :param disp_atoms: shape (ndisp,), dtype int.  Index of the displaced atom for each displacement.
 
@@ -636,11 +642,16 @@ def rank_2_tensor_derivs_by_symmetry(
         These are either ``T_disp - T_eq`` or ``T_disp``, where ``T_eq`` is the value at equilibrium and
         ``T_disp`` is the value after displacement.
 
-    :param oper_cart_rots: shape (nsym,3,3), dtype float.  For each spacegroup operator, its representation
-        as a 3x3 rotation/mirror matrix that operates on column vectors containing Cartesian data.
+    :param callbacks: ``SymmetryCallbacks`` instance defining how to apply symmetry operations to ``T``,
+        and how to convert back and forth between ``T`` and a 1D array of float or complex.
 
-    :param oper_perms: shape (nsym,nsite), dtype int.  For each spacegroup operator, its representation
-        as a permutation that operates on site metadata (see the notes below).
+    :param oper_cart_rots: shape (nsym,3,3), dtype float.  For each spacegroup or pointgroup operator,
+        its representation as a 3x3 rotation/mirror matrix that operates on column vectors containing
+        Cartesian data.  (for spacegroup operators, the translation vectors are not needed, because
+        their impact is already accounted for in ``oper_perms``)
+
+    :param oper_perms: shape (nsym,nsite), dtype int.  For each spacegroup or pointgroup operator, its
+        representation as a permutation that operates on site metadata (see the notes below).
 
     :param quotient_perms: shape (nquotient,nsite), dtype int, optional.  If the structure is a supercell
         of a periodic structure, then this should contain the representations of all pure translational
@@ -711,7 +722,7 @@ def rank_2_tensor_derivs_by_symmetry(
         # Expand the available data using the site-symmetry operators to ensure
         # we have enough independent equations for pseudoinversion.
         eq_cart_disps = []  # equation -> 3-vec
-        eq_rhses = []  # equation -> flattened 3x3 mat
+        eq_rhses = []  # equation -> flattened T
         for oper, cart_rot in enumerate(oper_cart_rots):
             if permute_index(oper, representative) != representative:
                 continue  # not site-symmetry oper
@@ -722,9 +733,10 @@ def rank_2_tensor_derivs_by_symmetry(
                 eq_rhses.append(callbacks.flatten(rotated))  # flattened tensor
 
         # Solve for Q in the overconstrained system   eq_cart_disps   Q   = eq_rhses
-        #                                                (?x3)      (3x9) =  (?x9)
+        #                                                (?x3)      (3xM) =  (?xM)
         #
-        # The columns of Q are the cartesian gradients of each tensor component
+        # (M is the length of the flattened representation of T).
+        # The columns of Q are the cartesian gradients of each scalar component of T
         # with respect to the representative atom.
         solved = np.linalg.pinv(eq_cart_disps) @ np.array(eq_rhses)
         assert len(solved) == 3
@@ -732,8 +744,8 @@ def rank_2_tensor_derivs_by_symmetry(
         # Important not to use array() here because this contains values of type T.
         return [callbacks.restore(x) for x in solved]
 
-    # atom -> 3x3x3 tensor where last two indices index the tensor.
-    # I.e. atom,i,j,k -> partial T_jk / partial x_(atom,i)
+    # atom -> cart axis -> T
+    # I.e. atom,i -> partial T / partial x_(atom,i)
     site_derivatives = {rep: compute_representative_row(rep) for rep in representative_disps}
 
     # Fill out more rows (i.e. derivatives w.r.t. other atoms) by applying spacegroup symmetry
