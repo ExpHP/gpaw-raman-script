@@ -432,6 +432,7 @@ def expand_raman_by_symmetry(cachepath,
         oper_cart_rots,
         oper_deperms,
     )
+    pol_derivs = np.array(pol_derivs.tolist())  # (n,3) dtype=object --> (n,3,3,3) dtype=complex
 
     np.save(cachepath, pol_derivs)
     return pol_derivs
@@ -662,7 +663,7 @@ def expand_derivs_by_symmetry(
     disp_atoms,       # disp -> atom
     disp_carts,       # disp -> 3-vec
     disp_values,      # disp -> T  (displaced value, optionally minus equilibrium value)
-    callbacks,        # how to work with T
+    callbacks: SymmetryCallbacks[T],        # how to work with T
     oper_cart_rots,   # oper -> 3x3
     oper_perms,       # oper -> atom' -> atom
     quotient_perms=None,   # oper -> atom' -> atom
@@ -703,7 +704,7 @@ def expand_derivs_by_symmetry(
         of a periodic structure, then this should contain the representations of all pure translational
         symmetries as permutations that operate on site metadata (see the notes below).  Note that, as an
         alternative to this argument, it possible to instead include these pure translational symmetries
-        in ``oper_perms/oper_cart_rots``... but using ``quotient_perms`` will be more efficient.
+        in ``oper_perms/oper_cart_rots``.
 
     :return:
         Returns a shape ``(natom, 3)`` array of ``T`` where the item at ``(a, k)`` is the derivative of
@@ -711,7 +712,7 @@ def expand_derivs_by_symmetry(
         Note that the output is *always* 2-dimensional with ``dtype=object``, even if ``T`` is an array type.
         (so the output may be an array of arrays).  This is done because numpy's overly eager array detection
         could easily lead to data loss if allowed to run unchecked on ``T``.  If you want to reconstruct a
-        single array, try ``np.array(output.tolist()).tolist()``.
+        single array, try ``np.array(output.tolist())``.
 
     ..note::
         This function is serial and requires a process to have access to data for all atoms.
@@ -749,12 +750,10 @@ def expand_derivs_by_symmetry(
     assert len(disp_carts) == len(disp_atoms) == len(disp_values)
     assert len(oper_cart_rots) == len(oper_perms)
 
+    natoms = len(oper_perms[0])
+
     disp_values = list(disp_values)
     callbacks.initialize(disp_values[0])
-
-    # Proper way to apply data permutations to sparse indices
-    oper_inv_perms = np.argsort(oper_perms, axis=1) # oper -> atom -> atom'
-    permute_index = lambda oper, site: oper_inv_perms[oper, site]
 
     # For each representative atom that gets displaced, gather all of its displacements.
     representative_disps = defaultdict(list)
@@ -764,7 +763,14 @@ def expand_derivs_by_symmetry(
     if quotient_perms is None:
         # Just the identity.
         quotient_perms = np.array([np.arange(len(oper_perms[0]))])
-    quotient_inv_perms = np.argsort(quotient_perms, axis=1) # quotient -> atom -> atom'
+
+    sym_info = PrecomputedSymmetryIndexInfo(representative_disps.keys(), oper_perms, quotient_perms)
+
+    def apply_combined_oper(value: T, combined: 'CombinedOperator'):
+        oper, quotient = combined
+        value = callbacks.rotate(value, oper, cart_rot=oper_cart_rots[oper])
+        value = callbacks.permute_atoms(value, quotient_perms[quotient])
+        return value
 
     # Compute derivatives with respect to displaced (representative) atoms
     def compute_representative_row(representative):
@@ -772,14 +778,14 @@ def expand_derivs_by_symmetry(
         # we have enough independent equations for pseudoinversion.
         eq_cart_disps = []  # equation -> 3-vec
         eq_rhses = []  # equation -> flattened T
-        for oper, cart_rot in enumerate(oper_cart_rots):
-            if permute_index(oper, representative) != representative:
-                continue  # not site-symmetry oper
 
+        # Generate equations by pairing each site symmetry operator with each displacement of this atom
+        for combined_op in sym_info.site_symmetry_for_rep(representative):
+            cart_rot = oper_cart_rots[combined_op.oper]
             for disp in representative_disps[representative]:
-                rotated = callbacks.rotate(disp_values[disp], oper, cart_rot=cart_rot)
+                transformed = apply_combined_oper(disp_values[disp], combined_op)
                 eq_cart_disps.append(cart_rot @ disp_carts[disp])
-                eq_rhses.append(callbacks.flatten(rotated))  # flattened tensor
+                eq_rhses.append(callbacks.flatten(transformed))
 
         # Solve for Q in the overconstrained system   eq_cart_disps   Q   = eq_rhses
         #                                                (?x3)      (3xM) =  (?xM)
@@ -797,39 +803,23 @@ def expand_derivs_by_symmetry(
 
     # atom -> cart axis -> T
     # I.e. atom,i -> partial T / partial x_(atom,i)
-    site_derivatives = {rep: compute_representative_row(rep) for rep in representative_disps}
+    site_derivatives = {rep: compute_representative_row(rep) for rep in representative_disps.keys()}
 
     # Fill out more rows (i.e. derivatives w.r.t. other atoms) by applying spacegroup symmetry
-    for representative in representative_disps:
-        # Find the atoms we can reach from the representative (and a symmetry operation that sends it to each one)
-        for oper, cart_rot in enumerate(oper_cart_rots):
-            newsite = permute_index(oper, representative)
-            if newsite not in site_derivatives:
-                # Apply the rotation to the inner dimensions of the gradient (i.e. rotate each T)
-                t_derivs_by_axis = [callbacks.rotate(deriv, oper, cart_rot) for deriv in site_derivatives[representative]]
-                # Apply the rotation to the outer axis of the gradient
-                array_derivs_by_axis = [callbacks.flatten(t) for t in t_derivs_by_axis]
-                array_derivs_by_axis = cart_rot @ array_derivs_by_axis
-                t_derivs_by_axis = [callbacks.restore(arr) for arr in array_derivs_by_axis]
+    for atom in range(natoms):
+        if atom in site_derivatives:
+            continue
 
-                site_derivatives[newsite] = t_derivs_by_axis
-
-    # If this is a supercell, fill out all remaining rows by applying pure translational symmetries
-    old_site_derivatives = dict(site_derivatives)
-    site_derivatives = {}
-    for oldsite in old_site_derivatives:
-        for quotient in range(len(quotient_perms)):
-            newsite = quotient_inv_perms[quotient, oldsite]
-            site_derivatives[newsite] = [
-                callbacks.permute_atoms(derivative, quotient_perms[quotient])
-                for derivative in old_site_derivatives[oldsite]
-            ]
+        # We'll just apply the first operator that sends us here
+        rep = sym_info.data[atom].rep
+        combined_op = sym_info.data[atom].operators[0]
+        site_derivatives[atom] = [
+            apply_combined_oper(derivative, combined_op)
+            for derivative in site_derivatives[rep]
+        ]
 
     # site_derivatives should now be dense
-    natoms = len(oper_perms[0])
-    missing_indices = set(range(natoms)) - set(site_derivatives)
-    if missing_indices:
-        raise RuntimeError(f'no displaced atoms were symmetrically equivalent to these indices: {sorted(missing_indices)}!')
+    assert set(range(natoms)) == set(site_derivatives)
 
     # Convert to array, in a manner that prevents numpy from detecting the dimensions of T.
     final_out = np.empty((natoms, 3), dtype=object)
@@ -861,8 +851,6 @@ class FromRepInfo(tp.NamedTuple):
     Attributes
         rep         Atom index of the representative that can reach this site.
         operators   List of operators, each of which individually maps ``rep`` to this site.
-                    If this site is itself a representative (and thus is its own ``rep``),
-                    then this is effectively the set of site symmetry.
     """
     rep: AtomIndex
     operators: tp.List[CombinedOperator]
@@ -873,7 +861,7 @@ class PrecomputedSymmetryIndexInfo:
     Attributes:
         from_reps   dict. For each atom, a ``FromRepInfo`` describing how to reach that atom.
     """
-    from_reps: tp.Dict[AtomIndex, FromRepInfo]
+    data: tp.Dict[AtomIndex, FromRepInfo]
 
     def __init__(self,
             representatives: tp.Iterable[AtomIndex],
@@ -903,9 +891,21 @@ class PrecomputedSymmetryIndexInfo:
 
         if redundant_reps:
             message = ', '.join('{} (~= {})'.format(a, from_reps[a].rep) for a in redundant_reps)
-            raise RuntimeError('Redundant atoms in representative list:  {}'.format(message))
+            raise RuntimeError('redundant atoms in representative list:  {}'.format(message))
 
-        self.from_reps = from_reps
+        natoms = len(oper_deperms[0])
+        missing_indices = set(range(natoms)) - set(from_reps)
+        if missing_indices:
+            raise RuntimeError(f'no representative atoms were symmetrically equivalent to these indices: {sorted(missing_indices)}!')
+
+        self.data = from_reps
+
+    def site_symmetry_for_rep(self, rep: AtomIndex) -> tp.Iterable[CombinedOperator]:
+        """ Get operators in the site symmetry of a representative atom. """
+        true_rep = self.data[rep].rep
+        assert true_rep == rep, "not a representative: {} (image of {})".format(rep, true_rep)
+
+        return self.data[rep].operators
 
 def _rotate_rank_3_tensor(tensor, cart_rot):
     assert tensor.shape == (3, 3, 3)
