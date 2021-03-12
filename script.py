@@ -78,7 +78,8 @@ def main__elph_diamond(action, log):
         # kpts={'size': (kx_gs, ky_gs,1), 'gamma': True},
         xc='PBE',
     )
-    supercell = (2, 2, 2)
+    # FIXME Need to test with an SC that's at least 3 in one direction to test translations
+    supercell = (1, 1, 1)
     params_fd_sym = dict(params_fd)
     params_fd_sym['point_group'] = True
 
@@ -92,6 +93,7 @@ def main__elph_diamond(action, log):
     if action == 'symmetry-test':
         # a supercell exactly like ElectronPhononCoupling makes
         supercell_atoms = atoms * supercell
+        quotient_perms = list(ase_repeat_translational_symmetry_perms(len(atoms), supercell))
 
         def get_wfs_with_sym():
             # Make a supercell exactly like ElectronPhononCoupling makes, but with point_group = True
@@ -99,6 +101,7 @@ def main__elph_diamond(action, log):
             if 'symmetry' not in params_fd_sym:
                 params_fd_sym['symmetry'] = dict(GPAW.default_parameters['symmetry'])
             params_fd_sym['symmetry']['point_group'] = True
+            params_fd_sym['symmetry']['tolerance'] = 1e-4
 
             calc_fd_sym = GPAW(txt=log, **params_fd)
             dummy_supercell_atoms = supercell_atoms.copy()
@@ -152,6 +155,7 @@ def main__elph_diamond(action, log):
                 GpawLcaoDHCallbacks(wfs_with_sym),        # how to work with T
                 oper_cart_rots,   # oper -> 3x3
                 oper_perms=wfs_with_sym.kd.symmetry.a_sa,       # oper -> atom' -> atom
+                quotient_perms=quotient_perms,
             )
             pickle.dump(full_values, open('elph-full.pckl', 'wb'), protocol=2)
 
@@ -504,14 +508,22 @@ def get_deperm(
 class SymmetryCallbacks(ABC, Generic[T]):
     @abstractmethod
     def flatten(self, obj: T) -> np.ndarray:
+        """ Convert an object into an ndarray of ndim 1. """
         raise NotImplementedError
 
     @abstractmethod
     def restore(self, arr: np.ndarray) -> T:
+        """ Reconstruct an object from an ndarray of ndim 1. """
         raise NotImplementedError
 
     @abstractmethod
     def rotate(self, obj: T, sym: int, cart_rot) -> T:
+        """ Apply a spacegroup operation. """
+        raise NotImplementedError
+
+    @abstractmethod
+    def permute_atoms(self, obj: T, site_deperm: np.ndarray) -> T:
+        """ Apply a pure translational symmetry represented as a permutation (s' -> s). """
         raise NotImplementedError
 
 class Tensor2Callbacks(SymmetryCallbacks):
@@ -523,6 +535,9 @@ class Tensor2Callbacks(SymmetryCallbacks):
 
     def rotate(self, obj, sym, cart_rot):
         return _rotate_rank_2_tensor(obj, cart_rot=cart_rot)
+
+    def permute_atoms(self, obj, deperm):
+        return obj
 
 class GpawArrayDictCallbacks(SymmetryCallbacks):
     """ Callbacks for a gpaw ``ArrayDict``. """
@@ -543,7 +558,10 @@ class GpawArrayDictCallbacks(SymmetryCallbacks):
                 raise RuntimeError('symmetry expansion must only be done on root node')
 
         if self.template_arraydict is None:
-            self.template_arraydict = obj.copy()
+            template = obj.copy()
+            for key in template:
+                template[key] = np.empty_like(template[key])
+            self.template_arraydict = template
         else:
             assert np.all(self.template_arraydict.shapes_a == obj.shapes_a), "instance of {} cannot be reused for different ArrayDicts".format(type(self).__name__)
 
@@ -557,6 +575,12 @@ class GpawArrayDictCallbacks(SymmetryCallbacks):
         out_a = self.template_arraydict.copy()
         for a in range(out_a.partition.natoms):
             out_a[a][...] = arrs_a[a].reshape(out_a.shapes_a[a])
+        return out_a
+
+    def permute_atoms(self, obj, deperm):
+        out_a = self.template_arraydict.copy()
+        for anew, aold in enumerate(deperm):
+            out_a[anew] = obj[aold]
         return out_a
 
 class GpawLcaoDHCallbacks(GpawArrayDictCallbacks):
@@ -595,6 +619,7 @@ def rank_2_tensor_derivs_by_symmetry(
     callbacks,        # how to work with T
     oper_cart_rots,   # oper -> 3x3
     oper_perms,       # oper -> atom' -> atom
+    quotient_perms=None,   # oper -> atom' -> atom
 ) -> np.ndarray:
     """
     Uses symmetry to expand finite difference data for derivatives of a rank 2 tensor.
@@ -604,14 +629,25 @@ def rank_2_tensor_derivs_by_symmetry(
     derivatives with respect to all cartesian coordinates of all atoms in the structure.
 
     :param disp_atoms: shape (ndisp,), dtype int.  Index of the displaced atom for each displacement.
+
     :param disp_carts: shape (ndisp,3), dtype float.  The displacement vectors, in cartesian coords.
+
     :param disp_values: sequence type of length ``ndisp`` holding ``T`` objects for each displacement.
         These are either ``T_disp - T_eq`` or ``T_disp``, where ``T_eq`` is the value at equilibrium and
         ``T_disp`` is the value after displacement.
+
     :param oper_cart_rots: shape (nsym,3,3), dtype float.  For each spacegroup operator, its representation
         as a 3x3 rotation/mirror matrix that operates on column vectors containing Cartesian data.
+
     :param oper_perms: shape (nsym,nsite), dtype int.  For each spacegroup operator, its representation
-        as a permutation that operates on site metadata.
+        as a permutation that operates on site metadata (see the notes below).
+
+    :param quotient_perms: shape (nquotient,nsite), dtype int, optional.  If the structure is a supercell
+        of a periodic structure, then this should contain the representations of all pure translational
+        symmetries as permutations that operate on site metadata (see the notes below).  Note that, as an
+        alternative to this argument, it possible to instead include these pure translational symmetries
+        in ``oper_perms/oper_cart_rots``... but using ``quotient_perms`` will be more efficient.
+
     :return:
         Returns a shape ``(natom, 3)`` array of ``T`` where the item at ``(a, k)`` is the derivative of
         the value with respect to cartesian component ``k`` of the displacement of atom ``a``.
@@ -632,7 +668,7 @@ def rank_2_tensor_derivs_by_symmetry(
         (if more than one site in the star has displacements, some of the input data may be ignored)
 
     ..note::
-        For best results, when the input displacements are expanded by symmetry, it should produce data
+        For best results, once the input displacements are expanded by symmetry, there should be data
         at both positive and negative displacements along each of three linearly independent axes for each site.
         Without negative displacements, the results will end up being closer to a forward difference
         rather than a central difference (and will be wholly inaccurate if equilibrium values were not subtracted).
@@ -665,6 +701,11 @@ def rank_2_tensor_derivs_by_symmetry(
     for (disp, representative) in enumerate(disp_atoms):
         representative_disps[representative].append(disp)
 
+    if quotient_perms is None:
+        # Just the identity.
+        quotient_perms = np.array([np.arange(len(oper_perms[0]))])
+    quotient_inv_perms = np.argsort(quotient_perms, axis=1) # quotient -> atom -> atom'
+
     # Compute derivatives with respect to displaced (representative) atoms
     def compute_representative_row(representative):
         # Expand the available data using the site-symmetry operators to ensure
@@ -695,12 +736,12 @@ def rank_2_tensor_derivs_by_symmetry(
     # I.e. atom,i,j,k -> partial T_jk / partial x_(atom,i)
     site_derivatives = {rep: compute_representative_row(rep) for rep in representative_disps}
 
-    # Compute derivatives with respect to other atoms by symmetry
+    # Fill out more rows (i.e. derivatives w.r.t. other atoms) by applying spacegroup symmetry
     for representative in representative_disps:
-        # Find which representative is related to this atom, and any symmetry operation that will send it here
+        # Find the atoms we can reach from the representative (and a symmetry operation that sends it to each one)
         for oper, cart_rot in enumerate(oper_cart_rots):
-            site = permute_index(oper, representative)
-            if site not in site_derivatives:
+            newsite = permute_index(oper, representative)
+            if newsite not in site_derivatives:
                 # Apply the rotation to the inner dimensions of the gradient (i.e. rotate each T)
                 t_derivs_by_axis = [callbacks.rotate(deriv, oper, cart_rot) for deriv in site_derivatives[representative]]
                 # Apply the rotation to the outer axis of the gradient
@@ -708,13 +749,23 @@ def rank_2_tensor_derivs_by_symmetry(
                 array_derivs_by_axis = cart_rot @ array_derivs_by_axis
                 t_derivs_by_axis = [callbacks.restore(arr) for arr in array_derivs_by_axis]
 
-                site_derivatives[site] = t_derivs_by_axis
+                site_derivatives[newsite] = t_derivs_by_axis
+
+    # If this is a supercell, fill out all remaining rows by applying pure translational symmetries
+    all_site_derivatives = {}
+    for oldsite in list(site_derivatives):
+        for quotient in range(len(quotient_perms)):
+            newsite = quotient_inv_perms[quotient, oldsite]
+            all_site_derivatives[newsite] = [
+                callbacks.permute_atoms(derivative, quotient_perms[quotient])
+                for derivative in site_derivatives[oldsite]
+            ]
 
     # site_derivatives should now be dense
-    natoms = len(site_derivatives)
-    missing_indices = set(range(natoms)) - set(site_derivatives)
+    natoms = len(oper_perms[0])
+    missing_indices = set(range(natoms)) - set(all_site_derivatives)
     if missing_indices:
-        raise RuntimeError(f'no displaced atoms were symmetrically equivalent to index {next(iter(missing_indices))}!')
+        raise RuntimeError(f'no displaced atoms were symmetrically equivalent to these indices: {sorted(missing_indices)}!')
 
     # Convert to array, in a manner that prevents numpy from detecting the dimensions of T.
     final_out = np.empty((natoms, 3), dtype=object)
@@ -746,6 +797,65 @@ def iter_displaced_structures(atoms, phonon):
         positions[i] += disp
         disp_atoms.set_positions(positions)
         yield disp_atoms
+
+def ase_repeat_translational_symmetry_perms(natoms, repeats):
+    """ Get the full quotient group of pure translational symmetries of ``atoms * repeats``.
+    
+    The order of the output is deterministic but unspecified. """
+    if isinstance(repeats, int):
+        repeats = (repeats, repeats, repeats)
+
+    # It is unclear whether ASE actually specifies the order of atoms in a supercell anywhere,
+    # so be ready for the worst.  (even though this we don't specify order of operators returned,
+    # our handling of repeats like (2, 3, 1) will be totally incorrect if the convention is wrong)
+    if not np.array_equal(repeats, (1, 1, 1)):
+        __check_ase_repeat_convention_hasnt_changed()
+
+    # fastest index is atoms, then repeats[2], then repeats[1], then repeats[0]
+
+    def all_cyclic_perms_of_len(n):
+        # e.g. for n=4 this gives [[0,1,2,3], [1,2,3,0], [2,3,0,1], [3,0,1,2]]
+        return np.add.outer(np.arange(n), np.arange(n)) % n
+
+    n_a, n_b, n_c = repeats
+    atom_perm = np.arange(natoms)  # we never rearrange the atoms within a cell
+    for a_perm in all_cyclic_perms_of_len(n_a):
+        for b_perm in all_cyclic_perms_of_len(n_b):
+            for c_perm in all_cyclic_perms_of_len(n_c):
+                yield permutation_outer_product(a_perm, b_perm, c_perm, atom_perm)
+
+def __check_ase_repeat_convention_hasnt_changed():
+    # A simple structure with an identity matrix for its cell so that atoms in the supercell
+    # have easily-recognizable positions.
+    unitcell = ase.Atoms(symbols=['X', 'Y'], positions=[[0, 0, 0], [0.5, 0, 0]], cell=np.eye(3))
+    sc_positions = (unitcell * (4, 3, 5)).get_positions()
+    if not all([
+        np.all(sc_positions[0].round(8) == [0, 0, 0]),
+        np.all(sc_positions[1].round(8) == [0.5, 0, 0]),    # fastest index: primitive
+        np.all(sc_positions[2].round(8) == [0, 0, 1]),      # ...followed by 3rd cell vector
+        np.all(sc_positions[2*5].round(8) == [0, 1, 0]),    # ...followed by 2nd cell vector
+        np.all(sc_positions[2*5*3].round(8) == [1, 0, 0]),  # ...followed by 1st cell vector
+    ]):
+        raise RuntimeError('ordering of atoms in ASE supercells has changed!')
+
+def permutation_outer_product(*perms):
+    """ Compute the mathematical outer product of a sequence of permutations.
+    
+    The result is a permutation that operates on an array whose length is the product of all of the
+    input perms.  The last perm will be the fastest index in the output (rearranging items within
+    blocks), while the first perm will be the slowest (rearranging the blocks themselves).
+    """
+    from functools import reduce
+
+    lengths = [len(p) for p in perms]  # na, nb, ..., ny, nz
+    strides = np.multiply.accumulate([1] + lengths[1:][::-1])[::-1]   #   ..., nx*ny*nz, ny*nz, nz, 1
+
+    premultiplied_perms = [stride * np.array(perm) for (stride, perm) in zip(strides, perms)]
+    permuted_n_dimensional = reduce(np.add.outer, premultiplied_perms)
+
+    # the thing we just computed is basically what you would get if you started with
+    #  np.arange(product(lengths)).reshape(lengths) and permuted each axis.
+    return permuted_n_dimensional.ravel()
 
 def phonopy_atoms_to_ase(atoms):
     atoms = ase.Atoms(
