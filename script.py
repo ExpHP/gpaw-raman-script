@@ -79,9 +79,7 @@ def main__elph_diamond(action, log):
         xc='PBE',
     )
     # FIXME Need to test with an SC that's at least 3 in one direction to test translations
-    supercell = (1, 1, 1)
-    params_fd_sym = dict(params_fd)
-    params_fd_sym['point_group'] = True
+    supercell = (2, 2, 2)
 
     # ============
     # BRUTE FORCE
@@ -104,8 +102,8 @@ def main__elph_diamond(action, log):
             if 'symmetry' not in params_fd_sym:
                 params_fd_sym['symmetry'] = dict(GPAW.default_parameters['symmetry'])
             params_fd_sym['symmetry']['point_group'] = True
-            params_fd_sym['symmetry']['symmorphic'] = False
-            params_fd_sym['symmetry']['tolerance'] = 1e-4
+            params_fd_sym['symmetry']['symmorphic'] = False  # enable full spacegroup # FIXME: doesn't work for supercells
+            params_fd_sym['symmetry']['tolerance'] = 1e-6
 
             calc_fd_sym = GPAW(txt=log, **params_fd)
             dummy_supercell_atoms = supercell_atoms.copy()
@@ -134,19 +132,31 @@ def main__elph_diamond(action, log):
             arr_dic.redistribute(atom_partition.as_serial())
             return array_0, arr_dic
 
+        # GPAW displaces the center cell for some reason instead of the first cell
         get_displaced_index = lambda prim_atom: elph.offset + prim_atom
+
         disp_atoms = [
             get_displaced_index(0),
             get_displaced_index(0),
+            # FIXME: can't currently get full spacegroup for supercells so use extra atoms for now.
+            #        (we'll need a different material if we want to test the step that generates
+            #         new rows using rotational symmetries)
+            get_displaced_index(1),
+            get_displaced_index(1),
         ]
         disp_carts = [
+            np.array([+1e02, 0, 0]),
+            np.array([-1e02, 0, 0]),
             np.array([+1e02, 0, 0]),
             np.array([-1e02, 0, 0]),
         ]
 
         disp_values = [
+            # TODO: Also transform the grid data in [0]
             read_elph('elph.0x+.pckl')[1],
             read_elph('elph.0x-.pckl')[1],
+            read_elph('elph.1x+.pckl')[1],
+            read_elph('elph.1x-.pckl')[1],
         ]
 
         lattice = supercell_atoms.get_cell()[...]
@@ -161,7 +171,7 @@ def main__elph_diamond(action, log):
                 oper_perms=wfs_with_sym.kd.symmetry.a_sa,       # oper -> atom' -> atom
                 quotient_perms=quotient_perms,
             )
-            for a in range(len(disp_atoms)):
+            for a in range(len(full_values)):
                 for c in range(3):
                     full_values[a][c] = dict(full_values[a][c])
             pickle.dump(full_values, open('elph-full.pckl', 'wb'), protocol=2)
@@ -793,24 +803,25 @@ def expand_derivs_by_symmetry(
                 site_derivatives[newsite] = t_derivs_by_axis
 
     # If this is a supercell, fill out all remaining rows by applying pure translational symmetries
-    all_site_derivatives = {}
-    for oldsite in list(site_derivatives):
+    old_site_derivatives = dict(site_derivatives)
+    site_derivatives = {}
+    for oldsite in old_site_derivatives:
         for quotient in range(len(quotient_perms)):
             newsite = quotient_inv_perms[quotient, oldsite]
-            all_site_derivatives[newsite] = [
+            site_derivatives[newsite] = [
                 callbacks.permute_atoms(derivative, quotient_perms[quotient])
-                for derivative in site_derivatives[oldsite]
+                for derivative in old_site_derivatives[oldsite]
             ]
 
     # site_derivatives should now be dense
     natoms = len(oper_perms[0])
-    missing_indices = set(range(natoms)) - set(all_site_derivatives)
+    missing_indices = set(range(natoms)) - set(site_derivatives)
     if missing_indices:
         raise RuntimeError(f'no displaced atoms were symmetrically equivalent to these indices: {sorted(missing_indices)}!')
 
     # Convert to array, in a manner that prevents numpy from detecting the dimensions of T.
     final_out = np.empty((natoms, 3), dtype=object)
-    final_out[...] = [site_derivatives[i] for i in range(len(site_derivatives))]
+    final_out[...] = [site_derivatives[i] for i in range(natoms)]
     return final_out
 
 def _rotate_rank_2_tensor(tensor, cart_rot):
