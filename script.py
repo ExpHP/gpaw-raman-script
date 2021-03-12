@@ -83,6 +83,7 @@ def main__elph_diamond(action, log):
     params_fd_sym = dict(params_fd)
     params_fd_sym['point_group'] = True
 
+    # ============
     # BRUTE FORCE
     if action == 'brute':
         calc_fd = GPAW(txt=log, **params_fd)
@@ -90,6 +91,8 @@ def main__elph_diamond(action, log):
         elph.run()
         return
 
+    # ============
+    # 
     if action == 'symmetry-test':
         # a supercell exactly like ElectronPhononCoupling makes
         supercell_atoms = atoms * supercell
@@ -101,6 +104,7 @@ def main__elph_diamond(action, log):
             if 'symmetry' not in params_fd_sym:
                 params_fd_sym['symmetry'] = dict(GPAW.default_parameters['symmetry'])
             params_fd_sym['symmetry']['point_group'] = True
+            params_fd_sym['symmetry']['symmorphic'] = False
             params_fd_sym['symmetry']['tolerance'] = 1e-4
 
             calc_fd_sym = GPAW(txt=log, **params_fd)
@@ -157,8 +161,12 @@ def main__elph_diamond(action, log):
                 oper_perms=wfs_with_sym.kd.symmetry.a_sa,       # oper -> atom' -> atom
                 quotient_perms=quotient_perms,
             )
+            for a in range(len(disp_atoms)):
+                for c in range(3):
+                    full_values[a][c] = dict(full_values[a][c])
             pickle.dump(full_values, open('elph-full.pckl', 'wb'), protocol=2)
 
+    # END action 'symmetry-test'
 
 def main__raman_ch4(log):
     from ase.build import molecule
@@ -505,6 +513,8 @@ def get_deperm(
         fracs_to, fracs_from, lattice[...].T, tol,
     )
 
+# ==============================================================================
+
 class SymmetryCallbacks(ABC, Generic[T]):
     @abstractmethod
     def flatten(self, obj: T) -> np.ndarray:
@@ -792,6 +802,8 @@ def _rotate_rank_3_tensor(tensor, cart_rot):
     assert tensor.shape == (3, 3, 3)
     return np.einsum('ia,jb,kc,abc->ijk', cart_rot, cart_rot, cart_rot, tensor)
 
+# ==============================================================================
+
 def get_displacements(phonon):
     """ Get displacements as list of [supercell_atom, [dx, dy, dz]] """
     return [[i, xyz] for (i, *xyz) in phonon.get_displacements()]
@@ -809,6 +821,8 @@ def iter_displaced_structures(atoms, phonon):
         positions[i] += disp
         disp_atoms.set_positions(positions)
         yield disp_atoms
+
+# ==============================================================================
 
 def ase_repeat_translational_symmetry_perms(natoms, repeats):
     """ Get the full quotient group of pure translational symmetries of ``atoms * repeats``.
@@ -868,6 +882,8 @@ def permutation_outer_product(*perms):
     # the thing we just computed is basically what you would get if you started with
     #  np.arange(product(lengths)).reshape(lengths) and permuted each axis.
     return permuted_n_dimensional.ravel()
+
+# ==============================================================================
 
 def phonopy_atoms_to_ase(atoms):
     atoms = ase.Atoms(
