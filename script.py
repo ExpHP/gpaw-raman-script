@@ -516,6 +516,24 @@ def get_deperm(
 # ==============================================================================
 
 class SymmetryCallbacks(ABC, Generic[T]):
+    """ Class that factors out operations needed by ``expand_derivs_by_symmetry`` to make it
+    general over all different sorts of data.
+
+    Instances must not be reused for more than one call to ``expand_derivs_by_symmetry``.
+    This restriction enables implementations to record data about the shape of their input if necessary.
+    """
+    def __init__(self):
+        self.__already_init = False
+
+    def initialize(self, obj: T):
+        """ Record any data needed about the shape of T, if necessary.
+
+        This will always be the first method called, and will be called exactly once on an
+        arbitrarily-chosen item from ``disp_values``. """
+        if self.__already_init:
+            raise RuntimeError('SymmetryCallbacks instances must not be reused')
+        self.__already_init = True
+
     @abstractmethod
     def flatten(self, obj: T) -> np.ndarray:
         """ Convert an object into an ndarray of ndim 1. """
@@ -552,13 +570,13 @@ class Tensor2Callbacks(SymmetryCallbacks):
 class GpawArrayDictCallbacks(SymmetryCallbacks):
     """ Callbacks for a gpaw ``ArrayDict``. """
     def __init__(self):
+        super().__init__()
         # A copy of one of the arraydicts so that we have access to the correct communicator, partition,
         # and array shapes when unflattening data.
         self.template_arraydict = None
 
-    def flatten(self, obj):
-        import gpaw
-        assert isinstance(obj, gpaw.arraydict.ArrayDict)
+    def initialize(self, obj):
+        super().initialize(obj)
 
         # FIXME: proper way to check this?
         if len(obj) != obj.partition.natoms:
@@ -567,14 +585,12 @@ class GpawArrayDictCallbacks(SymmetryCallbacks):
             else:
                 raise RuntimeError('symmetry expansion must only be done on root node')
 
-        if self.template_arraydict is None:
-            template = obj.copy()
-            for key in template:
-                template[key] = np.empty_like(template[key])
-            self.template_arraydict = template
-        else:
-            assert np.all(self.template_arraydict.shapes_a == obj.shapes_a), "instance of {} cannot be reused for different ArrayDicts".format(type(self).__name__)
+        template = obj.copy()
+        for key in template:
+            template[key] = np.empty_like(template[key])
+        self.template_arraydict = template
 
+    def flatten(self, obj):
         return np.concatenate([a.reshape(-1) for a in obj.values()])
 
     def restore(self, arr):
@@ -640,7 +656,7 @@ def expand_derivs_by_symmetry(
     symmetries for supercells) to compute derivatives with respect to all cartesian coordinates
     of all atoms in the structure.
 
-    E.g. ``T`` could be risidual forces of shape (natom,3) to compute the force constants matrix,
+    E.g. ``T`` could be residual forces of shape (natom,3) to compute the force constants matrix,
     or it could be 3x3 polarizability tensors to compute all raman tensors.  Or it could be something
     else entirely; simply supply the appropriate ``callbacks``.
 
@@ -712,6 +728,9 @@ def expand_derivs_by_symmetry(
 
     assert len(disp_carts) == len(disp_atoms) == len(disp_values)
     assert len(oper_cart_rots) == len(oper_perms)
+
+    disp_values = list(disp_values)
+    callbacks.initialize(disp_values[0])
 
     # Proper way to apply data permutations to sparse indices
     oper_inv_perms = np.argsort(oper_perms, axis=1) # oper -> atom -> atom'
