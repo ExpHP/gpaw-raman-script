@@ -14,6 +14,7 @@ import gpaw
 from gpaw import GPAW
 from gpaw.cluster import Cluster
 from gpaw.lrtddft import LrTDDFT
+import scipy.linalg
 import pickle
 
 from ruamel.yaml import YAML
@@ -21,8 +22,9 @@ yaml = YAML(typ='rt')
 
 from collections.abc import Sequence
 from abc import ABC, abstractmethod
-from typing import Generic, TypeVar
-T = TypeVar("T")
+import warnings
+import typing as tp
+T = tp.TypeVar("T")
 
 def main():
     import argparse
@@ -90,7 +92,9 @@ def main__elph_diamond(action, log):
         return
 
     # ============
-    # 
+    # SYMMETRY TEST
+    # For testing the symmetry expansion of ElectronPhononCoupling data.
+    # Takes a few pieces of the data produced by 'brute' and tries to produce all of the rest of the data.
     if action == 'symmetry-test':
         # a supercell exactly like ElectronPhononCoupling makes
         supercell_atoms = atoms * supercell
@@ -177,6 +181,10 @@ def main__elph_diamond(action, log):
             pickle.dump(full_values, open('elph-full.pckl', 'wb'), protocol=2)
 
     # END action 'symmetry-test'
+
+    # ============
+    # TODO: test that uses phonopy for displacements.
+    pass
 
 def main__raman_ch4(log):
     from ase.build import molecule
@@ -525,7 +533,7 @@ def get_deperm(
 
 # ==============================================================================
 
-class SymmetryCallbacks(ABC, Generic[T]):
+class SymmetryCallbacks(ABC, tp.Generic[T]):
     """ Class that factors out operations needed by ``expand_derivs_by_symmetry`` to make it
     general over all different sorts of data.
 
@@ -647,6 +655,8 @@ class GpawLcaoDHCallbacks(GpawArrayDictCallbacks):
                 out_asp[adest][s][...] = tmp_p
 
         return out_asp
+
+# ==============================================================================
 
 def expand_derivs_by_symmetry(
     disp_atoms,       # disp -> atom
@@ -777,7 +787,9 @@ def expand_derivs_by_symmetry(
         # (M is the length of the flattened representation of T).
         # The columns of Q are the cartesian gradients of each scalar component of T
         # with respect to the representative atom.
-        solved = np.linalg.pinv(eq_cart_disps) @ np.array(eq_rhses)
+        pinv, rank = scipy.linalg.pinv(eq_cart_disps, return_rank=True)
+        solved = pinv @ np.array(eq_rhses)
+        assert rank == 3, "site symmetry too small! (rank: {})".format(rank)
         assert len(solved) == 3
 
         # Important not to use array() here because this contains values of type T.
@@ -827,6 +839,73 @@ def expand_derivs_by_symmetry(
 def _rotate_rank_2_tensor(tensor, cart_rot):
     assert tensor.shape == (3, 3)
     return cart_rot @ tensor @ cart_rot.T
+
+AtomIndex = int
+QuotientIndex = int
+OperIndex = int
+
+class CombinedOperator(tp.NamedTuple):
+    """ Represents a symmetry operation that is the composition of a space group/pointgroup
+    operation followed by a pure translation.
+
+    Attributes
+        oper      Index of space group/pointgroup operator.
+        quotient  Index of pure translation operator (from the quotient group of a primitive lattice and a superlattice).
+    """
+    oper: OperIndex
+    quotient: QuotientIndex
+
+class FromRepInfo(tp.NamedTuple):
+    """ Describes the ways to reach a given site from a representative atom.
+    
+    Attributes
+        rep         Atom index of the representative that can reach this site.
+        operators   List of operators, each of which individually maps ``rep`` to this site.
+                    If this site is itself a representative (and thus is its own ``rep``),
+                    then this is effectively the set of site symmetry.
+    """
+    rep: AtomIndex
+    operators: tp.List[CombinedOperator]
+
+class PrecomputedSymmetryIndexInfo:
+    """ A class that records how to reach each atom from a predetermined set of symmetry representatives.
+
+    Attributes:
+        from_reps   dict. For each atom, a ``FromRepInfo`` describing how to reach that atom.
+    """
+    from_reps: tp.Dict[AtomIndex, FromRepInfo]
+
+    def __init__(self,
+            representatives: tp.Iterable[AtomIndex],
+            oper_deperms,      # oper -> site' -> site
+            quotient_deperms,  # quotient -> site' -> site
+    ):
+        redundant_reps = []
+        from_reps: tp.Dict[AtomIndex, FromRepInfo] = {}
+
+        # To permute individual sparse indices in O(1), we need the inverse perms
+        oper_inv_deperms = np.argsort(oper_deperms, axis=1)  # oper -> site -> site'
+        quotient_inv_deperms = np.argsort(quotient_deperms, axis=1)  # quotient -> site -> site'
+
+        for rep in representatives:
+            if rep in from_reps:
+                redundant_reps.append(rep)
+                continue
+
+            for quotient in range(len(quotient_inv_deperms)):
+                for oper in range(len(oper_inv_deperms)):
+                    # find the site that rep gets sent to
+                    site = oper_inv_deperms[oper][rep]
+                    site = quotient_inv_deperms[quotient][site]
+                    if site not in from_reps:
+                        from_reps[site] = FromRepInfo(rep, [])
+                    from_reps[site].operators.append(CombinedOperator(oper, quotient))
+
+        if redundant_reps:
+            message = ', '.join('{} (~= {})'.format(a, from_reps[a].rep) for a in redundant_reps)
+            raise RuntimeError('Redundant atoms in representative list:  {}'.format(message))
+
+        self.from_reps = from_reps
 
 def _rotate_rank_3_tensor(tensor, cart_rot):
     assert tensor.shape == (3, 3, 3)
