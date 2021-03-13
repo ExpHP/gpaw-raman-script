@@ -581,7 +581,8 @@ class Tensor2Callbacks(SymmetryCallbacks):
         return arr.reshape((3, 3))
 
     def rotate(self, obj, sym, cart_rot):
-        return _rotate_rank_2_tensor(obj, cart_rot=cart_rot)
+        assert obj.shape == (3, 3)
+        return cart_rot @ obj @ cart_rot.T
 
     def permute_atoms(self, obj, deperm):
         return obj
@@ -835,10 +836,6 @@ def expand_derivs_by_symmetry(
     final_out[...] = [site_derivatives[i] for i in range(natoms)]
     return final_out
 
-def _rotate_rank_2_tensor(tensor, cart_rot):
-    assert tensor.shape == (3, 3)
-    return cart_rot @ tensor @ cart_rot.T
-
 AtomIndex = int
 QuotientIndex = int
 OperIndex = int
@@ -915,10 +912,6 @@ class PrecomputedSymmetryIndexInfo:
         assert true_rep == rep, "not a representative: {} (image of {})".format(rep, true_rep)
 
         return self.data[rep].operators
-
-def _rotate_rank_3_tensor(tensor, cart_rot):
-    assert tensor.shape == (3, 3, 3)
-    return np.einsum('ia,jb,kc,abc->ijk', cart_rot, cart_rot, cart_rot, tensor)
 
 # ==============================================================================
 
