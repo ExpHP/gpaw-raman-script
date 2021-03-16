@@ -14,6 +14,7 @@ import gpaw
 from gpaw import GPAW
 from gpaw.cluster import Cluster
 from gpaw.lrtddft import LrTDDFT
+import itertools
 import scipy.linalg
 import pickle
 
@@ -587,6 +588,50 @@ class Tensor2Callbacks(SymmetryCallbacks):
     def permute_atoms(self, obj, deperm):
         return obj
 
+# FIXME untested
+class GeneralArrayCallbacks(SymmetryCallbacks):
+    def __init__(self, axis_labels, oper_deperms=None, quotient_deperms=None):
+        super().__init__()
+        self.shape = None
+        self.axis_labels = list(axis_labels)
+        self.rotator = TensorRotator(label == 'cart' for label in self.axis_labels)
+        self.oper_deperms = oper_deperms
+        self.quotient_deperms = quotient_deperms
+        if 'atom' in self.axis_labels:
+            if oper_deperms is None:
+                raise RuntimeError('need oper_deperms if there are atom axes')
+            if quotient_deperms is None:
+                self.quotient_deperms = np.array([np.arange(len(oper_deperms[0]))])
+
+        unknown_labels = set(axis_labels) - {'spin', 'atom', 'cart'}
+        if unknown_labels:
+            raise RuntimeError(f'bad axis labels: {sorted(unknown_labels)}')
+
+    def init(self, obj):
+        self.shape = obj.shape
+        assert len(self.shape) == len(self.axis_labels)
+
+    def flatten(self, obj):
+        return obj.reshape(-1)
+
+    def restore(self, arr):
+        return arr.reshape(self.shape)
+
+    def rotate(self, obj, oper, cart_rot):
+        assert obj.shape == self.template.shape
+        obj = self.rotator.rotate(cart_rot, obj)
+        if self.oper_deperms is not None:
+            obj = self.permute_atoms(obj, self.oper_deperms[oper])
+        return obj
+
+    def permute_atoms(self, obj, deperm):
+        obj = obj.copy()
+        for axis, label in enumerate(self.axis_labels):
+            if label == 'atom':
+                # perform integer array indexing on the `axis`th axis
+                obj = obj[(slice(None),) * axis + (deperm,)]
+        return obj
+
 class GpawArrayDictCallbacks(SymmetryCallbacks):
     """ Callbacks for a gpaw ``ArrayDict``. """
     def __init__(self):
@@ -993,6 +1038,39 @@ def permutation_outer_product(*perms):
     # the thing we just computed is basically what you would get if you started with
     #  np.arange(product(lengths)).reshape(lengths) and permuted each axis.
     return permuted_n_dimensional.ravel()
+
+# ==============================================================================
+
+class TensorRotator:
+    """ Helper for automating the production of an einsum call that applies a single matrix to many axes of an array.
+    
+    E.g. could perform something similar to ``np.einsum('Aa,Bb,Dd,abcd->ABcD', rot, rot, rot, array)`` if we wanted
+    to rotate axes 0, 1, and 3 of an array. """
+    def __init__(self, axis_rotate_flags: tp.Iterator[bool]):
+        unused_subscripts = itertools.count(start=0)
+        self.array_subscripts = []
+        self.rotmat_subscripts = []
+        self.out_subscripts = []
+
+        for flag in axis_rotate_flags:
+            if flag:
+                sum_subscript = next(unused_subscripts)
+                out_subscript = next(unused_subscripts)
+                self.rotmat_subscripts.append((out_subscript, sum_subscript))
+                self.array_subscripts.append(sum_subscript)
+                self.out_subscripts.append(out_subscript)
+            else:
+                subscript = next(unused_subscripts)
+                self.array_subscripts.append(subscript)
+                self.out_subscripts.append(subscript)
+
+    def rotate(self, rot, array):
+        einsum_args = []
+        for subscripts in self.rotmat_subscripts:
+            einsum_args.push(rot)
+            einsum_args.push(subscripts)
+        einsum_args += [array, self.array_subscripts, self.out_subscripts]
+        return np.einsum(*einsum_args)
 
 # ==============================================================================
 
