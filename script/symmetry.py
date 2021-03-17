@@ -82,11 +82,11 @@ class GeneralArrayCallbacks(SymmetryCallbacks):
             if quotient_deperms is None:
                 self.quotient_deperms = np.array([np.arange(len(oper_deperms[0]))])
 
-        unknown_labels = set(axis_labels) - {'spin', 'atom', 'cart'}
+        unknown_labels = set(axis_labels) - {'na', 'atom', 'cart'}
         if unknown_labels:
             raise RuntimeError(f'bad axis labels: {sorted(unknown_labels)}')
 
-    def init(self, obj):
+    def initialize(self, obj):
         self.shape = obj.shape
         assert len(self.shape) == len(self.axis_labels)
 
@@ -97,7 +97,7 @@ class GeneralArrayCallbacks(SymmetryCallbacks):
         return arr.reshape(self.shape)
 
     def rotate(self, obj, oper, cart_rot):
-        assert obj.shape == self.template.shape
+        assert obj.shape == self.shape, [self.shape, obj.shape]
         obj = self.rotator.rotate(cart_rot, obj)
         if self.oper_deperms is not None:
             obj = self.permute_atoms(obj, self.oper_deperms[oper])
@@ -465,8 +465,7 @@ class TensorRotator:
     def rotate(self, rot, array):
         einsum_args = []
         for subscripts in self.rotmat_subscripts:
-            einsum_args.push(rot)
-            einsum_args.push(subscripts)
+            einsum_args.append(rot)
+            einsum_args.append(subscripts)
         einsum_args += [array, self.array_subscripts, self.out_subscripts]
         return np.einsum(*einsum_args)
-
