@@ -86,7 +86,7 @@ class SemigroupTree(tp.Generic[G]):
     def __init__(
             self,
             generators: tp.Iterable[G],
-            func: tp.Callable[[G], tp.Iterable[G]],
+            func: tp.Callable[[G, G], G],
             make_hashable: tp.Callable[[G], tp.Any] = lambda x: x,
     ):
         """ """
@@ -124,7 +124,7 @@ class SemigroupTree(tp.Generic[G]):
                 if product_hashable not in all_seen:
                     all_seen.add(product_hashable)
                     self.members.append(product)
-                    self.generators.append((gen_node_index, rhs_node_index))
+                    self.decomps.append((gen_node_index, rhs_node_index))
                 rhs_node_index += 1
 
     def compute_homomorphism(
@@ -142,4 +142,3 @@ class SemigroupTree(tp.Generic[G]):
                 out.append(get_generator(gen_index, self.generators[gen_index]))
 
         return out
-

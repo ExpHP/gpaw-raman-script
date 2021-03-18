@@ -69,18 +69,18 @@ class Tensor2Callbacks(SymmetryCallbacks):
 
 # FIXME untested
 class GeneralArrayCallbacks(SymmetryCallbacks):
-    def __init__(self, axis_labels, oper_deperms=None, quotient_deperms=None):
+    def __init__(self, axis_labels, oper_deperms=None):
         super().__init__()
         self.shape = None
         self.axis_labels = list(axis_labels)
         self.rotator = TensorRotator(label == 'cart' for label in self.axis_labels)
         self.oper_deperms = oper_deperms
-        self.quotient_deperms = quotient_deperms
+        # self.quotient_deperms = quotient_deperms
         if 'atom' in self.axis_labels:
             if oper_deperms is None:
                 raise RuntimeError('need oper_deperms if there are atom axes')
-            if quotient_deperms is None:
-                self.quotient_deperms = np.array([np.arange(len(oper_deperms[0]))])
+            # if quotient_deperms is None:
+            #     self.quotient_deperms = np.array([np.arange(len(oper_deperms[0]))])
 
         unknown_labels = set(axis_labels) - {'na', 'atom', 'cart'}
         if unknown_labels:
