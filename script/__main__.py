@@ -72,7 +72,7 @@ def main__elph_diamond(action, log):
         #       that has to deal with domain parallelization, and so we need to test it
         parallel = {'domain': world.size },
         # occupations=FermiDirac(width=0.05),
-        # kpts={'size': (kx_gs, ky_gs,1), 'gamma': True},
+        kpts={'size': (2, 2, 2), 'gamma': False},
         xc='PBE',
     )
     # FIXME Need to test with an SC that's at least 3 in one direction to test translations
@@ -82,8 +82,26 @@ def main__elph_diamond(action, log):
     # BRUTE FORCE
     if action == 'brute':
         calc_fd = GPAW(txt=log, **params_fd)
+
+        if not os.path.exists('gs.gpw'):
+            # NOTE: original script used different parameters here (params_gs)  _/o\_
+            calc_gs = GPAW(**params_fd)
+            atoms.calc = calc_gs
+            atoms.get_potential_energy()
+            atoms.calc.write("gs.gpw", mode="all")
+        else:
+            calc_gs = GPAW('gs.gpw')
+
+        # NOTE: original elph.py did this but I don't understand it.
+        # The real space grid of the two calculators should match.
+        params_fd['gpts'] = calc_gs.wfs.gd.N_c * list(supercell)
+
         elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell, calculate_forces=True)
         elph.run()
+        calc_gs.wfs.gd.comm.barrier()
+        elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell)
+        elph.set_lcao_calculator(calc_fd)
+        elph.calculate_supercell_matrix(dump=1)
         return
 
     # ============
