@@ -1,5 +1,7 @@
 import typing as tp
 import itertools
+import contextlib
+import os
 
 T = tp.TypeVar('T')
 G = tp.TypeVar('G')
@@ -75,3 +77,31 @@ class SemigroupTree(tp.Generic[G]):
                 out.append(get_generator(gen_index, self.generators[gen_index]))
 
         return out
+
+
+_NOT_YET_RUN = object()
+def run_once(function):
+    value = _NOT_YET_RUN
+    def wrapped(*args, **kw):
+        nonlocal value
+        # NOTE: This could have a race condition if called from multiple threads in parallel, but since gpaw
+        #       uses MPI, pretty much all possible hope of that has already been thrown out the window.
+        if value is _NOT_YET_RUN:
+            value = function(*args, **kw)
+        return value
+    return wrapped
+
+@contextlib.contextmanager
+def pushd(dest):
+    """ Context manager for changing directory.  The original directory is restored on exiting the ``with`` block.
+
+    This exists because there are some files that GPAW *always* puts in the current directory.
+
+    This will wreak absolute havoc if used in a multithreaded application.
+    """
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(dest)
+        yield None
+    finally:
+        os.chdir(old_cwd)

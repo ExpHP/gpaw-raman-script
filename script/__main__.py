@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
 from . import symmetry
+from . import interop
+from . import utils
 
 import functools
 import os
 import sys
+import copy
 
 from datetime import datetime
 import numpy as np
@@ -50,7 +53,7 @@ def start_log_entry(path):
     parprint(file=logfile)
     parprint('=====================================', file=logfile)
     parprint('===', datetime.now().isoformat(), file=logfile)
-    return Tee(logfile, sys.stdout)
+    return utils.Tee(logfile, sys.stdout)
 
 def main__elph_diamond(action, log):
     from gpaw.elph.electronphonon import ElectronPhononCoupling
@@ -67,7 +70,7 @@ def main__elph_diamond(action, log):
         nbands = "nao",
         convergence={"bands":"all"},
         basis='dzp',
-        h = 0.25,  # large for faster testing
+        h = 0.3,  # large for faster testing
         # NOTE: normally kpt parallelism is better, but in this script we have code
         #       that has to deal with domain parallelization, and so we need to test it
         parallel = {'domain': world.size },
@@ -76,7 +79,7 @@ def main__elph_diamond(action, log):
         xc='PBE',
     )
     # FIXME Need to test with an SC that's at least 3 in one direction to test translations
-    supercell = (2, 2, 2)
+    supercell = (2, 1, 1)
 
     # ============
     # BRUTE FORCE
@@ -111,18 +114,18 @@ def main__elph_diamond(action, log):
     if action == 'symmetry-test':
         # a supercell exactly like ElectronPhononCoupling makes
         supercell_atoms = atoms * supercell
-        quotient_perms = list(ase_repeat_translational_symmetry_perms(len(atoms), supercell))
+        quotient_perms = list(interop.ase_repeat_translational_symmetry_perms(len(atoms), supercell))
 
         def get_wfs_with_sym():
             # Make a supercell exactly like ElectronPhononCoupling makes, but with point_group = True
-            params_fd_sym = dict(params_fd)
+            params_fd_sym = copy.deepcopy(params_fd)
             if 'symmetry' not in params_fd_sym:
                 params_fd_sym['symmetry'] = dict(GPAW.default_parameters['symmetry'])
             params_fd_sym['symmetry']['point_group'] = True
             params_fd_sym['symmetry']['symmorphic'] = False  # enable full spacegroup # FIXME: doesn't work for supercells
             params_fd_sym['symmetry']['tolerance'] = 1e-6
 
-            calc_fd_sym = GPAW(txt=log, **params_fd)
+            calc_fd_sym = GPAW(txt=log, **params_fd_sym)
             dummy_supercell_atoms = supercell_atoms.copy()
             dummy_supercell_atoms.calc = calc_fd_sym
             calc_fd_sym._set_atoms(dummy_supercell_atoms)  # FIXME private method
@@ -150,7 +153,7 @@ def main__elph_diamond(action, log):
             return array_0, arr_dic
 
         # GPAW displaces the center cell for some reason instead of the first cell
-        get_displaced_index = lambda prim_atom: elph.offset + prim_atom
+        get_displaced_index = lambda prim_atom: elph.offset * len(atoms) + prim_atom
 
         disp_atoms = [
             get_displaced_index(0),
@@ -162,10 +165,10 @@ def main__elph_diamond(action, log):
             get_displaced_index(1),
         ]
         disp_carts = [
-            np.array([+1e02, 0, 0]),
-            np.array([-1e02, 0, 0]),
-            np.array([+1e02, 0, 0]),
-            np.array([-1e02, 0, 0]),
+            np.array([+1e-2, 0, 0]),
+            np.array([-1e-2, 0, 0]),
+            np.array([+1e-2, 0, 0]),
+            np.array([-1e-2, 0, 0]),
         ]
 
         disp_values = [
@@ -566,67 +569,6 @@ def iter_displaced_structures(atoms, phonon):
 
 # ==============================================================================
 
-def ase_repeat_translational_symmetry_perms(natoms, repeats):
-    """ Get the full quotient group of pure translational symmetries of ``atoms * repeats``.
-    
-    The order of the output is deterministic but unspecified. """
-    if isinstance(repeats, int):
-        repeats = (repeats, repeats, repeats)
-
-    # It is unclear whether ASE actually specifies the order of atoms in a supercell anywhere,
-    # so be ready for the worst.  (even though this we don't specify order of operators returned,
-    # our handling of repeats like (2, 3, 1) will be totally incorrect if the convention is wrong)
-    if not np.array_equal(repeats, (1, 1, 1)):
-        __check_ase_repeat_convention_hasnt_changed()
-
-    # fastest index is atoms, then repeats[2], then repeats[1], then repeats[0]
-
-    def all_cyclic_perms_of_len(n):
-        # e.g. for n=4 this gives [[0,1,2,3], [1,2,3,0], [2,3,0,1], [3,0,1,2]]
-        return np.add.outer(np.arange(n), np.arange(n)) % n
-
-    n_a, n_b, n_c = repeats
-    atom_perm = np.arange(natoms)  # we never rearrange the atoms within a cell
-    for a_perm in all_cyclic_perms_of_len(n_a):
-        for b_perm in all_cyclic_perms_of_len(n_b):
-            for c_perm in all_cyclic_perms_of_len(n_c):
-                yield permutation_outer_product(a_perm, b_perm, c_perm, atom_perm)
-
-def __check_ase_repeat_convention_hasnt_changed():
-    # A simple structure with an identity matrix for its cell so that atoms in the supercell
-    # have easily-recognizable positions.
-    unitcell = ase.Atoms(symbols=['X', 'Y'], positions=[[0, 0, 0], [0.5, 0, 0]], cell=np.eye(3))
-    sc_positions = (unitcell * (4, 3, 5)).get_positions()
-    if not all([
-        np.all(sc_positions[0].round(8) == [0, 0, 0]),
-        np.all(sc_positions[1].round(8) == [0.5, 0, 0]),    # fastest index: primitive
-        np.all(sc_positions[2].round(8) == [0, 0, 1]),      # ...followed by 3rd cell vector
-        np.all(sc_positions[2*5].round(8) == [0, 1, 0]),    # ...followed by 2nd cell vector
-        np.all(sc_positions[2*5*3].round(8) == [1, 0, 0]),  # ...followed by 1st cell vector
-    ]):
-        raise RuntimeError('ordering of atoms in ASE supercells has changed!')
-
-def permutation_outer_product(*perms):
-    """ Compute the mathematical outer product of a sequence of permutations.
-    
-    The result is a permutation that operates on an array whose length is the product of all of the
-    input perms.  The last perm will be the fastest index in the output (rearranging items within
-    blocks), while the first perm will be the slowest (rearranging the blocks themselves).
-    """
-    from functools import reduce
-
-    lengths = [len(p) for p in perms]  # na, nb, ..., ny, nz
-    strides = np.multiply.accumulate([1] + lengths[1:][::-1])[::-1]   #   ..., nx*ny*nz, ny*nz, nz, 1
-
-    premultiplied_perms = [stride * np.array(perm) for (stride, perm) in zip(strides, perms)]
-    permuted_n_dimensional = reduce(np.add.outer, premultiplied_perms)
-
-    # the thing we just computed is basically what you would get if you started with
-    #  np.arange(product(lengths)).reshape(lengths) and permuted each axis.
-    return permuted_n_dimensional.ravel()
-
-# ==============================================================================
-
 def phonopy_atoms_to_ase(atoms):
     atoms = ase.Atoms(
         symbols=atoms.get_chemical_symbols(),
@@ -634,32 +576,6 @@ def phonopy_atoms_to_ase(atoms):
         cell=atoms.get_cell(),
     )
     return atoms
-
-class Tee :
-    def __init__(self, *fds):
-        self.fds = list(fds)
-
-    def write(self, text):
-        for fd in self.fds:
-            fd.write(text)
-
-    def flush(self):
-        for fd in self.fds:
-            fd.flush()
-
-    def closed(self):
-        return False
-
-    def __enter__(self, *args, **kw):
-        for i, fd in enumerate(self.fds):
-            if fd not in [sys.stdout, sys.stderr] and hasattr(fd, '__enter__'):
-                self.fds[i] = self.fds[i].__enter__(*args, **kw)
-        return self
-
-    def __exit__(self, *args, **kw):
-        for fd in self.fds:
-            if fd not in [sys.stdout, sys.stderr] and hasattr(fd, '__exit__'):
-                fd.__exit__(*args, **kw)
 
 if __name__ == '__main__':
     main()

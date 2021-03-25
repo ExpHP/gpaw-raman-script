@@ -444,7 +444,7 @@ class TensorRotator:
     
     E.g. could perform something similar to ``np.einsum('Aa,Bb,Dd,abcd->ABcD', rot, rot, rot, array)`` if we wanted
     to rotate axes 0, 1, and 3 of an array. """
-    def __init__(self, axis_rotate_flags: tp.Iterator[bool]):
+    def __init__(self, axis_rotate_flags: tp.Iterable[bool]):
         unused_subscripts = itertools.count(start=0)
         self.array_subscripts = []
         self.rotmat_subscripts = []
