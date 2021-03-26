@@ -390,7 +390,7 @@ def make_force_sets_and_excitations(cachepath, disp_filenames, phonon, atoms, ex
             parprint('Max equilibrium force during raman:', np.absolute(disp_forces).max())
         if world.rank == 0:
             np.save(force_filename, disp_forces)
-            ex.write(ex_filename)
+        ex.write(ex_filename)
 
     # combine force sets into one file
     force_sets = np.array([
