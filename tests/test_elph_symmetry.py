@@ -2,6 +2,7 @@ import ase.build
 import numpy as np
 from ase.parallel import world
 
+import gpaw
 from gpaw import GPAW
 from gpaw.cluster import Cluster
 from gpaw.elph.electronphonon import ElectronPhononCoupling
@@ -52,7 +53,7 @@ def test_identity():
             minus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))[1]
             expected = (arrayify_dict(plus) - arrayify_dict(minus)) / (2*DISPLACEMENT_DIST)
 
-            np.testing.assert_allclose(arrayify_dict(full[atom][axis]), expected)
+            np.testing.assert_allclose(arrayify_dict(full[1][atom][axis]), expected)
 
 def test_symmetry():
     ensure_test_data()
@@ -77,9 +78,7 @@ def test_symmetry():
             minus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))[1]
             expected = (arrayify_dict(plus) - arrayify_dict(minus)) / (2*DISPLACEMENT_DIST)
 
-            np.testing.assert_allclose(arrayify_dict(full[atom][axis]), expected, err_msg=f'atom {atom} axis {axis}')
-
-
+            np.testing.assert_allclose(arrayify_dict(full[1][atom][axis]), expected, err_msg=f'atom {atom} axis {axis}')
 
 def test_supercell():
     ensure_test_data()
@@ -99,11 +98,12 @@ def test_supercell():
             minus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))[1]
             expected = (arrayify_dict(plus) - arrayify_dict(minus)) / (2*DISPLACEMENT_DIST)
 
-            np.testing.assert_allclose(arrayify_dict(full[offset+atom][axis]), expected, err_msg=f'atom {atom} axis {axis}')
+            np.testing.assert_allclose(arrayify_dict(full[1][offset+atom][axis]), expected, err_msg=f'atom {atom} axis {axis}')
 
-
-def read_elph_input(data_subdir: str, displacement: AseDisplacement) -> tp.Dict[int, np.ndarray]:
-    return pickle.load(open(f'{MAIN_DATA_DIR}/{data_subdir}/elph.{displacement}.pckl', 'rb'))
+def read_elph_input(data_subdir: str, displacement: AseDisplacement) -> tp.Tuple[np.ndarray, tp.Dict[int, np.ndarray], np.ndarray]:
+    Vt_sG, dH_asp = pickle.load(open(f'{MAIN_DATA_DIR}/{data_subdir}/elph.{displacement}.pckl', 'rb'))
+    forces = pickle.load(open(f'{MAIN_DATA_DIR}/{data_subdir}/phonons.{displacement}.pckl', 'rb'))
+    return Vt_sG, dH_asp, forces
 
 def arrayify_dict(arraydict: tp.Dict[int, np.ndarray]) -> np.ndarray:
     return np.array([arraydict[i] for i in range(len(arraydict))])
@@ -137,7 +137,7 @@ def to_elph_original_types(wfs_with_sym, data):
     """ Turns an unpickled elph file to use the original types from gpaw. """
     from gpaw.arraydict import ArrayDict
 
-    array_0, arr_dic = data
+    array_0, arr_dic, forces = data
     atom_partition = wfs_with_sym.atom_partition
     arr_dic = ArrayDict(
         partition=atom_partition,
@@ -146,7 +146,7 @@ def to_elph_original_types(wfs_with_sym, data):
         d={a:arr_dic[a] for a in atom_partition.my_indices},
     )
     arr_dic.redistribute(atom_partition.as_serial())
-    return array_0, arr_dic
+    return array_0, arr_dic, forces
 
 
 # ==============================================================================
@@ -195,10 +195,23 @@ def gen_test_data(datadir: str, params_fd: dict, supercell):
     elph.set_lcao_calculator(calc_fd)
     elph.calculate_supercell_matrix(dump=1)
 
+# ==============================================================================
+
+def elph_callbacks(wfs_with_symmetry: gpaw.wavefunctions.base.WaveFunctions):
+    Vt_part = symmetry.GeneralArrayCallbacks(['na', 'na', 'na', 'na'])  # FIXME second one shouldn't be na
+    dH_part = symmetry.GpawLcaoDHCallbacks(wfs_with_symmetry)
+    forces_part = symmetry.GeneralArrayCallbacks(['atom', 'cart'], oper_deperms=wfs_with_symmetry.kd.symmetry.a_sa)
+    return symmetry.TupleCallbacks(Vt_part, dH_part, forces_part)
 
 # ==============================================================================
 
-def do_elph_symmetry(data_subdir: str, params_fd: dict, supercell, all_displacements: tp.Iterable[AseDisplacement], symmetry_type: tp.Optional[str]):
+def do_elph_symmetry(
+    data_subdir: str,
+    params_fd: dict,
+    supercell,
+    all_displacements: tp.Iterable[AseDisplacement],
+    symmetry_type: tp.Optional[str],
+):
     atoms = Cluster(ase.build.bulk('C'))
 
     # a supercell exactly like ElectronPhononCoupling makes
@@ -216,7 +229,11 @@ def do_elph_symmetry(data_subdir: str, params_fd: dict, supercell, all_displacem
     all_displacements = list(all_displacements)
     disp_atoms = [get_displaced_index(disp.atom) for disp in all_displacements]
     disp_carts = [disp.cart_displacement(DISPLACEMENT_DIST) for disp in all_displacements]
-    disp_values = [to_elph_original_types(wfs_with_sym, read_elph_input(data_subdir, disp))[1] for disp in all_displacements]
+    disp_values = [to_elph_original_types(wfs_with_sym, read_elph_input(data_subdir, disp)) for disp in all_displacements]
+
+    full_Vt = np.empty((len(supercell_atoms), 3) + disp_values[0][0].shape)
+    full_dH = np.empty((len(supercell_atoms), 3), dtype=object)
+    full_forces = np.empty((len(supercell_atoms), 3) + disp_values[0][2].shape)
 
     lattice = supercell_atoms.get_cell()[...]
     oper_cart_rots = np.einsum('ki,slk,jl->sij', lattice, wfs_with_sym.kd.symmetry.op_scc, np.linalg.inv(lattice))
@@ -225,15 +242,18 @@ def do_elph_symmetry(data_subdir: str, params_fd: dict, supercell, all_displacem
             disp_atoms,       # disp -> atom
             disp_carts,       # disp -> 3-vec
             disp_values,      # disp -> T  (displaced value, optionally minus equilibrium value)
-            symmetry.GpawLcaoDHCallbacks(wfs_with_sym),        # how to work with T
+            elph_callbacks(wfs_with_sym),        # how to work with T
             oper_cart_rots,   # oper -> 3x3
             oper_perms=wfs_with_sym.kd.symmetry.a_sa,       # oper -> atom' -> atom
             quotient_perms=quotient_perms,
         )
         for a in range(len(full_values)):
             for c in range(3):
-                full_values[a][c] = dict(full_values[a][c])
+                full_Vt[a][c] = full_values[a][c][0]
+                full_dH[a][c] = dict(full_values[a][c][1])
+                full_forces[a][c] = full_values[a][c][2]
     else:
-        full_values = None
+        # FIXME
+        pass
 
-    return full_values
+    return full_Vt, full_dH, full_forces

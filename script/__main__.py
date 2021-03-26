@@ -36,12 +36,16 @@ def main():
     p = subs.add_parser('diamond')
     p.add_argument('--brute', dest='action', action='store_const', const='brute')
     p.add_argument('--symmetry-test', dest='action', action='store_const', const='symmetry-test')
-    p.set_defaults(func=lambda args, log: main__elph_diamond(action=args.action, log=log))
+    p.add_argument('--supercell', type=(lambda s: tuple(map(int, s))), dest='supercell', default=(1,1,1))
+    p.set_defaults(func=lambda args, log: main__elph_diamond(action=args.action, supercell=args.supercell, log=log))
 
     # Old script is still here so that we can maintain it and work towards
     # factoring out commonalities with the new script.
-    p = subs.add_parser('ch4')
-    p.set_defaults(func=lambda args, log: main__raman_ch4(log=log))
+    p = subs.add_parser('raman')
+    p.set_defaults(structure='ch4')
+    p.add_argument('--mos2', action='store_const', dest='structure', const='mos2')
+    p.add_argument('--supercell', type=(lambda s: tuple(map(int, s))), dest='supercell', default=(1,1,1))
+    p.set_defaults(func=lambda args, log: main__raman_ch4(structure=args.structure, supercell=args.supercell, log=log))
 
     args = parser.parse_args()
 
@@ -55,7 +59,7 @@ def start_log_entry(path):
     parprint('===', datetime.now().isoformat(), file=logfile)
     return utils.Tee(logfile, sys.stdout)
 
-def main__elph_diamond(action, log):
+def main__elph_diamond(supercell, action, log):
     from gpaw.elph.electronphonon import ElectronPhononCoupling
     from gpaw.lrtddft.spectrum import polarizability
     from gpaw.lrtddft import LrTDDFT
@@ -78,8 +82,6 @@ def main__elph_diamond(action, log):
         kpts={'size': (2, 2, 2), 'gamma': False},
         xc='PBE',
     )
-    # FIXME Need to test with an SC that's at least 3 in one direction to test translations
-    supercell = (2, 1, 1)
 
     # ============
     # BRUTE FORCE
@@ -98,6 +100,8 @@ def main__elph_diamond(action, log):
         # NOTE: original elph.py did this but I don't understand it.
         # The real space grid of the two calculators should match.
         params_fd['gpts'] = calc_gs.wfs.gd.N_c * list(supercell)
+        if 'h' in params_fd:
+            del params_fd['h']
 
         elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell, calculate_forces=True)
         elph.run()
@@ -202,8 +206,8 @@ def main__elph_diamond(action, log):
     # TODO: test that uses phonopy for displacements.
     pass
 
-def main__raman_ch4(log):
-    from ase.build import molecule
+def main__raman_ch4(structure, supercell, log):
+    import ase.build
 
     from gpaw.lrtddft.spectrum import polarizability
     from gpaw.cluster import Cluster
@@ -216,10 +220,14 @@ def main__raman_ch4(log):
     relax_grid_sep = 0.22  # GPAW finite grid size
     vacuum_sep = 3.5
     pbc = False
-    def get_unrelaxed_structure():
-        atoms = Cluster(molecule('CH4'))
-        atoms.minimal_box(vacuum_sep, h=relax_grid_sep)
-        return atoms
+    if structure == 'ch4':
+        def get_unrelaxed_structure():
+            atoms = Cluster(ase.build.molecule('CH4'))
+            atoms.minimal_box(vacuum_sep, h=relax_grid_sep)
+            return atoms
+    elif structure == 'mos2':
+            atoms = Cluster(ase.build.mx2('MoS2'))
+            atoms.center(vacuum=vacuum_sep, axis=2)
 
     # Calculator (general settings)
     make_calc = functools.partial(GPAW,
@@ -248,7 +256,7 @@ def main__raman_ch4(log):
             eigensolver='cg',
             nbands=num_total_bands,
     )
-    supercell_matrix = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+    supercell_matrix = [[supercell[0], 0, 0], [0, supercell[1], 0], [0, 0, supercell[2]]]
     displacement_distance = 1e-2
 
     # ----------
@@ -416,12 +424,12 @@ def expand_raman_by_symmetry(cachepath,
 
     disp_atoms, disp_carts = map(np.array, zip(*get_displacements(phonon)))
 
-    symmetry = phonon.primitive_symmetry.get_symmetry_operations()
+    prim_symmetry = phonon.primitive_symmetry.get_symmetry_operations()
     lattice = phonon.primitive.get_cell()[...]
     carts = phonon.primitive.get_positions()
 
-    oper_frac_rots = symmetry['rotations']
-    oper_frac_trans = symmetry['translations']
+    oper_frac_rots = prim_symmetry['rotations']
+    oper_frac_trans = prim_symmetry['translations']
     oper_cart_rots = np.array([np.linalg.inv(lattice).T @ R @ lattice.T for R in oper_frac_rots])
     oper_cart_trans = oper_frac_trans @ lattice
 

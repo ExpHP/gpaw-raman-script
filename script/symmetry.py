@@ -23,6 +23,7 @@ class SymmetryCallbacks(ABC, tp.Generic[T]):
     """
     def __init__(self):
         self.__already_init = False
+        self.__flat_len = None
 
     def initialize(self, obj: T):
         """ Record any data needed about the shape of T, if necessary.
@@ -33,9 +34,22 @@ class SymmetryCallbacks(ABC, tp.Generic[T]):
             raise RuntimeError('SymmetryCallbacks instances must not be reused')
         self.__already_init = True
 
-    @abstractmethod
     def flatten(self, obj: T) -> np.ndarray:
-        """ Convert an object into an ndarray of ndim 1. """
+        arr = self.flatten_impl(obj)
+        if self.__flat_len is None:
+            self.__flat_len, = arr.shape
+        else:
+            np.testing.assert_array_equal(arr.shape, (self.__flat_len,))
+        return arr
+
+    def flat_len(self):
+        if self.__flat_len is None:
+            raise ValueError('must call .flatten() at least once first')
+        return self.__flat_len
+
+    @abstractmethod
+    def flatten_impl(self, obj: T) -> np.ndarray:
+        """ Method that should be defined on subclasses to implement ``flatten``. """
         raise NotImplementedError
 
     @abstractmethod
@@ -53,8 +67,8 @@ class SymmetryCallbacks(ABC, tp.Generic[T]):
         """ Apply a pure translational symmetry represented as a permutation (s' -> s). """
         raise NotImplementedError
 
-class Tensor2Callbacks(SymmetryCallbacks):
-    def flatten(self, obj):
+class Tensor2Callbacks(SymmetryCallbacks[np.ndarray]):
+    def flatten_impl(self, obj):
         return obj.reshape((9,))
 
     def restore(self, arr):
@@ -68,7 +82,7 @@ class Tensor2Callbacks(SymmetryCallbacks):
         return obj
 
 # FIXME untested
-class GeneralArrayCallbacks(SymmetryCallbacks):
+class GeneralArrayCallbacks(SymmetryCallbacks[np.ndarray]):
     def __init__(self, axis_labels, oper_deperms=None):
         super().__init__()
         self.shape = None
@@ -87,10 +101,11 @@ class GeneralArrayCallbacks(SymmetryCallbacks):
             raise RuntimeError(f'bad axis labels: {sorted(unknown_labels)}')
 
     def initialize(self, obj):
+        super().initialize(obj)
         self.shape = obj.shape
-        assert len(self.shape) == len(self.axis_labels)
+        np.testing.assert_equal(len(self.shape), len(self.axis_labels), err_msg=str(self.shape))
 
-    def flatten(self, obj):
+    def flatten_impl(self, obj):
         return obj.reshape(-1)
 
     def restore(self, arr):
@@ -111,7 +126,7 @@ class GeneralArrayCallbacks(SymmetryCallbacks):
                 obj = obj[(slice(None),) * axis + (deperm,)]
         return obj
 
-class GpawArrayDictCallbacks(SymmetryCallbacks):
+class GpawArrayDictCallbacks(SymmetryCallbacks[gpaw.arraydict.ArrayDict]):
     """ Callbacks for a gpaw ``ArrayDict``. """
     def __init__(self):
         super().__init__()
@@ -134,7 +149,7 @@ class GpawArrayDictCallbacks(SymmetryCallbacks):
             template[key] = np.empty_like(template[key])
         self.template_arraydict = template
 
-    def flatten(self, obj):
+    def flatten_impl(self, obj):
         return np.concatenate([a.reshape(-1) for a in obj.values()])
 
     def restore(self, arr):
@@ -181,6 +196,36 @@ class GpawLcaoDHCallbacks(GpawArrayDictCallbacks):
                 out_asp[adest][s][...] = tmp_p
 
         return out_asp
+
+class TupleCallbacks(SymmetryCallbacks[tp.Tuple]):
+    # Callbacks for each item.
+    parts: tp.List[SymmetryCallbacks]
+
+    def __init__(self, *parts: SymmetryCallbacks):
+        super().__init__()
+        self.parts = list(parts)
+
+    def initialize(self, obj):
+        super().initialize(obj)
+
+        assert isinstance(obj, tuple)
+        assert len(obj) == len(self.parts)
+        for (x, callbacks) in zip(obj, self.parts):
+            callbacks.initialize(x)
+
+    def flatten_impl(self, obj):
+        return np.concatenate([callbacks.flatten(x) for (x, callbacks) in zip(obj, self.parts)])
+
+    def restore(self, arr):
+        splits = np.cumsum([callbacks.flat_len() for callbacks in self.parts])[:-1]
+        arrs = np.split(arr, splits)
+        return tuple(callbacks.restore(arr) for (arr, callbacks) in zip(arrs, self.parts))
+
+    def rotate(self, obj, oper, cart_rot):
+        return (callbacks.rotate(x, oper, cart_rot) for (x, callbacks) in zip(obj, self.parts))
+
+    def permute_atoms(self, obj, deperm):
+        return (callbacks.permute_atoms(x, deperm) for (x, callbacks) in zip(obj, self.parts))
 
 # ==============================================================================
 
