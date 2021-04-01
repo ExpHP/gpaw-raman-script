@@ -84,7 +84,7 @@ def sym_quotient_translational_00_xyz():
 # * Tests a GeneralArrayCallbacks 'cart' axis
 def test_general_array_vec():
     sym = sym_xyz_1_atom()
-    callbacks = symmetry.GeneralArrayCallbacks(['cart'], oper_deperms=sym.oper_perms)
+    callbacks = symmetry.GeneralArrayCallbacks(['cart'])
     disp_atoms, disp_carts, disp_values = zip(*[
         DispData(0, [ 0.1, 0, 0], data=np.array([ 1., 0, 0])),
         DispData(0, [-0.1, 0, 0], data=np.array([-1., 0, 0])),
@@ -105,7 +105,7 @@ def test_general_array_vec():
 # * Tests a GeneralArrayCallbacks 'atom' axis.
 def test_general_array_atom():
     sym = sym_xyz_3_atom()
-    callbacks = symmetry.GeneralArrayCallbacks(['atom'], oper_deperms=sym.oper_perms)
+    callbacks = symmetry.GeneralArrayCallbacks(['atom'])
     disp_atoms, disp_carts, disp_values = zip(*[
         # because the operator is no longer in the site symmetry, we need more disps
         DispData(0, [ 0.1,    0,    0], data=np.array([ 2.,  3.,  4.])),
@@ -142,7 +142,7 @@ def test_pure_translation():
             ('EMBEDDED TRANSLATIONS', sym_embedded_translational_010101()),
     ]:
         print(f'TRYING {description}')
-        callbacks = symmetry.GeneralArrayCallbacks([], oper_deperms=sym.oper_perms)
+        callbacks = symmetry.GeneralArrayCallbacks([])
         disp_atoms, disp_carts, disp_values = zip(*[
             DispData(0, [ 0.1,    0,    0], data=np.array( 1.)),
             DispData(0, [-0.1,    0,    0], data=np.array(-1.)),
@@ -175,7 +175,7 @@ def test_pure_translation():
 def test_general_array_atom_quotient():
     sym = sym_quotient_translational_00_xyz()
 
-    callbacks = symmetry.GeneralArrayCallbacks(['atom'], oper_deperms=sym.oper_perms)
+    callbacks = symmetry.GeneralArrayCallbacks(['atom'])
     disp_atoms, disp_carts, disp_values = zip(*[
         DispData(0, [ 0.1,    0,    0], data=np.array([ 1.,  2.,  3.])),
         DispData(0, [-0.1,    0,    0], data=np.array([-1., -2., -3.])),

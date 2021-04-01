@@ -314,7 +314,7 @@ def gen_test_data(datadir: str, params_fd: dict, supercell):
 def elph_callbacks(wfs_with_symmetry: gpaw.wavefunctions.base.WaveFunctions):
     Vt_part = symmetry.GeneralArrayCallbacks(['na', 'na', 'na', 'na'])  # FIXME second one shouldn't be na
     dH_part = symmetry.GpawLcaoDHCallbacks(wfs_with_symmetry)
-    forces_part = symmetry.GeneralArrayCallbacks(['atom', 'cart'], oper_deperms=wfs_with_symmetry.kd.symmetry.a_sa)
+    forces_part = symmetry.GeneralArrayCallbacks(['atom', 'cart'])
     return symmetry.TupleCallbacks(Vt_part, dH_part, forces_part)
 
 # ==============================================================================

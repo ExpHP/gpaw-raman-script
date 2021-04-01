@@ -14,6 +14,10 @@ from abc import ABC, abstractmethod
 import typing as tp
 T = tp.TypeVar("T")
 
+AtomIndex = int
+QuotientIndex = int
+OperIndex = int
+
 class SymmetryCallbacks(ABC, tp.Generic[T]):
     """ Class that factors out operations needed by ``expand_derivs_by_symmetry`` to make it
     general over all different sorts of data.
@@ -58,13 +62,28 @@ class SymmetryCallbacks(ABC, tp.Generic[T]):
         raise NotImplementedError
 
     @abstractmethod
-    def rotate(self, obj: T, sym: int, cart_rot) -> T:
-        """ Apply a spacegroup operation. """
+    def apply_oper(self, obj: T, oper: OperIndex, cart_rot, atom_deperm) -> T:
+        """ Apply a spacegroup operation.
+        
+        The ``cart_rot`` matrix (representing the rotational part of the operation as a 3x3 matrix
+        to apply on the left side of a 3-vector) and the ``atom_deperm`` array (representing the operator
+        as a permutation of data indexed by atom, where ``transformed_data = data[atom_deperm]``)
+        are supplied for convenience.  If an implementation doesn't need them (or it is not enough,
+        e.g. it needs to know the fractional translation part), then that's fine; it should store the
+        necessary data and look at ``oper`` instead.
+        """
         raise NotImplementedError
 
     @abstractmethod
-    def permute_atoms(self, obj: T, site_deperm: np.ndarray) -> T:
-        """ Apply a pure translational symmetry represented as a permutation (s' -> s). """
+    def apply_quotient(self, obj: T, quotient: QuotientIndex, atom_deperm: np.ndarray) -> T:
+        """ Apply a pure translational symmetry.
+        
+        The ``atom_deperm`` array (representing the translation as a permutation of data indexed by
+        atom, i.e. ``translated_data = data[atom_deperm]``) is supplied for convenience.
+        If an implementation doesn't need it (or it is not enough, e.g. it needs to know how
+        the points in a finite grid permute), then that's fine; it should store the necessary data
+        and look at ``quotient`` instead.
+        """
         raise NotImplementedError
 
 class Tensor2Callbacks(SymmetryCallbacks[np.ndarray]):
@@ -74,31 +93,110 @@ class Tensor2Callbacks(SymmetryCallbacks[np.ndarray]):
     def restore(self, arr):
         return arr.reshape((3, 3))
 
-    def rotate(self, obj, sym, cart_rot):
+    def apply_oper(self, obj, oper, cart_rot, atom_deperm):
         assert obj.shape == (3, 3)
         return cart_rot @ obj @ cart_rot.T
 
-    def permute_atoms(self, obj, deperm):
+    def apply_quotient(self, obj, quotient, atom_deperm):
         return obj
 
-# FIXME untested
+Label = str
+OperType = str  # "oper" | "quotient"
+TransformType = str  # "matrix" | "perm"
+
 class GeneralArrayCallbacks(SymmetryCallbacks[np.ndarray]):
-    def __init__(self, axis_labels, oper_deperms=None):
+    """ Implements ArrayCallbacks for any ndarray where the action of a symmetry operation factorizes cleanly
+    into an independent group action on each individual axis of the array. """
+
+    # the arrays in here are the data arrays mentioned in the documentation of the `label_specs` argument.
+    oper_specs: tp.Dict[Label, tp.Tuple[TransformType, np.ndarray]]
+    quotient_specs: tp.Dict[Label, tp.Tuple[TransformType, np.ndarray]]
+
+    PLACEHOLDER_CART_ROT = object()
+    PLACEHOLDER_ATOM_DEPERM = object()
+
+    def __init__(
+            self,
+            axis_labels: tp.Sequence[Label],
+            *label_specs: tp.Tuple[tp.Tuple[Label, OperType], TransformType, np.ndarray],
+            ):
+        """
+        Construct a callback for a general n-dimensional array by specifying the action on each individual axis
+        (either as a matrix product or a permutation).
+        
+        :param axis_labels: sequence of ``str`` for each array axis.  ``"cart"`` means to rotate this axis
+        like a Cartesian vector. ``"atom"`` means it indexes atoms in the supercell. ``"na"`` means to leave this
+        axis alone.  The meaning of other labels can be controlled through ``label_specs``.
+        Any label is allowed to appear any number of times.
+
+        :param label_specs: Supplies the data necessary for transforming each label.
+        First in each spec is a key, composed of two strings.  The first string is an axis label;
+        let ``<axislen>`` refer to the length of this axis.
+        The second string is one of ``'oper'`` (for spacegroup) or ``'quotient'`` (for supercell translations);
+        let ``<nsym>`` refer to the size of the corresponding symmetry group.
+
+        After the key is a string indicating the type of operation to perform, followed by the data for that operation.
+        * If the operation is ``'perm'``, then the data is an integer array of shape ``(<nsym>, <axislen>)``.
+          Each row is the representation of an operator as a permutation of data indexed by that axis,
+          in such a form that ``new_data == data[perm]``.
+        * If the operation is ``'matrix'``, then the data is an array of shape ``(<nsym>, <axislen>, <axislen>)``
+          that could be applied on the left hand side of a column vector indexed by this axis.
+
+        Any label used in ``axis_labels`` must have at least one spec,
+        except for the labels ``"cart"``, ``"atom"`` and ``"na"``.
+
+        Example:  A rank 2 cartesian tensor (such as polarizability) could be transformed using
+        ``GeneralArrayCallbacks(['cart', 'cart'])``, which is equivalent to computing rotations as ``R @ tensor @ R.T``.
+        
+        Example:  GPAW has an array ``Vt_sG`` which is indexed by ``(spin, na, nb, nc)``, where ``(na, nb, nc)`` are
+        the dimensions of a real-space grid.  Unfortunately, the action of a rotation on this doesn't cleanly factor
+        out into an independent action on each axis, but if you flatten out the last three axes to get ``(spin, gridpoint)``,
+        then you will find that all symmetry operations permute these gridpoints.
+        Therefore, after computing the necessary perms, one could use
+        ``GeneralArrayCallbacks(['na', 'grid'], (('grid', 'oper'), 'perm', oper_grid_perms), (('grid', 'quotient'), 'perm', quotient_grid_perms))``.
+        """
         super().__init__()
+
         self.shape = None
         self.axis_labels = list(axis_labels)
-        self.rotator = TensorRotator(label == 'cart' for label in self.axis_labels)
-        self.oper_deperms = oper_deperms
-        # self.quotient_deperms = quotient_deperms
-        if 'atom' in self.axis_labels:
-            if oper_deperms is None:
-                raise RuntimeError('need oper_deperms if there are atom axes')
-            # if quotient_deperms is None:
-            #     self.quotient_deperms = np.array([np.arange(len(oper_deperms[0]))])
 
-        unknown_labels = set(axis_labels) - {'na', 'atom', 'cart'}
+        seen_keys = set()
+        self.oper_specs = {}
+        self.quotient_specs = {}
+        for key, transform_kind, transform_data in label_specs:
+            transform_data = np.array(transform_data)
+
+            label, oper_type = key
+            key = (label, oper_type)  # ensure hashable
+            if key in seen_keys:
+                raise ValueError(f'Key {repr(key)} used multiple times!')
+            seen_keys.add(key)
+
+            if label in ['na', 'cart', 'rot']:
+                raise ValueError(f"Cannot override label {label}")
+
+            if transform_kind == 'matrix':
+                assert transform_data.ndim == 3
+                assert transform_data.shape[1] == transform_data.shape[2]
+            elif transform_kind == 'perm':
+                assert transform_data.ndim == 2
+            else:
+                raise ValueError(f'Invalid transform type {repr(transform_kind)}')
+
+            if oper_type == 'oper':
+                self.oper_specs[label] = (transform_kind, transform_data)
+            elif oper_type == 'quotient':
+                self.quotient_specs[label] = (transform_kind, transform_data)
+            else:
+                raise ValueError(f'Invalid symmetry type {repr(oper_type)}')
+
+        self.oper_specs['cart'] = ('matrix', type(self).PLACEHOLDER_CART_ROT)
+        self.oper_specs['atom'] = ('perm', type(self).PLACEHOLDER_ATOM_DEPERM)
+        self.quotient_specs['atom'] = ('perm', type(self).PLACEHOLDER_ATOM_DEPERM)
+
+        unknown_labels = set(axis_labels) - {'na'} - set(self.oper_specs) - set(self.quotient_specs)
         if unknown_labels:
-            raise RuntimeError(f'bad axis labels: {sorted(unknown_labels)}')
+            raise RuntimeError(f'Some labels are missing symmetry data: {sorted(unknown_labels)}')
 
     def initialize(self, obj):
         super().initialize(obj)
@@ -111,19 +209,41 @@ class GeneralArrayCallbacks(SymmetryCallbacks[np.ndarray]):
     def restore(self, arr):
         return arr.reshape(self.shape)
 
-    def rotate(self, obj, oper, cart_rot):
-        assert obj.shape == self.shape, [self.shape, obj.shape]
-        obj = self.rotator.rotate(cart_rot, obj)
-        if self.oper_deperms is not None:
-            obj = self.permute_atoms(obj, self.oper_deperms[oper])
-        return obj
+    def apply_oper(self, obj, oper, cart_rot, atom_deperm):
+        return self._apply_sym(obj, self.oper_specs, oper, cart_rot=cart_rot, atom_deperm=atom_deperm)
 
-    def permute_atoms(self, obj, deperm):
+    def apply_quotient(self, obj, quotient, atom_deperm):
+        return self._apply_sym(obj, self.quotient_specs, quotient, atom_deperm=atom_deperm)
+
+    def _apply_sym(self, obj, label_specs, sym_index, cart_rot=None, atom_deperm=None):
+        assert obj.shape == self.shape, [self.shape, obj.shape]
+
         obj = obj.copy()
-        for axis, label in enumerate(self.axis_labels):
-            if label == 'atom':
-                # perform integer array indexing on the `axis`th axis
-                obj = obj[(slice(None),) * axis + (deperm,)]
+
+        for label, (transform_kind, sym_transform_data) in label_specs.items():
+            if sym_transform_data is type(self).PLACEHOLDER_ATOM_DEPERM:
+                transform_data = atom_deperm
+            elif sym_transform_data is type(self).PLACEHOLDER_CART_ROT:
+                transform_data = cart_rot
+            else: 
+                transform_data = sym_transform_data[sym_index]
+
+            if transform_kind == 'matrix':
+                rotation_matrix = transform_data
+                # perform a tensor contraction over every axis with this label
+                rotator = TensorRotator(l == label for l in self.axis_labels)
+                obj = rotator.rotate(rotation_matrix, obj)
+
+            elif transform_kind == 'perm':
+                permutation = transform_data
+                for iter_axis, iter_label in enumerate(self.axis_labels):
+                    if iter_label == label:
+                        # perform integer array indexing on the `axis`th axis
+                        obj = obj[(slice(None),) * iter_axis + (permutation,)]
+
+            else:
+                assert False, transform_kind  # unreachable
+
         return obj
 
 class GpawArrayDictCallbacks(SymmetryCallbacks[gpaw.arraydict.ArrayDict]):
@@ -162,7 +282,11 @@ class GpawArrayDictCallbacks(SymmetryCallbacks[gpaw.arraydict.ArrayDict]):
             out_a[a][...] = arrs_a[a].reshape(out_a.shapes_a[a])
         return out_a
 
-    def permute_atoms(self, obj, deperm):
+    # FIXME: Technically this should override apply_oper as well to apply that permutation.
+    #        Currently that's done in the GpawLcaoDHCallbacks subclass.
+    #        Which is just... *wrong.*
+
+    def apply_quotient(self, obj, quotient, deperm):
         out_a = self.template_arraydict.copy()
         for anew, aold in enumerate(deperm):
             out_a[anew] = obj[aold]
@@ -174,7 +298,7 @@ class GpawLcaoDHCallbacks(GpawArrayDictCallbacks):
         super().__init__()
         self.wfs = wfs_with_symmetry
 
-    def rotate(self, obj, sym, cart_rot):
+    def apply_oper(self, obj, sym, cart_rot, atom_deperm):
         from gpaw.utilities import pack, unpack2
 
         # FIXME: It's *possible* that this is actually applying the inverse of sym instead of sym itself.
@@ -184,6 +308,7 @@ class GpawLcaoDHCallbacks(GpawArrayDictCallbacks):
         dH_asp = obj
         out_asp = obj.copy()
         a_a = self.wfs.kd.symmetry.a_sa[sym]
+        assert (a_a == atom_deperm).all()
 
         for adest in dH_asp.keys():
             asrc = a_a[adest]
@@ -221,11 +346,11 @@ class TupleCallbacks(SymmetryCallbacks[tp.Tuple]):
         arrs = np.split(arr, splits)
         return tuple(callbacks.restore(arr) for (arr, callbacks) in zip(arrs, self.parts))
 
-    def rotate(self, obj, oper, cart_rot):
-        return (callbacks.rotate(x, oper, cart_rot) for (x, callbacks) in zip(obj, self.parts))
+    def apply_oper(self, obj, oper, cart_rot, atom_deperm):
+        return (callbacks.apply_oper(x, oper, cart_rot, atom_deperm) for (x, callbacks) in zip(obj, self.parts))
 
-    def permute_atoms(self, obj, deperm):
-        return (callbacks.permute_atoms(x, deperm) for (x, callbacks) in zip(obj, self.parts))
+    def apply_quotient(self, obj, quotient, atom_deperm):
+        return (callbacks.apply_quotient(x, quotient, atom_deperm) for (x, callbacks) in zip(obj, self.parts))
 
 # ==============================================================================
 
@@ -340,8 +465,8 @@ def expand_derivs_by_symmetry(
 
     def apply_combined_oper(value: T, combined: 'CombinedOperator'):
         oper, quotient = combined
-        value = callbacks.rotate(value, oper, cart_rot=oper_cart_rots[oper])
-        value = callbacks.permute_atoms(value, quotient_perms[quotient])
+        value = callbacks.apply_oper(value, oper, cart_rot=oper_cart_rots[oper], atom_deperm=oper_perms[oper])
+        value = callbacks.apply_quotient(value, quotient_perms[quotient], atom_deperm=quotient_perms[quotient])
         return value
 
     # Compute derivatives with respect to displaced (representative) atoms
@@ -404,10 +529,6 @@ def expand_derivs_by_symmetry(
     final_out = np.empty((natoms, 3), dtype=object)
     final_out[...] = [site_derivatives[i] for i in range(natoms)]
     return final_out
-
-AtomIndex = int
-QuotientIndex = int
-OperIndex = int
 
 class CombinedOperator(tp.NamedTuple):
     """ Represents a symmetry operation that is the composition of a space group/pointgroup
