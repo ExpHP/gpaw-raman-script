@@ -56,11 +56,11 @@ def test_identity():
             pluses = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=+1))
             minuses = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))
             expected_Vt = (pluses[0] - minuses[0]) / (2*DISPLACEMENT_DIST)
-            expected_dH = (arrayify_dict(pluses[1]) - arrayify_dict(minuses[1])) / (2*DISPLACEMENT_DIST)
+            expected_dH = (pluses[1] - minuses[1]) / (2*DISPLACEMENT_DIST)
             expected_forces = (pluses[2] - minuses[2]) / (2*DISPLACEMENT_DIST)
 
             np.testing.assert_allclose(full[0][atom][axis], expected_Vt, err_msg=f'atom {atom} axis {axis}')
-            np.testing.assert_allclose(arrayify_dict(full[1][atom][axis]), expected_dH, err_msg=f'atom {atom} axis {axis}')
+            np.testing.assert_allclose(full[1][atom][axis], expected_dH, err_msg=f'atom {atom} axis {axis}')
             np.testing.assert_allclose(full[2][atom][axis], expected_forces, err_msg=f'atom {atom} axis {axis}')
 
 @pytest.fixture
@@ -86,8 +86,8 @@ def test_symmetry_dH(data_symmetry):
         for axis in range(3):
             pluses = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=+1))
             minuses = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))
-            expected = (arrayify_dict(pluses[1]) - arrayify_dict(minuses[1])) / (2*DISPLACEMENT_DIST)
-            actual = arrayify_dict(full[1][atom][axis])
+            expected = (pluses[1] - minuses[1]) / (2*DISPLACEMENT_DIST)
+            actual = full[1][atom][axis]
 
             rtol = 1e-8
             check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'dH for atom {atom} axis {axis}')
@@ -139,8 +139,8 @@ def test_supercell_211_dH(data_supercell_211):
         for axis in range(3):
             plus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=+1))[1]
             minus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))[1]
-            expected = (arrayify_dict(plus) - arrayify_dict(minus)) / (2*DISPLACEMENT_DIST)
-            actual = arrayify_dict(full[1][offset+atom][axis])
+            expected = (plus - minus) / (2*DISPLACEMENT_DIST)
+            actual = full[1][offset+atom][axis]
 
             rtol = 1e-8
             check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'dH for atom {atom} axis {axis}')
@@ -155,7 +155,7 @@ def test_supercell_211_Vt(data_supercell_211):
             plus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=+1))[0]
             minus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))[0]
             expected = (plus - minus) / (2*DISPLACEMENT_DIST)
-            actual = arrayify_dict(full[0][offset+atom][axis])
+            actual = full[0][offset+atom][axis]
 
             rtol = 1e-8
             check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'dH for atom {atom} axis {axis}')
@@ -204,13 +204,11 @@ def check_symmetry_result(symmetric_array, normal_array, expected_nnz_range=None
             print('   {:25} {:25}   RELERR {:.3e}'.format(symmetric_elems[i], normal_elems[i], ratios[i] - 1))
         raise
 
-def read_elph_input(data_subdir: str, displacement: AseDisplacement) -> tp.Tuple[np.ndarray, tp.Dict[int, np.ndarray], np.ndarray]:
-    Vt_sG, dH_asp = pickle.load(open(f'{MAIN_DATA_DIR}/{data_subdir}/elph.{displacement}.pckl', 'rb'))
+def read_elph_input(data_subdir: str, displacement: AseDisplacement) -> tp.Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    Vt_sG, dH_asp_orig = pickle.load(open(f'{MAIN_DATA_DIR}/{data_subdir}/elph.{displacement}.pckl', 'rb'))
     forces = pickle.load(open(f'{MAIN_DATA_DIR}/{data_subdir}/phonons.{displacement}.pckl', 'rb'))
+    dH_asp = np.array([dH_asp_orig[i] for i in range(len(dH_asp_orig))])  # dict to array
     return Vt_sG, dH_asp, forces
-
-def arrayify_dict(arraydict: tp.Dict[int, np.ndarray]) -> np.ndarray:
-    return np.array([arraydict[i] for i in range(len(arraydict))])
 
 def get_wfs_with_sym(params_fd, symmetry_type, supercell_atoms):
     # Make a supercell exactly like ElectronPhononCoupling makes, but with point_group = True
@@ -236,21 +234,6 @@ def get_wfs_with_sym(params_fd, symmetry_type, supercell_atoms):
     calc_fd_sym.initialize()
     calc_fd_sym.set_positions(dummy_supercell_atoms)
     return calc_fd_sym.wfs
-
-def to_elph_original_types(wfs_with_sym, data):
-    """ Turns an unpickled elph file to use the original types from gpaw. """
-    from gpaw.arraydict import ArrayDict
-
-    array_0, arr_dic, forces = data
-    atom_partition = wfs_with_sym.atom_partition
-    arr_dic = ArrayDict(
-        partition=atom_partition,
-        shapes_a=[arr_dic[a].shape for a in range(atom_partition.natoms)],
-        dtype=arr_dic[0].dtype,
-        d={a:arr_dic[a] for a in atom_partition.my_indices},
-    )
-    arr_dic.redistribute(atom_partition.as_serial())
-    return array_0, arr_dic, forces
 
 # ==============================================================================
 
@@ -373,7 +356,7 @@ def do_elph_symmetry(
     all_displacements = list(all_displacements)
     disp_atoms = [get_displaced_index(disp.atom) for disp in all_displacements]
     disp_carts = [disp.cart_displacement(DISPLACEMENT_DIST) for disp in all_displacements]
-    disp_values = [to_elph_original_types(wfs_with_sym, read_elph_input(data_subdir, disp)) for disp in all_displacements]
+    disp_values = [read_elph_input(data_subdir, disp) for disp in all_displacements]
 
     full_Vt = np.empty((len(supercell_atoms), 3) + disp_values[0][0].shape)
     full_dH = np.empty((len(supercell_atoms), 3), dtype=object)
@@ -394,7 +377,7 @@ def do_elph_symmetry(
         for a in range(len(full_values)):
             for c in range(3):
                 full_Vt[a][c] = full_values[a][c][0]
-                full_dH[a][c] = dict(full_values[a][c][1])
+                full_dH[a][c] = full_values[a][c][1]
                 full_forces[a][c] = full_values[a][c][2]
     else:
         # FIXME

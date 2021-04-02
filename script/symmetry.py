@@ -87,13 +87,22 @@ class SymmetryCallbacks(ABC, tp.Generic[T]):
         """
         raise NotImplementedError
 
-class Tensor2Callbacks(SymmetryCallbacks[np.ndarray]):
+class ArrayCallbacks(SymmetryCallbacks[np.ndarray]):
+    """ Superclass that handles the flattening and restoration steps for callbacks on an array. """
+    shape: tp.Tuple[int, ...]
+
+    def initialize(self, obj):
+        super().initialize(obj)
+        self.shape = obj.shape
+
     def flatten_impl(self, obj):
-        return obj.reshape((9,))
+        np.testing.assert_array_equal(obj.shape, self.shape)
+        return obj.reshape(-1)
 
     def restore(self, arr):
-        return arr.reshape((3, 3))
+        return arr.reshape(self.shape)
 
+class Tensor2Callbacks(ArrayCallbacks):
     def apply_oper(self, obj, oper, cart_rot, atom_deperm):
         assert obj.shape == (3, 3)
         return cart_rot @ obj @ cart_rot.T
@@ -105,8 +114,8 @@ Label = str
 OperType = str  # "oper" | "quotient"
 TransformType = str  # "matrix" | "perm"
 
-class GeneralArrayCallbacks(SymmetryCallbacks[np.ndarray]):
-    """ Implements ArrayCallbacks for any ndarray where the action of a symmetry operation factorizes cleanly
+class GeneralArrayCallbacks(ArrayCallbacks):
+    """ Implements SymmetryCallbacks for any ndarray where the action of a symmetry operation factorizes cleanly
     into an independent group action on each individual axis of the array. """
 
     # the arrays in here are the data arrays mentioned in the documentation of the `label_specs` argument.
@@ -160,7 +169,6 @@ class GeneralArrayCallbacks(SymmetryCallbacks[np.ndarray]):
         """
         super().__init__()
 
-        self.shape = None
         self.axis_labels = list(axis_labels)
 
         seen_keys = set()
@@ -203,7 +211,6 @@ class GeneralArrayCallbacks(SymmetryCallbacks[np.ndarray]):
 
     def initialize(self, obj):
         super().initialize(obj)
-        self.shape = obj.shape
         np.testing.assert_equal(len(self.shape), len(self.axis_labels), err_msg=str(self.shape))
 
         # Sanity test: any label that appears multiple times should have the same length for each of its axes
@@ -222,12 +229,6 @@ class GeneralArrayCallbacks(SymmetryCallbacks[np.ndarray]):
                 label_dim = label_dims[label]
                 if not any(data is x for x in self.ALL_PLACEHOLDERS):  # can't use 'in' operator because ndarray
                     assert data.shape[1] == label_dim, f'dim for {repr(label)} is {label_dim}, but {sym_kind} has data of shape {data.shape}'
-
-    def flatten_impl(self, obj):
-        return obj.reshape(-1)
-
-    def restore(self, arr):
-        return arr.reshape(self.shape)
 
     def apply_oper(self, obj, oper, cart_rot, atom_deperm):
         return self._apply_sym(obj, self.oper_specs, oper, cart_rot=cart_rot, atom_deperm=atom_deperm)
@@ -267,54 +268,10 @@ class GeneralArrayCallbacks(SymmetryCallbacks[np.ndarray]):
 
         return obj
 
-class GpawArrayDictCallbacks(SymmetryCallbacks[gpaw.arraydict.ArrayDict]):
-    """ Callbacks for a gpaw ``ArrayDict``. """
-    def __init__(self):
-        super().__init__()
-        # A copy of one of the arraydicts so that we have access to the correct communicator, partition,
-        # and array shapes when unflattening data.
-        self.template_arraydict = None
-
-    def initialize(self, obj):
-        super().initialize(obj)
-
-        # FIXME: proper way to check this?
-        if len(obj) != obj.partition.natoms:
-            if len(obj) > 0:
-                raise RuntimeError('symmetry expansion must be done in serial; try arr.redistribute(arr.partition.as_serial())')
-            else:
-                raise RuntimeError('symmetry expansion must only be done on root node')
-
-        template = obj.copy()
-        for key in template:
-            template[key] = np.empty_like(template[key])
-        self.template_arraydict = template
-
-    def flatten_impl(self, obj):
-        return np.concatenate([a.reshape(-1) for a in obj.values()])
-
-    def restore(self, arr):
-        sizes = [np.product(shape) for shape in self.template_arraydict.shapes_a]
-        splits = np.cumsum(sizes)[:-1]
-        arrs_a = np.split(arr, splits)
-
-        out_a = self.template_arraydict.copy()
-        for a in range(out_a.partition.natoms):
-            out_a[a][...] = arrs_a[a].reshape(out_a.shapes_a[a])
-        return out_a
-
-    # FIXME: Technically this should override apply_oper as well to apply that permutation.
-    #        Currently that's done in the GpawLcaoDHCallbacks subclass.
-    #        Which is just... *wrong.*
-
-    def apply_quotient(self, obj, quotient, deperm):
-        out_a = self.template_arraydict.copy()
-        for anew, aold in enumerate(deperm):
-            out_a[anew] = obj[aold]
-        return out_a
-
-class GpawLcaoDHCallbacks(GpawArrayDictCallbacks):
-    """ Callbacks for ``calc.hamiltonian.dH_asp`` in GPAW LCAO mode. """
+class GpawLcaoDHCallbacks(ArrayCallbacks):
+    """ Callbacks for ``calc.hamiltonian.dH_asp`` in GPAW LCAO mode.
+    
+    The ArrayDict must be converted to an array with data at all atoms first. """
     def __init__(self, wfs_with_symmetry: gpaw.wavefunctions.base.WaveFunctions):
         super().__init__()
         self.wfs = wfs_with_symmetry
@@ -326,22 +283,26 @@ class GpawLcaoDHCallbacks(GpawArrayDictCallbacks):
         #        It's hard for me to tell since it would not ultimately impact program output, and the conventions
         #        for how gpaw's a_sa and R_sii are stored are unclear to me.
 
-        dH_asp = obj
-        out_asp = obj.copy()
         a_a = self.wfs.kd.symmetry.a_sa[sym]
-        assert (a_a == atom_deperm).all()
+        assert (a_a == atom_deperm).all(), "mismatched oper order or something?"
 
-        for adest in dH_asp.keys():
-            asrc = a_a[adest]
-            R_ii = self.wfs.setups[adest].R_sii[sym]
+        # rotate (permute) the atom axis
+        dH_asp = obj[atom_deperm]
+
+        # and now the 'p' axis
+        for a in range(len(dH_asp)):
+            R_ii = self.wfs.setups[a].R_sii[sym]
             for s in range(self.wfs.nspins):
-                dH_p = dH_asp[asrc][s]
+                dH_p = dH_asp[a][s]
                 dH_ii = unpack2(dH_p)
                 tmp_ii = R_ii @ dH_ii @ R_ii.T
                 tmp_p = pack(tmp_ii)
-                out_asp[adest][s][...] = tmp_p
+                dH_asp[a][s][...] = tmp_p
 
-        return out_asp
+        return dH_asp
+
+    def apply_quotient(self, obj, quotient, atom_deperm):
+        return obj[atom_deperm]
 
 class TupleCallbacks(SymmetryCallbacks[tp.Tuple]):
     # Callbacks for each item.
