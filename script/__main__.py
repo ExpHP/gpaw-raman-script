@@ -59,6 +59,8 @@ def start_log_entry(path):
     parprint('===', datetime.now().isoformat(), file=logfile)
     return utils.Tee(logfile, sys.stdout)
 
+# ==============================================================================
+
 def main__elph_diamond(supercell, action, log):
     from gpaw.elph.electronphonon import ElectronPhononCoupling
     from gpaw.lrtddft.spectrum import polarizability
@@ -82,6 +84,29 @@ def main__elph_diamond(supercell, action, log):
         kpts={'size': (2, 2, 2), 'gamma': False},
         xc='PBE',
     )
+
+    def get_wfs_with_sym():
+        # Make a supercell exactly like ElectronPhononCoupling makes, but with point_group = True
+        params_fd_sym = copy.deepcopy(params_fd)
+        if 'symmetry' not in params_fd_sym:
+            params_fd_sym['symmetry'] = dict(GPAW.default_parameters['symmetry'])
+        params_fd_sym['symmetry']['point_group'] = True
+        params_fd_sym['symmetry']['symmorphic'] = False  # enable full spacegroup # FIXME: doesn't work for supercells
+        params_fd_sym['symmetry']['tolerance'] = 1e-6
+
+        calc_fd_sym = GPAW(txt=log, **params_fd_sym)
+        dummy_supercell_atoms = supercell_atoms.copy()
+        dummy_supercell_atoms.calc = calc_fd_sym
+        calc_fd_sym._set_atoms(dummy_supercell_atoms)  # FIXME private method
+        calc_fd_sym.initialize()
+        calc_fd_sym.set_positions(dummy_supercell_atoms)
+        return calc_fd_sym.wfs
+    
+    DISPLACEMENT_DIST = 1e-2  # FIXME supply as arg to gpaw
+    minimal_ase_displacements = [
+        interop.AseDisplacement(atom=atom, axis=0, sign=sign)
+        for atom in [0] for sign in [-1, +1]
+    ]
 
     # ============
     # BRUTE FORCE
@@ -126,31 +151,15 @@ def main__elph_diamond(supercell, action, log):
         if 'h' in params_fd:
             del params_fd['h']
 
-        def get_wfs_with_sym():
-            # Make a supercell exactly like ElectronPhononCoupling makes, but with point_group = True
-            params_fd_sym = copy.deepcopy(params_fd)
-            if 'symmetry' not in params_fd_sym:
-                params_fd_sym['symmetry'] = dict(GPAW.default_parameters['symmetry'])
-            params_fd_sym['symmetry']['point_group'] = True
-            params_fd_sym['symmetry']['symmorphic'] = False  # enable full spacegroup # FIXME: doesn't work for supercells
-            params_fd_sym['symmetry']['tolerance'] = 1e-6
-
-            calc_fd_sym = GPAW(txt=log, **params_fd_sym)
-            dummy_supercell_atoms = supercell_atoms.copy()
-            dummy_supercell_atoms.calc = calc_fd_sym
-            calc_fd_sym._set_atoms(dummy_supercell_atoms)  # FIXME private method
-            calc_fd_sym.initialize()
-            calc_fd_sym.set_positions(dummy_supercell_atoms)
-            return calc_fd_sym.wfs
         wfs_with_sym = get_wfs_with_sym()
 
         calc_fd = GPAW(txt=log, **params_fd)
 
-        elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell, calculate_forces=True).offset
+        elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell, calculate_forces=True)
         cell_offset = elph.offset
         del elph  # that's all we needed it for
 
-        def read_elph(path):
+        def read_elph(displacement: interop.AseDisplacement):
             from gpaw.arraydict import ArrayDict
 
             array_0, arr_dic = pickle.load(open(path, 'rb'))
@@ -167,29 +176,14 @@ def main__elph_diamond(supercell, action, log):
         # GPAW displaces the center cell for some reason instead of the first cell
         get_displaced_index = lambda prim_atom: cell_offset * len(atoms) + prim_atom
 
-        disp_atoms = [
-            get_displaced_index(0),
-            get_displaced_index(0),
-            # FIXME: can't currently get full spacegroup for supercells so use extra atoms for now.
-            #        (we'll need a different material if we want to test the step that generates
-            #         new rows using rotational symmetries)
-            get_displaced_index(1),
-            get_displaced_index(1),
-        ]
-        disp_carts = [
-            np.array([+1e-2, 0, 0]),
-            np.array([-1e-2, 0, 0]),
-            np.array([+1e-2, 0, 0]),
-            np.array([-1e-2, 0, 0]),
-        ]
+        all_displacements = list(minimal_ase_displacements)
+        disp_atoms = [get_displaced_index(disp.atom) for disp in all_displacements]
+        disp_carts = [disp.cart_displacement(DISPLACEMENT_DIST) for disp in all_displacements]
+        disp_values = [read_elph_input(disp) for disp in all_displacements]
 
-        disp_values = [
-            # TODO: Also transform the grid data in [0]
-            read_elph('elph.0x+.pckl')[1],
-            read_elph('elph.0x-.pckl')[1],
-            read_elph('elph.1x+.pckl')[1],
-            read_elph('elph.1x-.pckl')[1],
-        ]
+        full_Vt = np.empty((len(supercell_atoms), 3) + disp_values[0][0].shape)
+        full_dH = np.empty((len(supercell_atoms), 3) + disp_values[0][1].shape)
+        full_forces = np.empty((len(supercell_atoms), 3) + disp_values[0][2].shape)
 
         lattice = supercell_atoms.get_cell()[...]
         oper_cart_rots = np.einsum('ki,slk,jl->sij', lattice, wfs_with_sym.kd.symmetry.op_scc, np.linalg.inv(lattice))
@@ -198,21 +192,59 @@ def main__elph_diamond(supercell, action, log):
                 disp_atoms,       # disp -> atom
                 disp_carts,       # disp -> 3-vec
                 disp_values,      # disp -> T  (displaced value, optionally minus equilibrium value)
-                symmetry.GpawLcaoDHCallbacks(wfs_with_sym),        # how to work with T
+                elph_callbacks(wfs_with_sym, supercell=supercell),        # how to work with T
                 oper_cart_rots,   # oper -> 3x3
                 oper_perms=wfs_with_sym.kd.symmetry.a_sa,       # oper -> atom' -> atom
                 quotient_perms=quotient_perms,
             )
             for a in range(len(full_values)):
                 for c in range(3):
-                    full_values[a][c] = dict(full_values[a][c])
-            pickle.dump(full_values, open('elph-full.pckl', 'wb'), protocol=2)
+                    full_Vt[a][c] = full_values[a][c][0]
+                    full_dH[a][c] = full_values[a][c][1]
+                    full_forces[a][c] = full_values[a][c][2]
+            full_values = full_Vt, full_dH, full_forces
+            pickle.dump(full_values, open('full.pckl', 'wb'), protocol=2)
 
     # END action 'symmetry-test'
 
     # ============
     # TODO: test that uses phonopy for displacements.
     pass
+
+def elph_callbacks(wfs_with_symmetry: gpaw.wavefunctions.base.WaveFunctions, supercell):
+    # Vt_sG has shape (nspin, N_c[0], N_c[1], N_c[2])
+    nspin = wfs_with_symmetry.nspins
+    grid_dim = tuple(wfs_with_symmetry.gd.N_c)
+    # The operators permute the grid points
+    grid_oper_deperms = interop.gpaw_flat_G_oper_permutations(wfs_with_symmetry)
+    print('grid dim:', grid_dim)
+    print('supercell:', supercell)
+    print('grid_oper_deperms:', grid_oper_deperms.shape)
+    grid_quotient_deperms = interop.gpaw_flat_G_quotient_permutations(N_c=grid_dim, repeats=supercell)
+
+    Vt_part = symmetry.WrappedCallbacks[np.ndarray, np.ndarray](
+        # To apply these permutations we have to flatten the three grid axes.
+        convert_into=lambda arr: arr.reshape((nspin, -1)),
+        convert_from=lambda arr: arr.reshape((nspin,) + grid_dim),
+        wrapped=symmetry.GeneralArrayCallbacks(
+            ['na', 'flatgrid'],
+            (('flatgrid', 'oper'), 'perm', grid_oper_deperms),
+            (('flatgrid', 'quotient'), 'perm', grid_quotient_deperms),
+        ),
+    )
+
+    dH_part = symmetry.GpawLcaoDHCallbacks(wfs_with_symmetry)
+    forces_part = symmetry.GeneralArrayCallbacks(['atom', 'cart'])
+    return symmetry.TupleCallbacks(Vt_part, dH_part, forces_part)
+
+def read_elph_input(displacement: interop.AseDisplacement) -> tp.Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    Vt_sG, dH_asp_orig = pickle.load(open(f'elph.{displacement}.pckl', 'rb'))
+    forces = pickle.load(open(f'phonons.{displacement}.pckl', 'rb'))
+    dH_asp = np.array([dH_asp_orig[i] for i in range(len(dH_asp_orig))])  # dict to array
+    return Vt_sG, dH_asp, forces
+
+# ==============================================================================
+
 
 def main__raman_ch4(structure, supercell, log):
     import ase.build
