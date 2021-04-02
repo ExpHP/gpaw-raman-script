@@ -4,7 +4,7 @@ import sys
 
 def permutation_outer_product(*perms):
     """ Compute the mathematical outer product of a sequence of permutations.
-    
+
     The result is a permutation that operates on an array whose length is the product of all of the
     input perms.  The last perm will be the fastest index in the output (rearranging items within
     blocks), while the first perm will be the slowest (rearranging the blocks themselves).

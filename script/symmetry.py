@@ -65,7 +65,7 @@ class SymmetryCallbacks(ABC, tp.Generic[T]):
     @abstractmethod
     def apply_oper(self, obj: T, oper: OperIndex, cart_rot, atom_deperm) -> T:
         """ Apply a spacegroup operation.
-        
+
         The ``cart_rot`` matrix (representing the rotational part of the operation as a 3x3 matrix
         to apply on the left side of a 3-vector) and the ``atom_deperm`` array (representing the operator
         as a permutation of data indexed by atom, where ``transformed_data = data[atom_deperm]``)
@@ -78,7 +78,7 @@ class SymmetryCallbacks(ABC, tp.Generic[T]):
     @abstractmethod
     def apply_quotient(self, obj: T, quotient: QuotientIndex, atom_deperm: np.ndarray) -> T:
         """ Apply a pure translational symmetry.
-        
+
         The ``atom_deperm`` array (representing the translation as a permutation of data indexed by
         atom, i.e. ``translated_data = data[atom_deperm]``) is supplied for convenience.
         If an implementation doesn't need it (or it is not enough, e.g. it needs to know how
@@ -134,7 +134,7 @@ class GeneralArrayCallbacks(ArrayCallbacks):
         """
         Construct a callback for a general n-dimensional array by specifying the action on each individual axis
         (either as a matrix product or a permutation).
-        
+
         :param axis_labels: sequence of ``str`` for each array axis.  ``"cart"`` means to rotate this axis
         like a Cartesian vector. ``"atom"`` means it indexes atoms in the supercell. ``"na"`` means to leave this
         axis alone.  The meaning of other labels can be controlled through ``label_specs``.
@@ -158,7 +158,7 @@ class GeneralArrayCallbacks(ArrayCallbacks):
 
         Example:  A rank 2 cartesian tensor (such as polarizability) could be transformed using
         ``GeneralArrayCallbacks(['cart', 'cart'])``, which is equivalent to computing rotations as ``R @ tensor @ R.T``.
-        
+
         Example:  GPAW has an array ``Vt_sG`` which is indexed by ``(spin, na, nb, nc)``, where ``(na, nb, nc)`` are
         the dimensions of a real-space grid.  Unfortunately, the action of a rotation on this doesn't cleanly factor
         out into an independent action on each axis, but if you flatten out the last three axes to get ``(spin, gridpoint)``,
@@ -247,7 +247,7 @@ class GeneralArrayCallbacks(ArrayCallbacks):
                 transform_data = atom_deperm
             elif sym_transform_data is type(self).PLACEHOLDER_CART_ROT:
                 transform_data = cart_rot
-            else: 
+            else:
                 transform_data = sym_transform_data[sym_index]
 
             if transform_kind == 'matrix':
@@ -270,7 +270,7 @@ class GeneralArrayCallbacks(ArrayCallbacks):
 
 class GpawLcaoDHCallbacks(ArrayCallbacks):
     """ Callbacks for ``calc.hamiltonian.dH_asp`` in GPAW LCAO mode.
-    
+
     The ArrayDict must be converted to an array with data at all atoms first. """
     def __init__(self, wfs_with_symmetry: gpaw.wavefunctions.base.WaveFunctions):
         super().__init__()
@@ -553,7 +553,7 @@ class CombinedOperator(tp.NamedTuple):
 
 class FromRepInfo(tp.NamedTuple):
     """ Describes the ways to reach a given site from a representative atom.
-    
+
     Attributes
         rep         Atom index of the representative that can reach this site.
         operators   List of operators, each of which individually maps ``rep`` to this site.
@@ -617,7 +617,7 @@ class PrecomputedSymmetryIndexInfo:
 
 class TensorRotator:
     """ Helper for automating the production of an einsum call that applies a single matrix to many axes of an array.
-    
+
     E.g. could perform something similar to ``np.einsum('Aa,Bb,Dd,abcd->ABcD', rot, rot, rot, array)`` if we wanted
     to rotate axes 0, 1, and 3 of an array. """
     def __init__(self, axis_rotate_flags: tp.Iterable[bool]):

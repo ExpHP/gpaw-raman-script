@@ -223,7 +223,7 @@ def test_quotient_translation_order__ase_atom():
     data[initial_point] = 99
 
     # Find the index of the operator corresponding to 'translation'.
-    # 
+    #
     # As specified in the 'interop' module, the operators are lexically ordered.
     quotient_gridpoints = interop.lexically_ordered_integer_gridpoints(repeats)
     quotient, = np.where(np.all(quotient_gridpoints == translation, axis=1))[0]

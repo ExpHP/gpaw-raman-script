@@ -101,7 +101,7 @@ def main__elph_diamond(supercell, action, log):
         calc_fd_sym.initialize()
         calc_fd_sym.set_positions(dummy_supercell_atoms)
         return calc_fd_sym.wfs
-    
+
     DISPLACEMENT_DIST = 1e-2  # FIXME supply as arg to gpaw
     minimal_ase_displacements = [
         interop.AseDisplacement(atom=atom, axis=0, sign=sign)
@@ -244,7 +244,6 @@ def read_elph_input(displacement: interop.AseDisplacement) -> tp.Tuple[np.ndarra
     return Vt_sG, dH_asp, forces
 
 # ==============================================================================
-
 
 def main__raman_ch4(structure, supercell, log):
     import ase.build

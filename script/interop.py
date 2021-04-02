@@ -35,7 +35,7 @@ def ase_repeat_translational_symmetry_perms(natoms, repeats):
 
 def all_cyclic_perms_of_len(n):
     """ Produce permutations in the cyclic group of rank n.
-    
+
     The order of the output is specified: The ``i``th permutation pushes elements ``i`` positions
     to the right. """
     # e.g. for n=4 this gives [[0,1,2,3], [3,0,1,2], [2,3,0,1], [1,2,3,0]]
@@ -72,7 +72,7 @@ class AseDisplacement(tp.NamedTuple):
         out = np.zeros(3)
         out[self.axis] = self.sign * magnitude
         return out
-    
+
     def __str__(self) -> str:
         axis_str = 'xyz'[self.axis]
         sign_str = '-' if self.sign == -1 else '+'
@@ -80,7 +80,7 @@ class AseDisplacement(tp.NamedTuple):
 
 def gpaw_flat_G_oper_permutations(wfs: WaveFunctions):
     """ Get spacegroup operators as permutations of a flattened 'G' axis in GPAW.
-    
+
     The order of operators in the output matches GPAW's Symmetry class. """
     return _gpaw_flat_G_permutations(wfs.gd.N_c, wfs.kd.symmetry.op_scc, wfs.kd.symmetry.ft_sc)
 
