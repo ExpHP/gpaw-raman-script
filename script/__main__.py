@@ -97,8 +97,8 @@ def main__elph_diamond(supercell, action, log):
         else:
             calc_gs = GPAW('gs.gpw')
 
-        # NOTE: original elph.py did this but I don't understand it.
-        # The real space grid of the two calculators should match.
+        # This makes the real space grid points identical to the primitive cell computation.
+        # (by increasing the counts by a factor of a supercell dimension)
         params_fd['gpts'] = calc_gs.wfs.gd.N_c * list(supercell)
         if 'h' in params_fd:
             del params_fd['h']
@@ -120,6 +120,12 @@ def main__elph_diamond(supercell, action, log):
         supercell_atoms = atoms * supercell
         quotient_perms = list(interop.ase_repeat_translational_symmetry_perms(len(atoms), supercell))
 
+        # IMPORTANT: The real space grid of the calculators we use now must match
+        #            the ones we had during the brute force computation.
+        params_fd['gpts'] = GPAW('gs.gpw').wfs.gd.N_c * list(supercell)
+        if 'h' in params_fd:
+            del params_fd['h']
+
         def get_wfs_with_sym():
             # Make a supercell exactly like ElectronPhononCoupling makes, but with point_group = True
             params_fd_sym = copy.deepcopy(params_fd)
@@ -140,7 +146,9 @@ def main__elph_diamond(supercell, action, log):
 
         calc_fd = GPAW(txt=log, **params_fd)
 
-        elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell, calculate_forces=True)
+        elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell, calculate_forces=True).offset
+        cell_offset = elph.offset
+        del elph  # that's all we needed it for
 
         def read_elph(path):
             from gpaw.arraydict import ArrayDict
@@ -157,7 +165,7 @@ def main__elph_diamond(supercell, action, log):
             return array_0, arr_dic
 
         # GPAW displaces the center cell for some reason instead of the first cell
-        get_displaced_index = lambda prim_atom: elph.offset * len(atoms) + prim_atom
+        get_displaced_index = lambda prim_atom: cell_offset * len(atoms) + prim_atom
 
         disp_atoms = [
             get_displaced_index(0),

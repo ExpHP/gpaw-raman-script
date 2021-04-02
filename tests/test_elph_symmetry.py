@@ -89,8 +89,7 @@ def test_symmetry_dH(data_symmetry):
             expected = (arrayify_dict(pluses[1]) - arrayify_dict(minuses[1])) / (2*DISPLACEMENT_DIST)
             actual = arrayify_dict(full[1][atom][axis])
 
-            # FIXME is this error really supposed to be this big?!
-            rtol = 1e-8 if (atom, axis) == (0, 0) else 12.0
+            rtol = 1e-8
             check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'dH for atom {atom} axis {axis}')
 
 def test_symmetry_forces(data_symmetry):
@@ -103,7 +102,7 @@ def test_symmetry_forces(data_symmetry):
             expected = (pluses[2] - minuses[2]) / (2*DISPLACEMENT_DIST)
             actual = full[2][atom][axis]
 
-            rtol = 1e-8 if axis == 0 else 1e-1
+            rtol = 1e-8 if (atom, axis) == (0, 0) else 1e-3
             check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'forces for atom {atom} axis {axis}')
 
 def test_symmetry_Vt(data_symmetry):
@@ -113,10 +112,10 @@ def test_symmetry_Vt(data_symmetry):
             pluses = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=+1))
             minuses = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))
             expected = (pluses[0] - minuses[0]) / (2*DISPLACEMENT_DIST)
-            actual = arrayify_dict(full[0][atom][axis])
+            actual = full[0][atom][axis]
 
-            rtol = 1e-8 if (atom, axis) == (0, 0) else 1e-8
-            check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'dH for atom {atom} axis {axis}')
+            rtol = 1e-8
+            check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'Vt for atom {atom} axis {axis}')
 
 @pytest.fixture
 @memoize()
@@ -143,7 +142,7 @@ def test_supercell_211_dH(data_supercell_211):
             expected = (arrayify_dict(plus) - arrayify_dict(minus)) / (2*DISPLACEMENT_DIST)
             actual = arrayify_dict(full[1][offset+atom][axis])
 
-            rtol = 1e-8 if (atom, axis) == (0, 0) else 1.0  # FIXME dH error is like 12x.  That's very large!
+            rtol = 1e-8
             check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'dH for atom {atom} axis {axis}')
 
 def test_supercell_211_Vt(data_supercell_211):
@@ -158,7 +157,7 @@ def test_supercell_211_Vt(data_supercell_211):
             expected = (plus - minus) / (2*DISPLACEMENT_DIST)
             actual = arrayify_dict(full[0][offset+atom][axis])
 
-            rtol = 1e-8 if (atom, axis) == (0, 0) else 1e-8
+            rtol = 1e-8
             check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'dH for atom {atom} axis {axis}')
 
 def test_supercell_211_forces(data_supercell_211):
@@ -172,12 +171,8 @@ def test_supercell_211_forces(data_supercell_211):
             minus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))[2]
             expected = (plus - minus) / (2*DISPLACEMENT_DIST)
             actual = full[2][offset+atom][axis]
-            
-            # In atom 0 axis 0, the elements with the biggest relative error have a relative error of 0.250000000.
-            # Yes. To that many digits of precision.
-            # This seems......... *very highly suspicious?*  FIXME
 
-            rtol = 1e-1
+            rtol = 1e-8
             check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'forces for atom {atom} axis {axis}')
 
 # ==============================================================================
@@ -288,20 +283,22 @@ def ensure_test_data():
 def gen_test_data(datadir: str, params_fd: dict, supercell):
     from gpaw.elph.electronphonon import ElectronPhononCoupling
 
-    atoms = Cluster(ase.build.bulk('C'))
-    calc_fd = GPAW(**params_fd)
-    elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell, calculate_forces=True)
+    params_gs = copy.deepcopy(params_fd)
 
-    calc_gs = GPAW(**params_fd)
+    atoms = Cluster(ase.build.bulk('C'))
+
+    calc_gs = GPAW(**params_gs)
     atoms.calc = calc_gs
     atoms.get_potential_energy()
     atoms.calc.write("gs.gpw", mode="all")
 
-    # NOTE: original elph.py did this but I don't understand it.
-    # The real space grid of the two calculators should match.
+    # Make sure the real space grid matches the original.
+    # (basically we multiply the number of grid points in each dimension by the supercell dimension)
     params_fd['gpts'] = calc_gs.wfs.gd.N_c * list(supercell)
     if 'h' in params_fd:
         del params_fd['h']
+    calc_fd = GPAW(**params_fd)
+    elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell, calculate_forces=True)
 
     if world.rank == 0:
         os.makedirs(datadir, exist_ok=True)
@@ -320,11 +317,19 @@ def elph_callbacks(wfs_with_symmetry: gpaw.wavefunctions.base.WaveFunctions, sup
     grid_dim = tuple(wfs_with_symmetry.gd.N_c)
     # The operators permute the grid points
     grid_oper_deperms = interop.gpaw_flat_G_oper_permutations(wfs_with_symmetry)
+    print('grid dim:', grid_dim)
+    print('supercell:', supercell)
+    print('grid_oper_deperms:', grid_oper_deperms.shape)
     grid_quotient_deperms = interop.gpaw_flat_G_quotient_permutations(N_c=grid_dim, repeats=supercell)
+
+    def log(msg, arr):
+        print(msg, arr.shape)
+        return arr
+
     Vt_part = symmetry.WrappedCallbacks[np.ndarray, np.ndarray](
         # To apply these permutations we have to flatten the three grid axes.
-        convert_into=lambda arr: arr.reshape((nspin, -1)),
-        convert_from=lambda arr: arr.reshape((nspin,) + grid_dim),
+        convert_into=lambda arr: log('into-2', log('into-1', arr).reshape((nspin, -1))),
+        convert_from=lambda arr: log('from-2', log('from-1', arr).reshape((nspin,) + grid_dim)),
         wrapped=symmetry.GeneralArrayCallbacks(
             ['na', 'flatgrid'],
             (('flatgrid', 'oper'), 'perm', grid_oper_deperms),
@@ -350,6 +355,12 @@ def do_elph_symmetry(
     # a supercell exactly like ElectronPhononCoupling makes
     supercell_atoms = atoms * supercell
     quotient_perms = list(interop.ase_repeat_translational_symmetry_perms(len(atoms), supercell))
+
+    # Make sure the grid matches our calculations (we repeated the grid of the groundstate)
+    params_fd = copy.deepcopy(params_fd)
+    params_fd['gpts'] = GPAW('gs.gpw').wfs.gd.N_c * list(supercell)
+    if 'h' in params_fd:
+        del params_fd['h']
 
     wfs_with_sym = get_wfs_with_sym(params_fd=params_fd, supercell_atoms=supercell_atoms, symmetry_type=symmetry_type)
     calc_fd = GPAW(**params_fd)

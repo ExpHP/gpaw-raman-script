@@ -115,6 +115,7 @@ class GeneralArrayCallbacks(SymmetryCallbacks[np.ndarray]):
 
     PLACEHOLDER_CART_ROT = object()
     PLACEHOLDER_ATOM_DEPERM = object()
+    ALL_PLACEHOLDERS = [PLACEHOLDER_CART_ROT, PLACEHOLDER_ATOM_DEPERM]
 
     def __init__(
             self,
@@ -204,6 +205,23 @@ class GeneralArrayCallbacks(SymmetryCallbacks[np.ndarray]):
         super().initialize(obj)
         self.shape = obj.shape
         np.testing.assert_equal(len(self.shape), len(self.axis_labels), err_msg=str(self.shape))
+
+        # Sanity test: any label that appears multiple times should have the same length for each of its axes
+        label_dims = {'cart': 3}
+        for dim, label in zip(obj.shape, self.axis_labels):
+            if label in label_dims:
+                assert label_dims[label] == dim, f'size mismatch for {label}: ({self.axis_labels}, {obj.shape})'
+            else:
+                label_dims[label] = dim
+
+        # Sanity test: That length should match the data saved for its transformations
+        for sym_kind, specs in [('oper', self.oper_specs), ('quotient', self.quotient_specs)]:
+            for label, (_, data) in specs.items():
+                if label not in label_dims:
+                    continue  # could happen for 'atom' if it's not used in the array
+                label_dim = label_dims[label]
+                if not any(data is x for x in self.ALL_PLACEHOLDERS):  # can't use 'in' operator because ndarray
+                    assert data.shape[1] == label_dim, f'dim for {repr(label)} is {label_dim}, but {sym_kind} has data of shape {data.shape}'
 
     def flatten_impl(self, obj):
         return obj.reshape(-1)
