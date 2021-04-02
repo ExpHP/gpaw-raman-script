@@ -13,6 +13,7 @@ yaml = YAML(typ='rt')
 from abc import ABC, abstractmethod
 import typing as tp
 T = tp.TypeVar("T")
+U = tp.TypeVar("U")
 
 AtomIndex = int
 QuotientIndex = int
@@ -154,6 +155,7 @@ class GeneralArrayCallbacks(SymmetryCallbacks[np.ndarray]):
         then you will find that all symmetry operations permute these gridpoints.
         Therefore, after computing the necessary perms, one could use
         ``GeneralArrayCallbacks(['na', 'grid'], (('grid', 'oper'), 'perm', oper_grid_perms), (('grid', 'quotient'), 'perm', quotient_grid_perms))``.
+        (See also ``WrappedCallbacks`` for a way to automatically perform the flattening of the gridpoint axes)
         """
         super().__init__()
 
@@ -217,6 +219,7 @@ class GeneralArrayCallbacks(SymmetryCallbacks[np.ndarray]):
 
     def _apply_sym(self, obj, label_specs, sym_index, cart_rot=None, atom_deperm=None):
         assert obj.shape == self.shape, [self.shape, obj.shape]
+        assert np.array(sym_index).shape == ()
 
         obj = obj.copy()
 
@@ -347,10 +350,38 @@ class TupleCallbacks(SymmetryCallbacks[tp.Tuple]):
         return tuple(callbacks.restore(arr) for (arr, callbacks) in zip(arrs, self.parts))
 
     def apply_oper(self, obj, oper, cart_rot, atom_deperm):
-        return (callbacks.apply_oper(x, oper, cart_rot, atom_deperm) for (x, callbacks) in zip(obj, self.parts))
+        return tuple(callbacks.apply_oper(x, oper, cart_rot, atom_deperm) for (x, callbacks) in zip(obj, self.parts))
 
     def apply_quotient(self, obj, quotient, atom_deperm):
-        return (callbacks.apply_quotient(x, quotient, atom_deperm) for (x, callbacks) in zip(obj, self.parts))
+        return tuple(callbacks.apply_quotient(x, quotient, atom_deperm) for (x, callbacks) in zip(obj, self.parts))
+
+class WrappedCallbacks(tp.Generic[T, U], SymmetryCallbacks[T]):
+    def __init__(self, convert_into: tp.Callable[[T], U], convert_from: tp.Callable[[U], T], wrapped: SymmetryCallbacks[U]):
+        super().__init__()
+        self.convert_into = convert_into
+        self.convert_from = convert_from
+        self.wrapped = wrapped
+
+    def initialize(self, obj):
+        super().initialize(obj)
+        return self.wrapped.initialize(self.convert_into(obj))
+
+    def flatten_impl(self, obj):
+        return self.wrapped.flatten_impl(self.convert_into(obj))
+
+    def restore(self, arr):
+        return self.convert_from(self.wrapped.restore(arr))
+
+    def apply_oper(self, obj, oper, cart_rot, atom_deperm):
+        converted = self.convert_into(obj)
+        transformed = self.wrapped.apply_oper(converted, oper, cart_rot, atom_deperm)
+        return self.convert_from(transformed)
+
+    def apply_quotient(self, obj, quotient, atom_deperm):
+        converted = self.convert_into(obj)
+        transformed = self.wrapped.apply_quotient(converted, quotient, atom_deperm)
+        return self.convert_from(transformed)
+
 
 # ==============================================================================
 
@@ -466,7 +497,7 @@ def expand_derivs_by_symmetry(
     def apply_combined_oper(value: T, combined: 'CombinedOperator'):
         oper, quotient = combined
         value = callbacks.apply_oper(value, oper, cart_rot=oper_cart_rots[oper], atom_deperm=oper_perms[oper])
-        value = callbacks.apply_quotient(value, quotient_perms[quotient], atom_deperm=quotient_perms[quotient])
+        value = callbacks.apply_quotient(value, quotient, atom_deperm=quotient_perms[quotient])
         return value
 
     # Compute derivatives with respect to displaced (representative) atoms
