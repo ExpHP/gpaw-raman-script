@@ -1,6 +1,6 @@
 
 from collections import namedtuple
-from script import symmetry, test_utils
+from script import symmetry, test_utils, interop
 import script
 import numpy as np
 import pytest
@@ -198,3 +198,65 @@ def test_general_array_atom_quotient():
         [20, 30, 10],  # derivative w.r.t. atom 2 y
         [20, 30, 10],  # derivative w.r.t. atom 2 z
     ]]))
+
+
+def test_lexically_ordered_gridpoints():
+    # Check gridpoint order.
+    gridpoints = interop.lexically_ordered_integer_gridpoints((3, 5, 6))
+    np.testing.assert_array_equal(gridpoints[0], (0, 0, 0))
+    np.testing.assert_array_equal(gridpoints[1], (0, 0, 1))
+    np.testing.assert_array_equal(gridpoints[5], (0, 0, 5))
+    np.testing.assert_array_equal(gridpoints[6], (0, 1, 0))
+    np.testing.assert_array_equal(gridpoints[3*5*6-1], (2, 4, 5))
+
+
+def test_quotient_translation_order__ase_atom():
+    from script import interop
+    repeats = (3, 5, 6)
+    # pick an arbitrary image of the primative cell and an arbitrary lattice vector to translate it by
+    initial_point = (1, 2, 3)
+    translation = (1, 1, 4)
+    final_point = (2, 3, 1)  # = (initial + translation) % repeats
+
+    # Create data with a single nonzero element
+    data = np.zeros(repeats)
+    data[initial_point] = 99
+
+    # Find the index of the operator corresponding to 'translation'.
+    # 
+    # As specified in the 'interop' module, the operators are lexically ordered.
+    quotient_gridpoints = interop.lexically_ordered_integer_gridpoints(repeats)
+    quotient, = np.where(np.all(quotient_gridpoints == translation, axis=1))[0]
+
+    # Use the perm with that index to permute the data in the grid array.
+    quotient_perms = list(interop.ase_repeat_translational_symmetry_perms(1, repeats))
+    transformed_data = data.ravel()[quotient_perms[quotient]].reshape(repeats)
+
+    # Verify that the data was translated to the expected location
+    assert transformed_data[final_point] == 99
+
+
+def test_quotient_translation_order__gpaw_flat_G():
+    from script import interop
+    grid_dim = (20, 40, 12)  # numbers with a fair number of divisors
+    repeats = (5, 8, 3)  # supercell dimensions. (divisors of each grid dimension)
+    initial_point = (6, 10, 9)  # an arbitrarily-chosen point in the grid
+    translation = (3, 6, 1)  # an arbitrary primitive lattice vector
+    final_point = tuple((initial_point[i] + translation[i] * grid_dim[i] // repeats[i]) % grid_dim[i] for i in range(3))
+
+    # Get index of perm with this translation. (according to how we specify their order)
+    quotient_gridpoints = interop.lexically_ordered_integer_gridpoints(repeats)
+    quotient, = np.where(np.all(quotient_gridpoints == translation, axis=1))[0]
+
+    # Create grid-aligned data with a single nonzero element
+    data = np.zeros(grid_dim)
+    data[initial_point] = 99
+
+    # Use one of the perms produced by 'interop' to translate the data in this array
+    quotient_perms = list(interop.gpaw_flat_G_quotient_permutations(grid_dim, repeats))
+    assert len(quotient_perms) == np.product(repeats)
+    transformed_data = data.ravel()[quotient_perms[quotient]].reshape(grid_dim)
+
+    # Verify that the data was translated to the expected location
+    print(np.where(transformed_data == 99))
+    assert transformed_data[final_point] == 99
