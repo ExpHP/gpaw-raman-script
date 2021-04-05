@@ -56,12 +56,15 @@ def test_identity():
             pluses = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=+1))
             minuses = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))
             expected_Vt = (pluses[0] - minuses[0]) / (2*DISPLACEMENT_DIST)
-            expected_dH = (pluses[1] - minuses[1]) / (2*DISPLACEMENT_DIST)
             expected_forces = (pluses[2] - minuses[2]) / (2*DISPLACEMENT_DIST)
 
             np.testing.assert_allclose(full[0][atom][axis], expected_Vt, err_msg=f'atom {atom} axis {axis}')
-            np.testing.assert_allclose(full[1][atom][axis], expected_dH, err_msg=f'atom {atom} axis {axis}')
             np.testing.assert_allclose(full[2][atom][axis], expected_forces, err_msg=f'atom {atom} axis {axis}')
+
+            # dH is a ragged array
+            for a2 in range(ATOMS_PER_CELL):
+                expected_dH = (pluses[1][a2] - minuses[1][a2]) / (2*DISPLACEMENT_DIST)
+                np.testing.assert_allclose(full[1][atom][axis][a2], expected_dH, err_msg=f'atom {atom} axis {axis}')
 
 @pytest.fixture
 @memoize()
@@ -86,11 +89,12 @@ def test_symmetry_dH(data_symmetry):
         for axis in range(3):
             pluses = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=+1))
             minuses = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))
-            expected = (pluses[1] - minuses[1]) / (2*DISPLACEMENT_DIST)
-            actual = full[1][atom][axis]
+            for a2 in range(ATOMS_PER_CELL):
+                expected = (pluses[1][a2] - minuses[1][a2]) / (2*DISPLACEMENT_DIST)
+                actual = full[1][atom][axis][a2]
 
-            rtol = 1e-8
-            check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'dH for atom {atom} axis {axis}')
+                rtol = 1e-8
+                check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'dH for atom {atom} axis {axis}, atom2 {a2}')
 
 def test_symmetry_forces(data_symmetry):
     data_subdir, full = data_symmetry
@@ -137,13 +141,15 @@ def test_supercell_211_dH(data_supercell_211):
     offset = 2
     for atom in range(ATOMS_PER_CELL):
         for axis in range(3):
-            plus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=+1))[1]
-            minus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))[1]
-            expected = (plus - minus) / (2*DISPLACEMENT_DIST)
-            actual = full[1][offset+atom][axis]
+            plus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=+1))
+            minus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))
 
-            rtol = 1e-8
-            check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'dH for atom {atom} axis {axis}')
+            for a2 in range(ATOMS_PER_CELL):
+                expected = (plus[1][a2] - minus[1][a2]) / (2*DISPLACEMENT_DIST)
+                actual = full[1][offset+atom][axis][a2]
+
+                rtol = 1e-8
+                check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'dH for atom {atom} axis {axis}')
 
 def test_supercell_211_Vt(data_supercell_211):
     ensure_test_data()
@@ -205,9 +211,8 @@ def check_symmetry_result(symmetric_array, normal_array, expected_nnz_range=None
         raise
 
 def read_elph_input(data_subdir: str, displacement: AseDisplacement) -> tp.Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    Vt_sG, dH_asp_orig = pickle.load(open(f'{MAIN_DATA_DIR}/{data_subdir}/elph.{displacement}.pckl', 'rb'))
+    Vt_sG, dH_asp = pickle.load(open(f'{MAIN_DATA_DIR}/{data_subdir}/elph.{displacement}.pckl', 'rb'))
     forces = pickle.load(open(f'{MAIN_DATA_DIR}/{data_subdir}/phonons.{displacement}.pckl', 'rb'))
-    dH_asp = np.array([dH_asp_orig[i] for i in range(len(dH_asp_orig))])  # dict to array
     return Vt_sG, dH_asp, forces
 
 def get_wfs_with_sym(params_fd, symmetry_type, supercell_atoms):
@@ -234,6 +239,10 @@ def get_wfs_with_sym(params_fd, symmetry_type, supercell_atoms):
     calc_fd_sym.initialize()
     calc_fd_sym.set_positions(dummy_supercell_atoms)
     return calc_fd_sym.wfs
+
+
+def dict_subtract(arraydict: tp.Dict[int, np.ndarray]) -> np.ndarray:
+    return np.array([arraydict[i] for i in range(len(arraydict))])
 
 # ==============================================================================
 

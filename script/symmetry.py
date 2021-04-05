@@ -268,10 +268,41 @@ class GeneralArrayCallbacks(ArrayCallbacks):
 
         return obj
 
-class GpawLcaoDHCallbacks(ArrayCallbacks):
-    """ Callbacks for ``calc.hamiltonian.dH_asp`` in GPAW LCAO mode.
+class AtomDictCallbacks(SymmetryCallbacks[tp.Dict[int, T]], tp.Generic[T]):
+    """ Callbacks for a dict over atoms. (e.g. for use as a ragged array) """
+    def __init__(self):
+        super().__init__()
+        self.shapes = None
 
-    The ArrayDict must be converted to an array with data at all atoms first. """
+    def initialize(self, obj):
+        super().initialize(obj)
+
+        self.shapes = [obj[a].shape for a in range(len(obj))]
+
+    def flatten_impl(self, obj):
+        return np.concatenate([obj[a].reshape(-1) for a in range(len(obj))])
+
+    def restore(self, arr):
+        sizes = [np.product(shape) for shape in self.shapes]
+        splits = np.cumsum(sizes)[:-1]
+        arrs_a = np.split(arr, splits)
+
+        return {a: arrs_a[a].reshape(self.shapes[a]) for a in range(len(arrs_a))}
+
+    def apply_oper(self, obj, sym, cart_rot, atom_deperm):
+        return self._permute(obj, atom_deperm)
+
+    def apply_quotient(self, obj, quotient, atom_deperm):
+        return self._permute(obj, atom_deperm)
+
+    def _permute(self, obj, atom_deperm):
+        out_a = {}
+        for anew, aold in enumerate(atom_deperm):
+            out_a[anew] = obj[aold].copy()
+        return out_a
+
+class GpawLcaoDHCallbacks(AtomDictCallbacks[np.ndarray]):
+    """ Callbacks for ``calc.hamiltonian.dH_asp`` (as a ragged dict of arrays) in GPAW LCAO mode. """
     def __init__(self, wfs_with_symmetry: gpaw.wavefunctions.base.WaveFunctions):
         super().__init__()
         self.wfs = wfs_with_symmetry
@@ -279,17 +310,14 @@ class GpawLcaoDHCallbacks(ArrayCallbacks):
     def apply_oper(self, obj, sym, cart_rot, atom_deperm):
         from gpaw.utilities import pack, unpack2
 
-        # FIXME: It's *possible* that this is actually applying the inverse of sym instead of sym itself.
-        #        It's hard for me to tell since it would not ultimately impact program output, and the conventions
-        #        for how gpaw's a_sa and R_sii are stored are unclear to me.
-
         a_a = self.wfs.kd.symmetry.a_sa[sym]
         assert (a_a == atom_deperm).all(), "mismatched oper order or something?"
 
-        # rotate (permute) the atom axis
-        dH_asp = obj[atom_deperm]
+        # permute the 'a' axis (atoms in the dict)
+        obj = super().apply_oper(obj, sym, cart_rot, atom_deperm)
 
         # and now the 'p' axis
+        dH_asp = obj
         for a in range(len(dH_asp)):
             R_ii = self.wfs.setups[a].R_sii[sym]
             for s in range(self.wfs.nspins):
@@ -300,9 +328,6 @@ class GpawLcaoDHCallbacks(ArrayCallbacks):
                 dH_asp[a][s][...] = tmp_p
 
         return dH_asp
-
-    def apply_quotient(self, obj, quotient, atom_deperm):
-        return obj[atom_deperm]
 
 class TupleCallbacks(SymmetryCallbacks[tp.Tuple]):
     # Callbacks for each item.
