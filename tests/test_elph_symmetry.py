@@ -81,49 +81,23 @@ def data_symmetry():
         ],
         symmetry_type = 'pointgroup',
     )
-    return data_subdir, full
+    disp_atom_offset = 0  # index of first atom of center cell
+    return data_subdir, full, disp_atom_offset
 
 def test_symmetry_dH(data_symmetry):
-    data_subdir, full = data_symmetry
-    for atom in range(ATOMS_PER_CELL):
-        for axis in range(3):
-            pluses = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=+1))
-            minuses = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))
-            for a2 in range(ATOMS_PER_CELL):
-                expected = (pluses[1][a2] - minuses[1][a2]) / (2*DISPLACEMENT_DIST)
-                actual = full[1][atom][axis][a2]
-
-                rtol = 1e-8
-                check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'dH for atom {atom} axis {axis}, atom2 {a2}')
+    check_dH_derivative(data_symmetry, dict(rtol=1e-8))
 
 def test_symmetry_forces(data_symmetry):
-    data_subdir, full = data_symmetry
-    pickle.dump(full, open('blah.pckl', 'wb'), protocol=2)
-    for atom in range(ATOMS_PER_CELL):
-        for axis in range(3):
-            pluses = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=+1))
-            minuses = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))
-            expected = (pluses[2] - minuses[2]) / (2*DISPLACEMENT_DIST)
-            actual = full[2][atom][axis]
-
-            rtol = 1e-8 if (atom, axis) == (0, 0) else 1e-3
-            check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'forces for atom {atom} axis {axis}')
+    tols = lambda atom, axis: dict(rtol = 1e-8 if (atom, axis) == (0, 0) else 1e-3)
+    check_forces_derivative(data_symmetry, tols)
 
 def test_symmetry_Vt(data_symmetry):
-    data_subdir, full = data_symmetry
-    for atom in range(ATOMS_PER_CELL):
-        for axis in range(3):
-            pluses = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=+1))
-            minuses = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))
-            expected = (pluses[0] - minuses[0]) / (2*DISPLACEMENT_DIST)
-            actual = full[0][atom][axis]
-
-            rtol = 1e-8
-            check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'Vt for atom {atom} axis {axis}')
+    check_Vt_derivative(data_symmetry, dict(rtol=1e-8))
 
 @pytest.fixture
 @memoize()
 def data_supercell_211():
+    ensure_test_data()
     data_subdir = 'sc-211'
     full = do_elph_symmetry(
         data_subdir = data_subdir,
@@ -132,54 +106,89 @@ def data_supercell_211():
         all_displacements = list(AseDisplacement.iter(ATOMS_PER_CELL)),
         symmetry_type = None,
     )
-    return data_subdir, full
+    disp_atom_offset = 2  # index of first atom of center cell
+    return data_subdir, full, disp_atom_offset
 
 def test_supercell_211_dH(data_supercell_211):
-    ensure_test_data()
-    data_subdir, full = data_supercell_211
-
-    offset = 2
-    for atom in range(ATOMS_PER_CELL):
-        for axis in range(3):
-            plus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=+1))
-            minus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))
-
-            for a2 in range(ATOMS_PER_CELL):
-                expected = (plus[1][a2] - minus[1][a2]) / (2*DISPLACEMENT_DIST)
-                actual = full[1][offset+atom][axis][a2]
-
-                rtol = 1e-8
-                check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'dH for atom {atom} axis {axis}')
+    check_dH_derivative(data_supercell_211, dict(rtol=1e-8))
 
 def test_supercell_211_Vt(data_supercell_211):
-    ensure_test_data()
-    data_subdir, full = data_supercell_211
+    check_Vt_derivative(data_supercell_211, dict(rtol=1e-8))
 
-    offset = 2
+def test_supercell_211_forces(data_supercell_211):
+    check_forces_derivative(data_supercell_211, dict(rtol=1e-8))
+
+@pytest.fixture
+@memoize()
+def data_supercell_311():
+    ensure_test_data()
+    data_subdir = 'sc-311'
+    full = do_elph_symmetry(
+        data_subdir = data_subdir,
+        params_fd = BASE_PARAMS,
+        supercell = (3, 1, 1),
+        all_displacements = list(AseDisplacement.iter(ATOMS_PER_CELL)),
+        symmetry_type = None,
+    )
+    disp_atom_offset = 2  # index of first atom of center cell
+    return data_subdir, full, disp_atom_offset
+
+def test_supercell_311_dH(data_supercell_311):
+    check_dH_derivative(data_supercell_311, dict(rtol=1e-8))
+
+def test_supercell_311_Vt(data_supercell_311):
+    check_Vt_derivative(data_supercell_311, dict(rtol=1e-8))
+
+def test_supercell_311_forces(data_supercell_311):
+    check_forces_derivative(data_supercell_311, dict(rtol=1e-8))
+
+# ==============================================================================
+
+def check_Vt_derivative(data, tols):
+    data_subdir, full_output, disp_atom_offset = data
+
     for atom in range(ATOMS_PER_CELL):
         for axis in range(3):
             plus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=+1))[0]
             minus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))[0]
             expected = (plus - minus) / (2*DISPLACEMENT_DIST)
-            actual = full[0][offset+atom][axis]
+            actual = full_output[0][disp_atom_offset + atom][axis]
 
-            rtol = 1e-8
-            check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'dH for atom {atom} axis {axis}')
+            this_tols = possibly_call(tols, atom=atom, axis=axis)
+            check_symmetry_result(actual, expected, err_msg=f'Vt for atom {atom} axis {axis}', **this_tols)
 
-def test_supercell_211_forces(data_supercell_211):
-    ensure_test_data()
-    data_subdir, full = data_supercell_211
+def check_dH_derivative(data, tols):
+    data_subdir, full_output, disp_atom_offset = data
 
-    offset = 2
+    for atom in range(ATOMS_PER_CELL):
+        for axis in range(3):
+            plus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=+1))[1]
+            minus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))[1]
+
+            for a2 in range(ATOMS_PER_CELL):
+                expected = (plus[a2] - minus[a2]) / (2*DISPLACEMENT_DIST)
+                actual = full_output[1][disp_atom_offset + atom][axis][a2]
+
+                this_tols = possibly_call(tols, atom=atom, axis=axis)
+                check_symmetry_result(actual, expected, err_msg=f'dH for atom {atom} axis {axis}, atom2 {a2}', **this_tols)
+
+def check_forces_derivative(data, tols):
+    data_subdir, full_output, disp_atom_offset = data
+
     for atom in range(ATOMS_PER_CELL):
         for axis in range(3):
             plus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=+1))[2]
             minus = read_elph_input(data_subdir, AseDisplacement(atom=atom, axis=axis, sign=-1))[2]
             expected = (plus - minus) / (2*DISPLACEMENT_DIST)
-            actual = full[2][offset+atom][axis]
+            actual = full_output[2][disp_atom_offset + atom][axis]
 
-            rtol = 1e-8
-            check_symmetry_result(actual, expected, rtol=rtol, err_msg=f'forces for atom {atom} axis {axis}')
+            this_tols = possibly_call(tols, atom=atom, axis=axis)
+            check_symmetry_result(actual, expected, err_msg=f'forces for atom {atom} axis {axis}', **this_tols)
+
+def possibly_call(value, *args, **kw):
+    while callable(value):
+        value = value(*args, **kw)
+    return value
 
 # ==============================================================================
 
@@ -240,10 +249,6 @@ def get_wfs_with_sym(params_fd, symmetry_type, supercell_atoms):
     calc_fd_sym.set_positions(dummy_supercell_atoms)
     return calc_fd_sym.wfs
 
-
-def dict_subtract(arraydict: tp.Dict[int, np.ndarray]) -> np.ndarray:
-    return np.array([arraydict[i] for i in range(len(arraydict))])
-
 # ==============================================================================
 
 class SymmetryOutput(tp.NamedTuple):
@@ -270,6 +275,7 @@ def ensure_test_data():
 
     make_output(path = f'{MAIN_DATA_DIR}/sc-111', supercell=(1,1,1))
     make_output(path = f'{MAIN_DATA_DIR}/sc-211', supercell=(2,1,1))
+    make_output(path = f'{MAIN_DATA_DIR}/sc-311', supercell=(3,1,1))
     # make_output(path = f'{MAIN_DATA_DIR}/sc-333', supercell=(3,3,3))
 
 def gen_test_data(datadir: str, params_fd: dict, supercell):
@@ -320,8 +326,8 @@ def elph_callbacks(wfs_with_symmetry: gpaw.wavefunctions.base.WaveFunctions, sup
 
     Vt_part = symmetry.WrappedCallbacks[np.ndarray, np.ndarray](
         # To apply these permutations we have to flatten the three grid axes.
-        convert_into=lambda arr: log('into-2', log('into-1', arr).reshape((nspin, -1))),
-        convert_from=lambda arr: log('from-2', log('from-1', arr).reshape((nspin,) + grid_dim)),
+        convert_into=lambda arr: arr.reshape((nspin, -1)),
+        convert_from=lambda arr: arr.reshape((nspin,) + grid_dim),
         wrapped=symmetry.GeneralArrayCallbacks(
             ['na', 'flatgrid'],
             (('flatgrid', 'oper'), 'perm', grid_oper_deperms),
