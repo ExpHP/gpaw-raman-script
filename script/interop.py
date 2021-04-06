@@ -78,6 +78,16 @@ class AseDisplacement(tp.NamedTuple):
         sign_str = '-' if self.sign == -1 else '+'
         return f'{self.atom}{axis_str}{sign_str}'
 
+def gpaw_broadcast_array_dict_to_dicts(arraydict):
+    """ Take a GPAW arraydict and build a dict that has data at all atoms on all processes. """
+    out_a = {}
+    for a in range(arraydict.partition.natoms):
+        out_a[a] = np.zeros(arraydict.shapes_a[a])
+        if a in arraydict:
+            out_a[a][:] = arraydict[a]
+        arraydict.partition.comm.sum(out_a[a])
+    return out_a
+
 def gpaw_flat_G_oper_permutations(wfs: WaveFunctions):
     """ Get spacegroup operators as permutations of a flattened 'G' axis in GPAW.
 

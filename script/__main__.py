@@ -36,6 +36,7 @@ def main():
     p = subs.add_parser('diamond')
     p.add_argument('--brute', dest='action', action='store_const', const='brute')
     p.add_argument('--symmetry-test', dest='action', action='store_const', const='symmetry-test')
+    p.add_argument('--get-files', dest='action', action='store_const', const='get-files')
     p.add_argument('--supercell', type=(lambda s: tuple(map(int, s))), dest='supercell', default=(1,1,1))
     p.set_defaults(func=lambda args, log: main__elph_diamond(action=args.action, supercell=args.supercell, log=log))
 
@@ -88,7 +89,7 @@ def main__elph_diamond(supercell, action, log):
         xc='PBE',
     )
 
-    def get_wfs_with_sym():
+    def get_wfs_with_sym(params_fd):
         # Make a supercell exactly like ElectronPhononCoupling makes, but with point_group = True
         params_fd_sym = copy.deepcopy(params_fd)
         if 'symmetry' not in params_fd_sym:
@@ -155,7 +156,7 @@ def main__elph_diamond(supercell, action, log):
         if 'h' in params_fd:
             del params_fd['h']
 
-        wfs_with_sym = get_wfs_with_sym()
+        wfs_with_sym = get_wfs_with_sym(params_fd)
 
         calc_fd = GPAW(txt=log, **params_fd)
 
@@ -178,7 +179,7 @@ def main__elph_diamond(supercell, action, log):
         lattice = supercell_atoms.get_cell()[...]
         oper_cart_rots = np.einsum('ki,slk,jl->sij', lattice, wfs_with_sym.kd.symmetry.op_scc, np.linalg.inv(lattice))
         if world.rank == 0:
-            full_values = symmetry.expand_derivs_by_symmetry(
+            full_derivatives = symmetry.expand_derivs_by_symmetry(
                 disp_atoms,       # disp -> atom
                 disp_carts,       # disp -> 3-vec
                 disp_values,      # disp -> T  (displaced value, optionally minus equilibrium value)
@@ -187,87 +188,118 @@ def main__elph_diamond(supercell, action, log):
                 oper_perms=wfs_with_sym.kd.symmetry.a_sa,       # oper -> atom' -> atom
                 quotient_perms=quotient_perms,
             )
-            for a in range(len(full_values)):
+            for a in range(len(full_derivatives)):
                 for c in range(3):
-                    full_Vt[a][c] = full_values[a][c][0]
-                    full_dH[a][c] = full_values[a][c][1]
-                    full_forces[a][c] = full_values[a][c][2]
+                    full_Vt[a][c] = full_derivatives[a][c][0]
+                    full_dH[a][c] = full_derivatives[a][c][1]
+                    full_forces[a][c] = full_derivatives[a][c][2]
             full_values = full_Vt, full_dH, full_forces
             pickle.dump(full_values, open('full.pckl', 'wb'), protocol=2)
 
     # END action 'symmetry-test'
 
-    # # ============
-    # # SYMMETRY TEST
-    # # For testing the symmetry expansion of ElectronPhononCoupling data.
-    # # Produces selected displacements.
-    # if action == 'get-the-files':
-    #     # a supercell exactly like ElectronPhononCoupling makes
-    #     supercell_atoms = atoms * supercell
-    #     quotient_perms = list(interop.ase_repeat_translational_symmetry_perms(len(atoms), supercell))
+    # ============
+    # GET THE FILES
+    # Get files only at selected displacements.
 
-    #     def get_data(atoms):
-    #         # Do calculation
-    #         atoms_N.get_potential_energy()
+    if action == 'get-files':
+        if not os.path.exists('gs.gpw'):
+            calc_gs = GPAW(**params_fd)
+            atoms.calc = calc_gs
+            atoms.get_potential_energy()
+            atoms.calc.write("gs.gpw", mode="all")
+        else:
+            calc_gs = GPAW('gs.gpw')
 
-    #         # Calculate forces if desired
-    #         if self.calculate_forces:
-    #             force_filename = 'phonons.' + self.state
-    #             fd = opencew(force_filename)
-    #             if fd is not None:
-    #                 forces = atoms_N.get_forces()
-    #                 if rank == 0:
-    #                     pickle.dump(forces, fd, protocol=2)
-    #                     sys.stdout.write('Writing %s\n' % force_filename)
-    #                     fd.close()
-    #                 sys.stdout.flush()
+        # This makes the real space grid points identical to the primitive cell computation.
+        # (by increasing the counts by a factor of a supercell dimension)
+        params_fd['gpts'] = calc_gs.wfs.gd.N_c * list(supercell)
+        if 'h' in params_fd:
+            del params_fd['h']
 
+        def get_data(atoms):
+            atoms.get_potential_energy()
 
-    #     # IMPORTANT: The real space grid of the calculators we use now must match
-    #     #            the ones we had during the brute force computation.
-    #     params_fd['gpts'] = GPAW('gs.gpw').wfs.gd.N_c * list(supercell)
-    #     if 'h' in params_fd:
-    #         del params_fd['h']
+            calc = atoms.calc
+            if not isinstance(calc, GPAW):
+                calc = calc.dft  # unwrap DFTD3 wrapper
 
-    #     wfs_with_sym = get_wfs_with_sym()
+            Vt_sG = calc.wfs.gd.collect(calc.hamiltonian.vt_sG, broadcast=True)
+            dH_asp = interop.gpaw_broadcast_array_dict_to_dicts(calc.hamiltonian.dH_asp)
+            forces = atoms.get_forces()
+            return Vt_sG, dH_asp, forces
 
-    #     calc_fd = GPAW(txt=log, **params_fd)
+        calc_fd = GPAW(txt=log, **params_fd)
 
-    #     elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell, calculate_forces=True)
-    #     cell_offset = elph.offset
-    #     del elph  # that's all we needed it for
+        elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell, calculate_forces=True)
+        cell_offset = elph.offset
+        del elph  # that's all we needed it for
 
-    #     # GPAW displaces the center cell for some reason instead of the first cell
-    #     get_displaced_index = lambda prim_atom: cell_offset * len(atoms) + prim_atom
+        # a supercell exactly like ElectronPhononCoupling makes
+        supercell_atoms = atoms * supercell
+        supercell_atoms.calc = calc_fd
+        quotient_perms = list(interop.ase_repeat_translational_symmetry_perms(len(atoms), supercell))
 
-    #     all_displacements = list(minimal_ase_displacements)
-    #     disp_atoms = [get_displaced_index(disp.atom) for disp in all_displacements]
-    #     disp_carts = [disp.cart_displacement(DISPLACEMENT_DIST) for disp in all_displacements]
-    #     disp_values = [read_elph_input(disp) for disp in all_displacements]
+        # GPAW displaces the center cell for some reason instead of the first cell
+        get_displaced_index = lambda prim_atom: cell_offset * len(atoms) + prim_atom
 
-    #     full_Vt = np.empty((len(supercell_atoms), 3) + disp_values[0][0].shape)
-    #     full_dH = np.empty((len(supercell_atoms), 3) + disp_values[0][1].shape)
-    #     full_forces = np.empty((len(supercell_atoms), 3) + disp_values[0][2].shape)
+        elph_path = f'elph.eq.pckl'
+        forces_path = f'phonons.eq.pckl'
+        if not os.path.exists(elph_path):
+            Vt_sG, dH_asp, forces = get_data(supercell_atoms)
+            pickle.dump(forces, paropen(forces_path, 'wb'), protocol=2)
+            pickle.dump((Vt_sG, dH_asp), paropen(elph_path, 'wb'), protocol=2)
 
-    #     lattice = supercell_atoms.get_cell()[...]
-    #     oper_cart_rots = np.einsum('ki,slk,jl->sij', lattice, wfs_with_sym.kd.symmetry.op_scc, np.linalg.inv(lattice))
-    #     if world.rank == 0:
-    #         full_values = symmetry.expand_derivs_by_symmetry(
-    #             disp_atoms,       # disp -> atom
-    #             disp_carts,       # disp -> 3-vec
-    #             disp_values,      # disp -> T  (displaced value, optionally minus equilibrium value)
-    #             elph_callbacks(wfs_with_sym, supercell=supercell),        # how to work with T
-    #             oper_cart_rots,   # oper -> 3x3
-    #             oper_perms=wfs_with_sym.kd.symmetry.a_sa,       # oper -> atom' -> atom
-    #             quotient_perms=quotient_perms,
-    #         )
-    #         for a in range(len(full_values)):
-    #             for c in range(3):
-    #                 full_Vt[a][c] = full_values[a][c][0]
-    #                 full_dH[a][c] = full_values[a][c][1]
-    #                 full_forces[a][c] = full_values[a][c][2]
-    #         full_values = full_Vt, full_dH, full_forces
-    #         pickle.dump(full_values, open('full.pckl', 'wb'), protocol=2)
+        # Compute at unique displacements
+        original_positions = supercell_atoms.get_positions().copy()
+        for disp in minimal_ase_displacements:
+            elph_path = f'elph.sym.{disp}.pckl'
+            forces_path = f'phonons.sym.{disp}.pckl'
+            if not os.path.exists(elph_path):
+                disp_atom = get_displaced_index(disp.atom)
+                disp_cart = disp.cart_displacement(DISPLACEMENT_DIST)
+
+                modified_positions = original_positions.copy()
+                modified_positions[disp_atom] += disp_cart
+                supercell_atoms.set_positions(modified_positions)
+
+                Vt_sG, dH_asp, forces = get_data(supercell_atoms)
+                pickle.dump(forces, paropen(forces_path, 'wb'), protocol=2)
+                pickle.dump((Vt_sG, dH_asp), paropen(elph_path, 'wb'), protocol=2)
+        supercell_atoms.set_positions(original_positions)
+
+        # Get derivatives
+        wfs_with_sym = get_wfs_with_sym(params_fd)
+        if world.rank == 0:
+            all_displacements = list(minimal_ase_displacements)
+            disp_atoms = [get_displaced_index(disp.atom) for disp in all_displacements]
+            disp_carts = [disp.cart_displacement(DISPLACEMENT_DIST) for disp in all_displacements]
+            disp_values = [read_elph_input(f'sym.{disp}') for disp in all_displacements]
+            lattice = supercell_atoms.get_cell()[...]
+            oper_cart_rots = np.einsum('ki,slk,jl->sij', lattice, wfs_with_sym.kd.symmetry.op_scc, np.linalg.inv(lattice))
+            full_derivatives = symmetry.expand_derivs_by_symmetry(
+                disp_atoms,       # disp -> atom
+                disp_carts,       # disp -> 3-vec
+                disp_values,      # disp -> T  (displaced value, optionally minus equilibrium value)
+                elph_callbacks(wfs_with_sym, supercell=supercell),        # how to work with T
+                oper_cart_rots,   # oper -> 3x3
+                oper_perms=wfs_with_sym.kd.symmetry.a_sa,       # oper -> atom' -> atom
+                quotient_perms=quotient_perms,
+            )
+
+            eq_Vt, eq_dH, eq_forces = read_elph_input('eq')
+            for a in range(len(full_derivatives)):
+                for c in range(3):
+                    delta_Vt, delta_dH, delta_forces = full_derivatives[a][c]
+                    for sign in [-1, +1]:
+                        disp = interop.AseDisplacement(atom=a, axis=c, sign=sign)
+                        disp_Vt = eq_Vt + sign * DISPLACEMENT_DIST * delta_Vt
+                        disp_dH = {k: eq_dH[k] + sign * DISPLACEMENT_DIST * delta_dH[k] for k in eq_dH}
+                        disp_forces = eq_forces + sign * DISPLACEMENT_DIST * delta_forces
+                        pickle.dump(disp_forces, paropen(f'phonons.{disp}.pckl', 'wb'), protocol=2)
+                        pickle.dump((disp_Vt, disp_dH), paropen(f'elph.{disp}.pckl', 'wb'), protocol=2)
+
+        calc_gs.wfs.gd.comm.barrier()
 
     # # END action 'get-the-files'
 
@@ -298,7 +330,7 @@ def elph_callbacks(wfs_with_symmetry: gpaw.wavefunctions.base.WaveFunctions, sup
     forces_part = symmetry.GeneralArrayCallbacks(['atom', 'cart'])
     return symmetry.TupleCallbacks(Vt_part, dH_part, forces_part)
 
-def read_elph_input(displacement: interop.AseDisplacement) -> tp.Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def read_elph_input(displacement: tp.Union[interop.AseDisplacement, str]) -> tp.Tuple[np.ndarray, np.ndarray, np.ndarray]:
     Vt_sG, dH_asp = pickle.load(open(f'elph.{displacement}.pckl', 'rb'))
     forces = pickle.load(open(f'phonons.{displacement}.pckl', 'rb'))
     return Vt_sG, dH_asp, forces
