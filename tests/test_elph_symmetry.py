@@ -92,6 +92,7 @@ def test_symmetry_forces(data_symmetry):
     check_forces_derivative(data_symmetry, tols)
 
 def test_symmetry_Vt(data_symmetry):
+    #pickle.dump(data_symmetry[1][0], open('full-Vt.pckl', 'wb'), protocol=2)
     check_Vt_derivative(data_symmetry, dict(rtol=1e-8))
 
 @pytest.fixture
@@ -295,14 +296,14 @@ def gen_test_data(datadir: str, params_fd: dict, supercell):
     params_fd['gpts'] = calc_gs.wfs.gd.N_c * list(supercell)
     if 'h' in params_fd:
         del params_fd['h']
-    calc_fd = GPAW(**params_fd)
-    elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell, calculate_forces=True)
+    del calc_gs
 
     if world.rank == 0:
         os.makedirs(datadir, exist_ok=True)
+    calc_fd = GPAW(**params_fd)
     elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell, calculate_forces=True, name=f'{datadir}/elph')
     elph.run()
-    calc_gs.wfs.gd.comm.barrier()
+    calc_fd.wfs.gd.comm.barrier()
     elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell)
     elph.set_lcao_calculator(calc_fd)
     elph.calculate_supercell_matrix(dump=1)
@@ -363,10 +364,20 @@ def do_elph_symmetry(
     wfs_with_sym = get_wfs_with_sym(params_fd=params_fd, supercell_atoms=supercell_atoms, symmetry_type=symmetry_type)
     calc_fd = GPAW(**params_fd)
 
-    elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell, calculate_forces=True)
+    gd = wfs_with_sym.gd
+    print('n_c', gd.n_c)
+    print('beg_c', gd.beg_c)
+    print('end_c', gd.end_c)
+    print('coords', np.array([gd.coords(i) for i in range(3)]).T)
+
 
     # GPAW displaces the center cell for some reason instead of the first cell
-    get_displaced_index = lambda prim_atom: elph.offset * len(atoms) + prim_atom
+    elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell, calculate_forces=True)
+    displaced_cell_index = elph.offset
+    del elph  # just showing that we don't use these anymore
+    del calc_fd
+
+    get_displaced_index = lambda prim_atom: displaced_cell_index * len(atoms) + prim_atom
 
     all_displacements = list(all_displacements)
     disp_atoms = [get_displaced_index(disp.atom) for disp in all_displacements]
