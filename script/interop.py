@@ -88,6 +88,13 @@ def gpaw_broadcast_array_dict_to_dicts(arraydict):
         arraydict.partition.comm.sum(out_a[a])
     return out_a
 
+def gpaw_op_scc_to_cart_rots(op_scc: np.ndarray, lattice: np.ndarray):
+    assert op_scc.shape[1:] == (3,3)
+    assert lattice.shape == (3,3)
+
+    # cartesian column operator M = A^T U^T A^-T = (A U A^-1)^T
+    return np.einsum('ik,skl,lj->sji', np.linalg.inv(lattice), op_scc, lattice)
+
 def gpaw_flat_G_oper_permutations(wfs: WaveFunctions):
     """ Get spacegroup operators as permutations of a flattened 'G' axis in GPAW.
 
@@ -111,10 +118,12 @@ def _gpaw_flat_G_permutations(N_c, op_scc, ft_sc):
 
     # Go to basis where gridpoints have integer locations.
     #
-    # Starting with   f' = R f + t    (f = frac vec, R = rotation matrix)
+    # Starting with   f' = U^T f + t    (f = frac vec, U = gpaw integer rotation matrix)
     #     and using   n = diag(N_c) f    (n = integer coords of gridpoint)
-    #        we get   n' = diag(N_c) R diag(N_c)^-1 n  + diag(N_c)
-    intop_scc = np.einsum('bB,abc,Cc->aBC', np.diag(N_c), op_scc, np.diag(1.0 / N_c))
+    #        we get   n' = diag(N_c) U^T diag(N_c)^-1 n + diag(N_c) f
+    # and can define  n' = Q^T n + W,
+    #                 Q = diag(N_c)^-1 U diag(N_c),      W = diag(N_c) f.
+    intop_scc = np.einsum('Bb,abc,cC->aBC', np.diag(1.0 / N_c), op_scc, np.diag(N_c))
     intft_sc = N_c * ft_sc
 
     # gridpoints initially in lexicographic order, matching the order you get from flattening data
@@ -122,7 +131,7 @@ def _gpaw_flat_G_permutations(N_c, op_scc, ft_sc):
     gridpoints = lexically_ordered_integer_gridpoints(N_c)
     out = []
     for intop_cc, intft_c in zip(intop_scc, intft_sc):
-        gridpoints_after_float = gridpoints @ intop_cc.T + intft_c  # transform the row vectors
+        gridpoints_after_float = gridpoints @ intop_cc + intft_c  # transform the row vectors.  Q (not Q^T) acts on row vectors
         gridpoints_after = np.rint(gridpoints_after_float)
         np.testing.assert_allclose(gridpoints_after_float, gridpoints_after, atol=max(N_c)*1e-10, err_msg="Symmetries are incompatible with grid!")
         gridpoints_after %= N_c

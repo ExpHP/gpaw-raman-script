@@ -33,15 +33,13 @@ class SemigroupTree(tp.Generic[G]):
         if not self.generators:
             return  # empty semigroup
 
-        all_seen = set()
+        all_seen: tp.Set = set()
         for gen_gen_index, gen in enumerate(self.generators):
             # Ignore redundant generators.
-            gen_hashable = make_hashable(gen)
-            if gen_hashable in all_seen:
+            if not checked_add_to_set(all_seen, make_hashable(gen)):
                 continue
 
             # Add leaf node for generator.
-            all_seen.add(gen_hashable)
             self.generator_indices.append(len(self.members))
             self.members.append(gen)
             self.decomps.append(gen_gen_index)
@@ -54,10 +52,8 @@ class SemigroupTree(tp.Generic[G]):
             rhs_node_index = 0
             while rhs_node_index < len(self.members):
                 product = func(gen, self.members[rhs_node_index])
-                product_hashable = make_hashable(product)
 
-                if product_hashable not in all_seen:
-                    all_seen.add(product_hashable)
+                if checked_add_to_set(all_seen, make_hashable(product)):
                     self.members.append(product)
                     self.decomps.append((gen_node_index, rhs_node_index))
                 rhs_node_index += 1
@@ -77,6 +73,29 @@ class SemigroupTree(tp.Generic[G]):
                 out.append(get_generator(gen_index, self.generators[gen_index]))
 
         return out
+
+
+def cyclic_group(
+        generator: G,
+        func: tp.Callable[[G, G], G],
+        make_hashable: tp.Callable[[G], tp.Any] = lambda x: x,
+        ):
+    """ Generates the cyclic group of a generator G of finite order, in the sequence G^0, G^1, G^2, ... """
+    current = generator
+    sequence = []
+    seen: tp.Set = set()
+    while checked_add_to_set(seen, make_hashable(current)):
+        sequence.append(current)
+        current = func(current, generator)
+    # identity is at the end; move it to the front
+    return [sequence.pop()] + sequence
+
+
+def checked_add_to_set(set: tp.Set[T], item: T) -> bool:
+    """ Adds an item to a set and returns a boolean indicating whether the item was newly added. """
+    was_new = item not in set
+    set.add(item)
+    return was_new
 
 
 _NOT_YET_RUN = object()

@@ -329,6 +329,35 @@ class GpawLcaoDHCallbacks(AtomDictCallbacks[np.ndarray]):
 
         return dH_asp
 
+def GpawLcaoVTCallbacks(wfs, supercell):
+    assert len(supercell) == 3
+    return GpawLcaoVTCallbacks__from_parts(
+        nspins=wfs.nspins,
+        N_c=wfs.gd.N_c,
+        op_scc=wfs.kd.symmetry.op_scc,
+        ft_sc=wfs.kd.symmetry.ft_sc,
+        supercell=supercell,
+    )
+
+def GpawLcaoVTCallbacks__from_parts(nspins, N_c, op_scc, ft_sc, supercell):
+    from . import interop
+
+    N_c = tuple(N_c)
+    supercell = tuple(supercell)
+    grid_oper_deperms = interop._gpaw_flat_G_permutations(N_c, op_scc, ft_sc)
+    grid_quotient_deperms = interop.gpaw_flat_G_quotient_permutations(N_c=N_c, repeats=supercell)
+
+    return WrappedCallbacks[np.ndarray, np.ndarray](
+        # To apply these permutations we have to flatten the three grid axes.
+        convert_into=lambda arr: arr.reshape((nspins, -1)),
+        convert_from=lambda arr: arr.reshape((nspins,) + N_c),
+        wrapped=GeneralArrayCallbacks(
+            ['na', 'flatgrid'],
+            (('flatgrid', 'oper'), 'perm', grid_oper_deperms),
+            (('flatgrid', 'quotient'), 'perm', grid_quotient_deperms),
+        ),
+    )
+
 class TupleCallbacks(SymmetryCallbacks[tp.Tuple]):
     # Callbacks for each item.
     parts: tp.List[SymmetryCallbacks]

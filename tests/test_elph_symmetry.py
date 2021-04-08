@@ -92,7 +92,6 @@ def test_symmetry_forces(data_symmetry):
     check_forces_derivative(data_symmetry, tols)
 
 def test_symmetry_Vt(data_symmetry):
-    #pickle.dump(data_symmetry[1][0], open('full-Vt.pckl', 'wb'), protocol=2)
     check_Vt_derivative(data_symmetry, dict(rtol=1e-8))
 
 @pytest.fixture
@@ -316,6 +315,7 @@ def elph_callbacks(wfs_with_symmetry: gpaw.wavefunctions.base.WaveFunctions, sup
     grid_dim = tuple(wfs_with_symmetry.gd.N_c)
     # The operators permute the grid points
     grid_oper_deperms = interop.gpaw_flat_G_oper_permutations(wfs_with_symmetry)
+
     print('grid dim:', grid_dim)
     print('supercell:', supercell)
     print('grid_oper_deperms:', grid_oper_deperms.shape)
@@ -364,13 +364,6 @@ def do_elph_symmetry(
     wfs_with_sym = get_wfs_with_sym(params_fd=params_fd, supercell_atoms=supercell_atoms, symmetry_type=symmetry_type)
     calc_fd = GPAW(**params_fd)
 
-    gd = wfs_with_sym.gd
-    print('n_c', gd.n_c)
-    print('beg_c', gd.beg_c)
-    print('end_c', gd.end_c)
-    print('coords', np.array([gd.coords(i) for i in range(3)]).T)
-
-
     # GPAW displaces the center cell for some reason instead of the first cell
     elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell, calculate_forces=True)
     displaced_cell_index = elph.offset
@@ -390,6 +383,7 @@ def do_elph_symmetry(
 
     lattice = supercell_atoms.get_cell()[...]
     oper_cart_rots = np.einsum('ki,slk,jl->sij', lattice, wfs_with_sym.kd.symmetry.op_scc, np.linalg.inv(lattice))
+    # oper_cart_rots = interop.gpaw_op_scc_to_cart_rots(wfs_with_sym.kd.symmetry.op_scc, lattice)
     if world.rank == 0:
         full_values = symmetry.expand_derivs_by_symmetry(
             disp_atoms,       # disp -> atom

@@ -11,7 +11,8 @@ DispData = namedtuple('DispData', ['atom', 'cart', 'data'])
 
 
 def compose_perm(a, b): return b[a]
-def compose_rot(a, b): return a @ b
+def compose_rot(a, b): return a @ b   # composes matrices that transform column vectors
+def compose_rot_T(a, b): return b @ a   # composes matrices that transform row vectors
 def make_rot_hashable(a): return tuple(map(tuple, a.tolist()))
 def make_perm_hashable(a): return tuple(a.tolist())
 
@@ -260,3 +261,64 @@ def test_quotient_translation_order__gpaw_flat_G():
     # Verify that the data was translated to the expected location
     print(np.where(transformed_data == 99))
     assert transformed_data[final_point] == 99
+
+
+# Spacegroup: C4 in xy plane.  Order:  Identity, 90deg CCW, 180deg, 90deg CW.
+#  Structure: Atoms at +x, +y, -x, -y.  (so C4 permutes them 0 -> 1 -> 2 -> 3 -> 0)
+def test_gpaw_grid_C4_z():
+    N_c = (5, 5, 3)  # grid dimensions
+    nspins = 1
+
+    cart_rot_generator = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]])
+    perm_generator = np.array([3, 0, 1, 2])
+    op_scc_generator = np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]])  # gpaw's op_scc is transposed (operates on row vectors)
+
+    oper_cart_rots = test_utils.cyclic_group(cart_rot_generator, compose_rot, make_rot_hashable)
+    oper_perms = test_utils.cyclic_group(perm_generator, compose_perm, make_perm_hashable)
+    op_scc = test_utils.cyclic_group(op_scc_generator, compose_rot_T, make_rot_hashable)
+    ft_sc = np.zeros((4, 3))
+    quotient_perms = None
+    supercell = (1, 1, 1)
+
+    callbacks = symmetry.GpawLcaoVTCallbacks__from_parts(nspins=nspins, N_c=N_c, op_scc=op_scc, ft_sc=ft_sc, supercell=supercell)
+
+    def data_pointed(index_tuple, value):
+        """ Creates Vt data with a single nonzero value. """
+        array = np.zeros((nspins,) + N_c)
+        array[(0,) + index_tuple] = value
+        return array
+    data_zero = np.zeros((nspins,) + N_c)
+
+    disp_atoms, disp_carts, disp_values = zip(*[
+        DispData(0, [ 0.1,    0,    0], data=data_pointed((2, 0, 2),  1.0)),
+        DispData(0, [-0.1,    0,    0], data=data_pointed((2, 0, 2), -1.0)),
+        DispData(0, [   0,  0.1,    0], data=data_zero),
+        DispData(0, [   0, -0.1,    0], data=data_zero),
+        DispData(0, [   0,    0,  0.1], data=data_zero),
+        DispData(0, [   0,    0, -0.1], data=data_zero),
+    ])
+    derivs = symmetry.expand_derivs_by_symmetry(
+            callbacks=callbacks, disp_atoms=disp_atoms, disp_carts=disp_carts, disp_values=disp_values,
+            oper_cart_rots=oper_cart_rots, oper_perms=oper_perms, quotient_perms=quotient_perms,
+    )
+    derivs = np.array(derivs.tolist())
+    expected = np.array([[
+        data_pointed((2, 0, 2), 10.0),  # derivative w.r.t. atom 0 x
+        data_zero,  # derivative w.r.t. atom 0 y
+        data_zero,  # derivative w.r.t. atom 0 z
+    ], [
+        data_zero,  # derivative w.r.t. atom 1 x
+        data_pointed((0, 2, 2), 10.0),  # derivative w.r.t. atom 1 y
+        data_zero,  # derivative w.r.t. atom 1 z
+    ], [
+        data_pointed(((-2)%5, 0, 2), -10.0),  # derivative w.r.t. atom 2 x
+        data_zero,  # derivative w.r.t. atom 2 y
+        data_zero,  # derivative w.r.t. atom 2 z
+    ], [
+        data_zero,  # derivative w.r.t. atom 3 x
+        data_pointed((0, (-2)%5, 2), -10.0),  # derivative w.r.t. atom 3 y
+        data_zero,  # derivative w.r.t. atom 3 z
+    ]])
+    print('actual', list(zip(*np.where(derivs))))
+    print('expected', list(zip(*np.where(expected))))
+    np.testing.assert_allclose(derivs, expected)
