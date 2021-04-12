@@ -341,33 +341,9 @@ def gen_test_data(datadir: str, params_fd: dict, supercell):
 # ==============================================================================
 
 def elph_callbacks(wfs_with_symmetry: gpaw.wavefunctions.base.WaveFunctions, supercell):
-    # Vt_sG has shape (nspin, N_c[0], N_c[1], N_c[2])
-    nspin = wfs_with_symmetry.nspins
-    grid_dim = tuple(wfs_with_symmetry.gd.N_c)
-    # The operators permute the grid points
-    grid_oper_deperms = interop.gpaw_flat_G_oper_permutations(wfs_with_symmetry)
-
-    print('grid dim:', grid_dim)
-    print('supercell:', supercell)
-    print('grid_oper_deperms:', grid_oper_deperms.shape)
-    grid_quotient_deperms = interop.gpaw_flat_G_quotient_permutations(N_c=grid_dim, repeats=supercell)
-
-    def log(msg, arr):
-        print(msg, arr.shape)
-        return arr
-
-    Vt_part = symmetry.WrappedCallbacks[np.ndarray, np.ndarray](
-        # To apply these permutations we have to flatten the three grid axes.
-        convert_into=lambda arr: arr.reshape((nspin, -1)),
-        convert_from=lambda arr: arr.reshape((nspin,) + grid_dim),
-        wrapped=symmetry.GeneralArrayCallbacks(
-            ['na', 'flatgrid'],
-            (('flatgrid', 'oper'), 'perm', grid_oper_deperms),
-            (('flatgrid', 'quotient'), 'perm', grid_quotient_deperms),
-        ),
-    )
-
-    dH_part = symmetry.GpawLcaoDHCallbacks(wfs_with_symmetry)
+    elphsym = symmetry.ElphGpawSymmetrySource.from_wfs_with_symmetry(wfs_with_symmetry)
+    Vt_part = symmetry.GpawLcaoVTCallbacks(wfs_with_symmetry, elphsym, supercell=supercell)
+    dH_part = symmetry.GpawLcaoDHCallbacks(wfs_with_symmetry, elphsym)
     forces_part = symmetry.GeneralArrayCallbacks(['atom', 'cart'])
     return symmetry.TupleCallbacks(Vt_part, dH_part, forces_part)
 

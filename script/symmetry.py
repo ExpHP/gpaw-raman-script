@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+from . import interop
+
 from collections import defaultdict
 import itertools
 
@@ -303,14 +305,15 @@ class AtomDictCallbacks(SymmetryCallbacks[tp.Dict[int, T]], tp.Generic[T]):
 
 class GpawLcaoDHCallbacks(AtomDictCallbacks[np.ndarray]):
     """ Callbacks for ``calc.hamiltonian.dH_asp`` (as a ragged dict of arrays) in GPAW LCAO mode. """
-    def __init__(self, wfs_with_symmetry: gpaw.wavefunctions.base.WaveFunctions):
+    def __init__(self, wfs, symmetry: 'ElphGpawSymmetrySource'):
         super().__init__()
-        self.wfs = wfs_with_symmetry
+        self.nspins = wfs.nspins
+        self.symmetry = symmetry
 
     def apply_oper(self, obj, sym, cart_rot, atom_deperm):
         from gpaw.utilities import pack, unpack2
 
-        a_a = self.wfs.kd.symmetry.a_sa[sym]
+        a_a = self.symmetry.a_sa[sym]
         assert (a_a == atom_deperm).all(), "mismatched oper order or something?"
 
         # permute the 'a' axis (atoms in the dict)
@@ -319,8 +322,8 @@ class GpawLcaoDHCallbacks(AtomDictCallbacks[np.ndarray]):
         # and now the 'p' axis
         dH_asp = obj
         for a in range(len(dH_asp)):
-            R_ii = self.wfs.setups[a].R_sii[sym]
-            for s in range(self.wfs.nspins):
+            R_ii = self.symmetry.R_asii[a][sym]
+            for s in range(self.nspins):
                 dH_p = dH_asp[a][s]
                 dH_ii = unpack2(dH_p)
                 tmp_ii = R_ii @ dH_ii @ R_ii.T
@@ -329,13 +332,13 @@ class GpawLcaoDHCallbacks(AtomDictCallbacks[np.ndarray]):
 
         return dH_asp
 
-def GpawLcaoVTCallbacks(wfs, supercell):
+def GpawLcaoVTCallbacks(wfs, symmetry: 'ElphGpawSymmetrySource', supercell):
     assert len(supercell) == 3
     return GpawLcaoVTCallbacks__from_parts(
         nspins=wfs.nspins,
         N_c=wfs.gd.N_c,
-        op_scc=wfs.kd.symmetry.op_scc,
-        ft_sc=wfs.kd.symmetry.ft_sc,
+        op_scc=symmetry.op_scc,
+        ft_sc=symmetry.ft_sc,
         supercell=supercell,
     )
 
@@ -699,3 +702,78 @@ class TensorRotator:
             einsum_args.append(subscripts)
         einsum_args += [array, self.array_subscripts, self.out_subscripts]
         return np.einsum(*einsum_args)
+
+# ==============================================================================
+
+class ElphGpawSymmetrySource:
+    """ Helper for code that needs symmetry data in the format provided by GPAW, but for operators
+    not computed by GPAW. """
+
+    op_scc: np.ndarray  # replacement for wfs.kd.symmetry.op_scc
+    ft_sc: np.ndarray  # replacement for wfs.kd.symmetry.ft_sc
+    a_sa: np.ndarray  # replacement for wfs.kd.symmetry.a_sa
+    R_asii: tp.Dict[AtomIndex, np.ndarray]  # replacement for wfs.setups[a].R_sii
+
+    def __init__(self, op_scc, ft_sc, a_sa, R_asii):
+        self.op_scc = op_scc
+        self.ft_sc = ft_sc
+        self.a_sa = a_sa
+        self.R_asii = R_asii
+
+    @classmethod
+    def from_wfs_with_symmetry(cls, wfs):
+        """ Create from GPAW's own Symmetry. """
+        return cls(
+            op_scc=wfs.kd.symmetry.op_scc,
+            ft_sc=wfs.kd.symmetry.ft_sc,
+            a_sa=wfs.kd.symmetry.a_sa,
+            R_asii={a: setup.R_sii for (a, setup) in enumerate(wfs.setups)},
+        )
+
+    @classmethod
+    def from_setups_and_ops(cls, setups: 'gpaw.setup.Setups', lattice, oper_cart_rots, oper_cart_trans, oper_deperms):
+        """ Create from a custom set of operators. """
+        op_scc = interop.cart_rots_to_gpaw_op_scc(oper_cart_rots, lattice)
+        ft_sc = oper_cart_trans @ np.linalg.inv(lattice)
+        a_sa = oper_deperms
+
+        return cls(
+            op_scc=op_scc,
+            ft_sc=ft_sc,
+            a_sa=a_sa,
+            R_asii=cls.compute_R_asii(setups, lattice=lattice, op_scc=op_scc),
+        )
+
+    # (copied from Setups.set_symmetry, but changed to return a value instead of set an attribute)
+    @staticmethod
+    def compute_R_asii(setups: 'gpaw.setup.Setups', lattice, op_scc):
+        from gpaw.rotation import rotation
+
+        R_slmm = []
+        for op_cc in op_scc:
+            op_vv = np.dot(np.linalg.inv(lattice), np.dot(op_cc, lattice))
+            R_slmm.append([rotation(l, op_vv) for l in range(4)])
+
+        # Compute LCAO operators for each setup.
+        # 'X' is an index label for unique atom type (Z, type, basis).  (the key for setups.setups, and value from id_a)
+        R_Xsii = {
+            X: ElphGpawSymmetrySource.compute_R_sii(setup, R_slmm)
+            for (X, setup) in setups.setups.items()
+        }
+
+        # Switch to per-atom.
+        R_asii = {a: R_Xsii[X] for (a, X) in enumerate(setups.id_a)}
+        return R_asii
+
+    # (copied from BaseSetup.calculate_rotations, but changed to return a value instead of set an attribute)
+    @staticmethod
+    def compute_R_sii(setup, R_slmm):
+        nsym = len(R_slmm)
+        R_sii = np.zeros((nsym, setup.ni, setup.ni))
+        i1 = 0
+        for l in setup.l_j:
+            i2 = i1 + 2 * l + 1
+            for s, R_lmm in enumerate(R_slmm):
+                R_sii[s, i1:i2, i1:i2] = R_lmm[l]
+            i1 = i2
+        return R_sii
