@@ -87,10 +87,6 @@ def data_symmetry():
 def test_symmetry_dH(data_symmetry):
     check_dH_derivative(data_symmetry, dict(rtol=1e-8))
 
-def test_symmetry_forces(data_symmetry):
-    tols = lambda atom, axis: dict(rtol = 1e-8 if (atom, axis) == (0, 0) else 1e-3)
-    check_forces_derivative(data_symmetry, tols)
-
 def test_symmetry_Vt(data_symmetry):
     # This hurts.
     # Some of the worst things we see in the output:
@@ -99,8 +95,12 @@ def test_symmetry_Vt(data_symmetry):
     #  symmetric  0.03412427    original   0.019868       --> okay, forget rtol, use atol
     #  symmetric  0.03412427    original   0.07353537     --> even bigger atol
     #  symmetric -1.778908      original  -1.938584       --> big guy with big abs. err; bring back rtol
-    tols = dict(zerotol=5e-3, rtol=1e-1, atol=4e-2)
+    tols = dict(zero_rtol=5e-3, rtol=1e-1, atol=4e-2)
     check_Vt_derivative(data_symmetry, tols)
+
+def test_symmetry_forces(data_symmetry):
+    tols = lambda atom, axis: dict(rtol = 1e-8 if (atom, axis) == (0, 0) else 1e-3)
+    check_forces_derivative(data_symmetry, tols)
 
 @pytest.fixture
 @memoize()
@@ -125,6 +125,43 @@ def test_supercell_211_Vt(data_supercell_211):
 
 def test_supercell_211_forces(data_supercell_211):
     check_forces_derivative(data_supercell_211, dict(rtol=1e-8))
+
+# We have to test something that is both a supercell WITH symmetry enabled,
+# due to the complication introduced by pointgroup operators moving atoms
+# to other cells.
+@pytest.fixture
+@memoize()
+def data_symmetric_211():
+    ensure_test_data()
+    data_subdir = 'sc-211'
+    full = do_elph_symmetry(
+        data_subdir = data_subdir,
+        params_fd = BASE_PARAMS,
+        supercell = (2, 1, 1),
+        all_displacements = [
+            AseDisplacement(atom=atom, axis=axis, sign=sign)
+            for atom in [0, 1]
+            for axis in [0, 1]  # only operator compatible with 2x1x1 is a b-c flip, so we need b displacements too
+            for sign in [-1, +1]
+        ],
+        symmetry_type = 'pointgroup',
+    )
+    disp_atom_offset = 2  # index of first atom of center cell
+    return data_subdir, full, disp_atom_offset
+
+def test_symmetric_211_forces(data_symmetric_211):
+    def tols(atom, axis):
+        if atom == 0 and axis in [0, 1]:
+            return dict(rtol=1e-8)
+        # 1.0 might sound like a big z-tolerance, but this comes from direct inspection of the data;
+        # The vast majority of elements have an absolute value > 1,
+        # and all of the worst offenders are among those few elements that do not:
+        #    symmetric  -0.9349432   original  -0.6489585
+        #    symmetric  -0.9349432   original  -1.220928
+        #    symmetric   0.8988729   original   0.5734485
+        return dict(rtol=1e-1, zero_atol=1.0)
+
+    check_forces_derivative(data_symmetric_211, tols)
 
 @pytest.fixture
 @memoize()
@@ -200,11 +237,11 @@ def possibly_call(value, *args, **kw):
 
 # ==============================================================================
 
-def check_symmetry_result(symmetric_array, normal_array, expected_nnz_range=None, rtol=1e-7, atol=0, zerotol=1e-10, err_msg=None):
+def check_symmetry_result(symmetric_array, normal_array, expected_nnz_range=None, rtol=1e-7, atol=0, zero_rtol=1e-10, zero_atol=0, err_msg=None):
     # GPAW's results are often quite asymmetric, and enabling symmetry can cause matrix elements to become zero
     # when they previously appeared to have a non-negligible magnitude.
-    magnitude = np.max(np.abs(symmetric_array))
-    zero_mask = np.abs(symmetric_array) < zerotol * magnitude
+    zero_thresh = zero_rtol * np.max(np.abs(symmetric_array)) + zero_atol
+    zero_mask = np.abs(symmetric_array) < zero_thresh
 
     nonzero_idx = np.where(np.logical_not(zero_mask))
     if expected_nnz_range:
@@ -238,7 +275,7 @@ def check_symmetry_result(symmetric_array, normal_array, expected_nnz_range=None
 
             ratio = error_ratio(symmetric_value, normal_value)
             line = f'{str(index_tuple):>16}  {symmetric_value:13.07} {normal_value:13.07}   ABSERR {abs_err:10.3e}   RELERR {ratio - 1:10.3e}   '
-            if np.abs(symmetric_value) < zerotol * magnitude:
+            if np.abs(symmetric_value) < zero_thresh:
                 line += f'(zero)'
             elif terribad_ratio_cutoff <= ratio:
                 line += '(!!!!)'
@@ -340,8 +377,13 @@ def gen_test_data(datadir: str, params_fd: dict, supercell):
 
 # ==============================================================================
 
-def elph_callbacks(wfs_with_symmetry: gpaw.wavefunctions.base.WaveFunctions, supercell):
-    elphsym = symmetry.ElphGpawSymmetrySource.from_wfs_with_symmetry(wfs_with_symmetry)
+def elph_callbacks(
+        wfs_with_symmetry: gpaw.wavefunctions.base.WaveFunctions,
+        supercell,
+        elphsym: tp.Optional[symmetry.ElphGpawSymmetrySource] = None,
+        ):
+    if elphsym is None:
+        elphsym = symmetry.ElphGpawSymmetrySource.from_wfs_with_symmetry(wfs_with_symmetry)
     Vt_part = symmetry.GpawLcaoVTCallbacks(wfs_with_symmetry, elphsym, supercell=supercell)
     dH_part = symmetry.GpawLcaoDHCallbacks(wfs_with_symmetry, elphsym)
     forces_part = symmetry.GeneralArrayCallbacks(['atom', 'cart'])
