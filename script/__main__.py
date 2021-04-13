@@ -15,8 +15,10 @@ from ase.parallel import parprint, paropen, world
 import phonopy
 import ase.build
 import gpaw
+from gpaw import GPAW
 from gpaw.lrtddft import LrTDDFT
 import pickle
+import warnings
 
 from ruamel.yaml import YAML
 yaml = YAML(typ='rt')
@@ -66,7 +68,7 @@ def main__elph_diamond(supercell, action, log):
     from gpaw.elph.electronphonon import ElectronPhononCoupling
     from gpaw.lrtddft.spectrum import polarizability
     from gpaw.lrtddft import LrTDDFT
-    from gpaw import GPAW, FermiDirac
+    from gpaw import FermiDirac
     from gpaw.cluster import Cluster
 
     atoms = Cluster(ase.build.bulk('C'))
@@ -217,18 +219,6 @@ def main__elph_diamond(supercell, action, log):
         if 'h' in params_fd:
             del params_fd['h']
 
-        def get_data(atoms):
-            atoms.get_potential_energy()
-
-            calc = atoms.calc
-            if not isinstance(calc, GPAW):
-                calc = calc.dft  # unwrap DFTD3 wrapper
-
-            Vt_sG = calc.wfs.gd.collect(calc.hamiltonian.vt_sG, broadcast=True)
-            dH_asp = interop.gpaw_broadcast_array_dict_to_dicts(calc.hamiltonian.dH_asp)
-            forces = atoms.get_forces()
-            return Vt_sG, dH_asp, forces
-
         calc_fd = GPAW(txt=log, **params_fd)
 
         elph = ElectronPhononCoupling(atoms, calc=calc_fd, supercell=supercell, calculate_forces=True)
@@ -246,9 +236,10 @@ def main__elph_diamond(supercell, action, log):
         elph_path = f'elph.eq.pckl'
         forces_path = f'phonons.eq.pckl'
         if not os.path.exists(elph_path):
-            Vt_sG, dH_asp, forces = get_data(supercell_atoms)
+            elph_data = get_elph_data(supercell_atoms)
+            forces = supercell_atoms.get_forces()
             pickle.dump(forces, paropen(forces_path, 'wb'), protocol=2)
-            pickle.dump((Vt_sG, dH_asp), paropen(elph_path, 'wb'), protocol=2)
+            pickle.dump(elph_data, paropen(elph_path, 'wb'), protocol=2)
 
         # Compute at unique displacements
         original_positions = supercell_atoms.get_positions().copy()
@@ -263,9 +254,10 @@ def main__elph_diamond(supercell, action, log):
                 modified_positions[disp_atom] += disp_cart
                 supercell_atoms.set_positions(modified_positions)
 
-                Vt_sG, dH_asp, forces = get_data(supercell_atoms)
+                elph_data = get_elph_data(supercell_atoms)
+                forces = supercell_atoms.get_forces()
                 pickle.dump(forces, paropen(forces_path, 'wb'), protocol=2)
-                pickle.dump((Vt_sG, dH_asp), paropen(elph_path, 'wb'), protocol=2)
+                pickle.dump(elph_data, paropen(elph_path, 'wb'), protocol=2)
         supercell_atoms.set_positions(original_positions)
 
         # Get derivatives
@@ -307,10 +299,148 @@ def main__elph_diamond(supercell, action, log):
     # TODO: test that uses phonopy for displacements.
     pass
 
+def main__elph_phonopy(supercell, log):
+    from gpaw.elph.electronphonon import ElectronPhononCoupling
+    from gpaw import GPAW
+
+    structure_path = 'structure.gpw'
+    calc = GPAW(structure_path)
+
+    # atoms = Cluster(ase.build.molecule('CH4'))
+    # atoms.minimal_box(4)
+    # atoms.pbc = True
+
+    DISPLACEMENT_DIST = 1e-2  # FIXME supply as arg to gpaw
+
+    phonon = get_minimum_displacements(cachepath='phonopy_disp.yaml',
+        unitcell=ase_atoms_to_phonopy(calc.atoms),
+        supercell_matrix=np.diag(supercell),
+        displacement_distance=DISPLACEMENT_DIST,
+    )
+    natoms = len(calc.atoms)
+    disp_phonopy_sites, disp_carts = get_phonopy_displacements(phonon)
+    disp_sites = phonopy_sc_indices_to_ase_sc_indices(disp_phonopy_sites, natoms, supercell)
+
+    # GPAW displaces the center cell for some reason.
+    # elph = ElectronPhononCoupling(calc.atoms, calc=calc, supercell=supercell)
+    # displaced_cell_index = elph.offset
+    # del elph  # that's all we needed it for
+    # disp_sites = (disp_sites % natoms) + displaced_cell_index * natoms
+
+    supercell_atoms = make_gpaw_supercell(calc, supercell, txt=log)
+
+    def do_structure(supercell_atoms, name):
+        forces_path = f'phonons.{name}.pckl'
+        elph_path = f'elph.{name}.pckl'
+        if not os.path.exists(elph_path):
+            elph_data = get_elph_data(supercell_atoms)
+            forces = supercell_atoms.get_forces()
+            pickle.dump(forces, paropen(forces_path, 'wb'), protocol=2)
+            pickle.dump(elph_data, paropen(elph_path, 'wb'), protocol=2)
+
+    do_structure(supercell_atoms, 'eq')
+    eq_positions = supercell_atoms.get_positions()
+    for disp_index, displaced_atoms in enumerate(iter_displaced_structures(supercell_atoms, disp_sites, disp_carts)):
+        supercell_atoms.set_positions(displaced_atoms.get_positions())
+        do_structure(supercell_atoms, f'sym-{disp_index}')
+    supercell_atoms.set_positions(eq_positions)
+
+    disp_values = [read_elph_input(f'sym-{index}') for index in range(len(disp_sites))]
+
+    full_Vt = np.empty((len(supercell_atoms), 3) + disp_values[0][0].shape)
+    full_dH = np.empty((len(supercell_atoms), 3), dtype=object)
+    full_forces = np.empty((len(supercell_atoms), 3) + disp_values[0][2].shape)
+
+    # NOTE: phonon.symmetry includes pure translational symmetries of the supercell
+    #       so we use an empty quotient group
+    quotient_perms = np.array([np.arange(len(supercell_atoms))])
+    super_lattice = supercell_atoms.get_cell()[...]
+    super_symmetry = phonon.symmetry.get_symmetry_operations()
+    oper_sfrac_rots = super_symmetry['rotations']
+    oper_sfrac_trans = super_symmetry['translations']
+    oper_cart_rots = np.array([np.linalg.inv(super_lattice).T @ R @ super_lattice.T for R in oper_sfrac_rots])
+    oper_cart_trans = oper_sfrac_trans @ super_lattice
+    oper_coperms = phonon.symmetry.get_atomic_permutations()
+    oper_deperms = np.argsort(oper_coperms, axis=1)
+    del oper_coperms
+
+    elphsym = symmetry.ElphGpawSymmetrySource.from_setups_and_ops(
+        setups=supercell_atoms.calc.wfs.setups,
+        lattice=supercell_atoms.calc.get_cell()[...],
+        oper_cart_rots=oper_cart_rots,
+        oper_cart_trans=oper_cart_trans,
+        oper_deperms=oper_deperms,
+        )
+    if world.rank == 0:
+        full_derivatives = symmetry.expand_derivs_by_symmetry(
+            disp_sites,       # disp -> atom
+            disp_carts,       # disp -> 3-vec
+            disp_values,      # disp -> T  (displaced value, optionally minus equilibrium value)
+            elph_callbacks_2(supercell_atoms.calc.wfs, elphsym, supercell=supercell),        # how to work with T
+            oper_cart_rots,   # oper -> 3x3
+            oper_perms=oper_deperms,       # oper -> atom' -> atom
+            quotient_perms=quotient_perms,
+        )
+        for a in range(len(full_derivatives)):
+            for c in range(3):
+                full_Vt[a][c] = full_derivatives[a][c][0]
+                full_dH[a][c] = full_derivatives[a][c][1]
+                full_forces[a][c] = full_derivatives[a][c][2]
+        full_values = full_Vt, full_dH, full_forces
+        pickle.dump(full_values, open('full.pckl', 'wb'), protocol=2)
+
+def make_gpaw_supercell(calc: GPAW, supercell: tp.Tuple[int, int, int], **new_kw):
+    atoms = calc.atoms
+
+    # Take most parameters from the unit cell.
+    params = copy.deepcopy(calc.parameters)
+    try: del params['txt']
+    except KeyError: pass
+
+    # This makes the real space grid points identical to the primitive cell computation.
+    # (by increasing the counts by a factor of a supercell dimension)
+    params['gpts'] = calc.wfs.gd.N_c * supercell
+    try: del params['h']
+    except KeyError: pass
+
+    # Decrease kpt count to match density in reciprocal space.
+    # FIXME: if gamma is False, the new kpoints won't match the old ones.
+    #        However, it doesn't seem appropriate to warn about this because ElectronPhononCoupling itself
+    #        warns about gamma calculations for some reason I do not yet understand.  - ML
+    old_kpts = params['kpts']
+    params['kpts'] = {'size': tuple(np.ceil(calc.wfs.kd.N_c / supercell))}  # ceil so that 1 doesn't become 0
+    if isinstance(old_kpts, dict) and 'gamma' in old_kpts:
+        params['kpts']['gamma'] = old_kpts['gamma']
+
+    # warn if kpoint density could not be preserved (unless it's just one point in an aperiodic direction)
+    if any((k % c != 0) and not (k, c, pbc) == (1, 1, False) for (k, c, pbc) in zip(calc.wfs.kd.N_c, supercell, atoms.pbc)):
+        warnings.warn('original kpts not divisible by supercell; density in supercell will be different')
+
+    sc_atoms = atoms * supercell
+    sc_atoms.calc = GPAW(**params)
+    return sc_atoms
+
+def get_elph_data(atoms):
+    # This here is effectively what ElectronPhononCoupling.__call__ does.
+    # It returns the data that should be pickled for a single displacement.
+    atoms.get_potential_energy()
+
+    calc = atoms.calc
+    if not isinstance(calc, GPAW):
+        calc = calc.dft  # unwrap DFTD3 wrapper
+
+    Vt_sG = calc.wfs.gd.collect(calc.hamiltonian.vt_sG, broadcast=True)
+    dH_asp = interop.gpaw_broadcast_array_dict_to_dicts(calc.hamiltonian.dH_asp)
+    return Vt_sG, dH_asp
+
 def elph_callbacks(wfs_with_symmetry: gpaw.wavefunctions.base.WaveFunctions, supercell):
     elphsym = symmetry.ElphGpawSymmetrySource.from_wfs_with_symmetry(wfs_with_symmetry)
-    Vt_part = symmetry.GpawLcaoVTCallbacks(wfs_with_symmetry, elphsym, supercell=supercell)
-    dH_part = symmetry.GpawLcaoDHCallbacks(wfs_with_symmetry, elphsym)
+    return elph_callbacks_2(wfs_with_symmetry, elphsym, supercell)
+
+# FIXME: rename (just different args)
+def elph_callbacks_2(wfs: gpaw.wavefunctions.base.WaveFunctions, elphsym: symmetry.ElphGpawSymmetrySource, supercell):
+    Vt_part = symmetry.GpawLcaoVTCallbacks(wfs, elphsym, supercell=supercell)
+    dH_part = symmetry.GpawLcaoDHCallbacks(wfs, elphsym)
     forces_part = symmetry.GeneralArrayCallbacks(['atom', 'cart'])
     return symmetry.TupleCallbacks(Vt_part, dH_part, forces_part)
 
@@ -400,7 +530,8 @@ def main__raman_ch4(structure, supercell, log):
 
     # Phonopy displacements
     phonon = get_minimum_displacements(cachepath='phonopy_disp.yaml',
-            structure_path='relaxed.vasp', supercell_matrix=supercell_matrix,
+            unitcell=phonopy.interface.calculator.read_crystal_structure('relaxed.vasp', interface_mode='vasp')[0],
+            supercell_matrix=supercell_matrix,
             displacement_distance=displacement_distance,
     )
 
@@ -466,15 +597,17 @@ def relax_atoms(outpath, atoms):
 
 
 # Get displacements using phonopy
-def get_minimum_displacements(cachepath, structure_path, supercell_matrix, displacement_distance):
-    from phonopy.interface.calculator import read_crystal_structure
-
+def get_minimum_displacements(
+        cachepath: str,
+        unitcell: phonopy.structure.atoms.PhonopyAtoms,
+        supercell_matrix: np.ndarray,
+        displacement_distance: float,
+        ):
     if os.path.exists(cachepath):
         parprint(f'Found existing {cachepath}')
         return phonopy.load(cachepath, produce_fc=False)
     parprint(f'Getting displacements... ({cachepath})')
 
-    unitcell, _ = read_crystal_structure(structure_path, interface_mode='vasp')
     phonon = phonopy.Phonopy(unitcell, supercell_matrix, factor=phonopy.units.VaspToTHz)
     phonon.generate_displacements(distance=displacement_distance)
     if world.rank == 0:
@@ -494,7 +627,8 @@ def make_force_sets_and_excitations(cachepath, disp_filenames, phonon, atoms, ex
         eq_ex_filename = disp_filenames['ex']['eq']
         yield 'eq', eq_force_filename, eq_ex_filename, eq_atoms
 
-        for i, disp_atoms in enumerate(iter_displaced_structures(atoms, phonon)):
+        disp_phonopy_sites, disp_carts = get_phonopy_displacements(phonon)
+        for i, disp_atoms in enumerate(iter_displaced_structures(atoms, disp_phonopy_sites, disp_carts)):
             force_filename = disp_filenames['force']['disp'].format(i)
             ex_filename = disp_filenames['ex']['disp'].format(i)
             yield 'disp', force_filename, ex_filename, disp_atoms
@@ -537,7 +671,7 @@ def expand_raman_by_symmetry(cachepath,
         return np.load(cachepath)
     parprint(f'Expanding raman data by symmetry... ({cachepath})')
 
-    disp_atoms, disp_carts = map(np.array, zip(*get_displacements(phonon)))
+    disp_phonopy_sites, disp_carts = get_phonopy_displacements(phonon)
 
     prim_symmetry = phonon.primitive_symmetry.get_symmetry_operations()
     lattice = phonon.primitive.get_cell()[...]
@@ -557,13 +691,13 @@ def expand_raman_by_symmetry(cachepath,
 
     disp_tensors = np.array([
         get_polarizability(LrTDDFT.read(disp_filenames['ex']['disp'].format(i), **ex_kw))
-        for i in range(len(disp_atoms))
+        for i in range(len(disp_phonopy_sites))
     ])
     if subtract_equilibrium_polarizability:
         disp_tensors -= get_polarizability(LrTDDFT.read(disp_filenames['ex']['eq'], **ex_kw))
 
     pol_derivs = symmetry.expand_derivs_by_symmetry(
-        disp_atoms,
+        disp_phonopy_sites,
         disp_carts,
         disp_tensors,
         symmetry.Tensor2Callbacks(),
@@ -672,18 +806,31 @@ def get_deperm(
 
 # ==============================================================================
 
-def get_displacements(phonon):
-    """ Get displacements as list of [supercell_atom, [dx, dy, dz]] """
-    return [[i, xyz] for (i, *xyz) in phonon.get_displacements()]
+Displacements = tp.List[tp.Tuple[int, tp.List[float]]]
+PhonopyScIndex = int  # index of a supercell atom, in phonopy's supercell ordering
+AseScIndex = int  # index of a supercell atom, in ASE's supercell ordering
 
-def iter_displaced_structures(atoms, phonon):
+def get_phonopy_displacements(phonon: phonopy.Phonopy):
+    """ Get displacements as arrays of ``phonopy_atom`` and ``[dx, dy, dz]`` (cartesian).
+
+    ``phonopy_atom`` is the displaced atom index according to phonopy's supercell ordering convention.
+    Mind that this is different from ASE's convention. """
+    return [(i, xyz) for (i, *xyz) in phonon.get_displacements()]
+
+def phonopy_sc_indices_to_ase_sc_indices(phonopy_disp_atoms, natoms, supercell):
+    """ Takes an array of atom indices in phonopy's supercell ordering convention and converts it to ASE's convention. """
+    # use inverse perm to permute sparse indices
+    deperm_phonopy_to_ase = interop.get_deperm_from_phonopy_sc_to_ase_sc(natoms, supercell)  # ase index -> phonopy index
+    inv_deperm_phonopy_to_ase = np.argsort(deperm_phonopy_to_ase)  # phonopy index -> ase index
+    return inv_deperm_phonopy_to_ase[phonopy_disp_atoms]  # ase indices
+
+def iter_displaced_structures(atoms, disp_sites, disp_carts):
     # Don't use phonon.get_supercells_with_displacements as these may be translated
     # a bit relative to the original atoms if you used something like 'minimum_box'.
     # (resulting in absurd forces, e.g. all components positive at equilibrium)
-    assert len(atoms) == len(phonon.supercell)
-
     eq_atoms = atoms.copy()
-    for i, disp in get_displacements(phonon):
+    assert len(disp_sites) == len(disp_carts)
+    for i, disp in zip(disp_sites, disp_carts):
         disp_atoms = eq_atoms.copy()
         positions = disp_atoms.get_positions()
         positions[i] += disp
@@ -694,6 +841,14 @@ def iter_displaced_structures(atoms, phonon):
 
 def phonopy_atoms_to_ase(atoms):
     atoms = ase.Atoms(
+        symbols=atoms.get_chemical_symbols(),
+        positions=atoms.get_positions(),
+        cell=atoms.get_cell(),
+    )
+    return atoms
+
+def ase_atoms_to_phonopy(atoms):
+    atoms = phonopy.structure.atoms.PhonopyAtoms(
         symbols=atoms.get_chemical_symbols(),
         positions=atoms.get_positions(),
         cell=atoms.get_cell(),
