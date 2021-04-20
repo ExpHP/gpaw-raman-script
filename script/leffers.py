@@ -1,3 +1,5 @@
+# coding: utf-8
+
 #General
 import numpy as np
 from scipy import signal
@@ -8,19 +10,17 @@ from gpaw import GPAW, PW, FermiDirac
 from gpaw.fd_operators import Gradient
 
 from ase.phonons import Phonons
-from ase.units import _hplanck, _c, J
 from ase.parallel import rank, size, world, MPI4PY, parprint
 
-# adapted from gitlab:gpaw/gpaw!563
-def get_elph_elements(atoms, supercell_atoms, supercell):
+def get_elph_elements(atoms, gpw_name, params_fd, sc = (1,1,1), basename = None):
     """
         Evaluates the dipole transition matrix elements
 
         Input
         ----------
-        atoms            : Atoms (with GPAW calculator) for unit cell
-        supercell_atoms  : Atoms (with GPAW calculator) for supercell
-        supercell (tuple): Supercell dimensions that relate supercell_atoms to atoms
+        params_fd : Calculation parameters used for the phonon calculation
+        sc (tuple): Supercell, default is (1,1,1) used for gamma phonons
+        basename  : If you want give a specific name (gqklnn_{}.pckl)
 
         Output
         ----------
@@ -29,43 +29,59 @@ def get_elph_elements(atoms, supercell_atoms, supercell):
     from ase.phonons import Phonons
     from gpaw.elph.electronphonon import ElectronPhononCoupling
 
-    calc = atoms.calc
-    kpts = calc.get_ibz_k_points()
-    nk = len(kpts)
-    nbands = calc.wfs.bd.nbands
-    qpts = [[0, 0, 0]]
+    par = MPI4PY()
+    par.comm.Barrier()
+    calc_gs = GPAW(gpw_name)
 
-    # Phonon calculation, We'll read the forces from the elph.run function
-    # This only looks at gamma point phonons
-    ph = Phonons(atoms=atoms, name="phonons", supercell=supercell)
+    calc_fd = GPAW(**params_fd)
+    calc_gs.initialize_positions(atoms)
+    kpts = calc_gs.get_ibz_k_points()
+    nk = len(kpts)
+    gamma_kpt = [[0,0,0]]
+    nbands = calc_gs.wfs.bd.nbands
+    qpts = gamma_kpt
+
+
+    #Phonon calculation, We'll read the forces from the elph.run function
+    #This only looks at gamma point phonons
+    ph = Phonons(atoms = atoms, name="phonons", supercell = sc)
     ph.read()
     frequencies, modes = ph.band_structure(qpts, modes=True)
 
-    parprint("Phonon frequencies are loaded.")
+    if rank == 0:
+        print("Phonon frequencies are loaded.")
 
-    # Find el-ph matrix in the LCAO basis
-    elph = ElectronPhononCoupling(atoms, calc=None, supercell=supercell)
-    elph.set_lcao_calculator(supercell_atoms.calc)
-    elph.load_supercell_matrix(basis=supercell_atoms.calc.parameters['basis'])
-    parprint("Supercell matrix is loaded")
+    #Find el-ph matrix in the LCAO basis
+    elph = ElectronPhononCoupling(atoms, calc=None, supercell = sc)
 
-    # Find the bloch expansion coefficients
-    c_kn = np.empty((nk, nbands, nbands), dtype=complex)
+    elph.set_lcao_calculator(calc_fd)
+    elph.load_supercell_matrix(basis = "dzp")
+    if rank == 0:
+        print("Supercell matrix is loaded")
+
+    #Find the bloch expansion coefficients
+    kpt_comm = calc_gs.wfs.kd.comm  # FIXME: unused
+    c_kn = np.zeros((nk,nbands, nbands), dtype = complex)
+
     for k in range(len(kpts)):
-        spin = 0
-        c_k = calc.wfs.collect_array("C_nM", k, spin)
-        if world.rank == 0:
+        c_k = calc_gs.wfs.collect_array("C_nM",k,0)
+        if rank == 0:
             c_kn[k] = c_k
 
-    calc.kd.comm.Bcast(c_kn, root=0)
+    par.comm.Bcast(c_kn, root = 0)
 
-    # And we finally find the electron-phonon coupling matrix elements!
-    g_qklnn = elph.bloch_matrix(c_kn=c_kn, kpts=kpts, qpts=qpts, u_ql=modes)
-    return np.array(g_qklnn)
+    #And we finally find the electron-phonon coupling matrix elements!
+    g_qklnn = elph.bloch_matrix(c_kn = c_kn, kpts = kpts, qpts = qpts, u_ql = modes)
+    if rank == 0:
+        print("Saving the elctron-phonon coupling matrix")
+        if basename is None:
+            np.save("gqklnn.npy", np.array(g_qklnn))
+        else:
+            np.save("gqklnn_{}.npy".format(basename), np.array(g_qklnn))
 
 
 
-def get_dipole_transitions(atoms, momname = None, basename = None):
+def get_dipole_transitions(atoms, gpw_name, momname = None, basename = None):
     """
     Finds the dipole matrix elements:
     <\psi_n|\nabla|\psi_m> = <u_n|nabla|u_m> + ik<u_n|u_m> where psi_n = u_n(r)*exp(ikr).
@@ -79,15 +95,8 @@ def get_dipole_transitions(atoms, momname = None, basename = None):
         dip_vknm.npy    Array with dipole matrix elements
     """
 
-    # FIXME: reading groundstate from file
-    # FIXME: MPI4PY usage
-    par = MPI4PY()
-    if basename is None:
-        calc_name = 'gs.gpw'
-    else:
-        calc_name = 'gs_{}.gpw'.format(basename)
-
-    calc = GPAW(calc_name)
+    par = MPI4PY()  # FIXME: use a comm from gpaw
+    calc = GPAW(gpw_name)  # FIXME: take calc as input
 
     bzk_kc = calc.get_ibz_k_points()
     n = calc.wfs.bd.nbands
@@ -169,7 +178,7 @@ def L(w, gamma = 10/8065.544):
     lor = 0.5*gamma/(pi*((w.real)**2+0.25*gamma**2))
     return lor
 
-def calculate_raman_tensor(atoms, sc = (1,1,1), permutations = True, ramanname = None, momname = None, basename = None, w_l = 2.54066, gamma_l = 0.2):
+def calculate_raman_tensor(atoms, gpw_name, sc = (1,1,1), permutations = True, ramanname = None, momname = None, basename = None, w_l = 2.54066, gamma_l = 0.2):
     """
     Calculates the first order Raman tensor
 
@@ -186,16 +195,11 @@ def calculate_raman_tensor(atoms, sc = (1,1,1), permutations = True, ramanname =
         RI.npy          Numpy array containing the raman spectre
     """
 
-    # FIXME: MPI4PY usage
-    par = MPI4PY()
+    par = MPI4PY()  # FIXME use a comm from gpaw
 
     parprint("Calculating the Raman spectra: Laser frequency = {}".format(w_l))
 
-    # FIXME: this again
-    if basename is None:
-        calc = GPAW('gs.gpw')
-    else:
-        calc = GPAW('gs_{}.gpw'.format(basename))
+    calc = GPAW(gpw_name)  # FIXME: take calc as input
 
     bzk_kc = calc.get_ibz_k_points()
     n = calc.wfs.bd.nbands
@@ -270,6 +274,7 @@ def calculate_raman_tensor(atoms, sc = (1,1,1), permutations = True, ramanname =
         E_el = E_kn[k]
         raman_ablw += np.einsum('asi,lij,bljs->abl', f_n[None,:,None]*(1-f_n[None,None, :])*mom/(w_l-(E_el[None,None,:]-E_el[None,:,None]) + complex(0,gamma_l)), elph, (1 - f_n[None,None,:,None])*mom[:,None, :,:]/(w_l-w_ph[None,:,None,None]-(E_el[None,None,:,None]- E_el[None,None,None,:]) + complex(0,gamma_l)))[:,:,:,None]
 
+        # FIXME: GOOD GOD WHAT IS THIS
         if permutations:
             raman_ablw += np.einsum('asi,wljs,bij->ablw', f_n[None,:,None]*(1-f_n[None,None,:])*mom/(w_l-(E_el[None,None,:]-E_el[None,:,None])+ complex(0,gamma_l)), (1-f_n[None,None,:,None])*elph[None,:,:,:]/(w[:,None,None,None]-(E_el[None,None,:,None]-E_el[None,None,None,:])+ complex(0,gamma_l)),mom)
 
@@ -289,7 +294,7 @@ def calculate_raman_tensor(atoms, sc = (1,1,1), permutations = True, ramanname =
         else:
             np.save("Raman_tensor_{}_ablw.npy".format(ramanname), raman_ablw)
 
-def calculate_raman(atoms, sc = (1,1,1), permutations = True, ramanname = None, momname = None, basename = None, w_l = 2.54066, gamma_l = 0.2, d_i = 0, d_o = 0):
+def calculate_raman(atoms, gpw_name, sc = (1,1,1), permutations = True, ramanname = None, momname = None, basename = None, w_l = 2.54066, gamma_l = 0.2, d_i = 0, d_o = 0):
     """
     Calculates the first order Raman spectre
 
@@ -299,28 +304,25 @@ def calculate_raman(atoms, sc = (1,1,1), permutations = True, ramanname = None, 
         permutations    Used all fermi terms (True) or only the resonant term (False)
         ramanname       Suffix for the raman.npy file
         momname         Suffix for the momentumfile
-        basename        Suffix for the gs.gpw and gqklnn.npy files
+        basename        Suffix for the gqklnn.npy files
         w_l, gamma_l    Laser energy, broadening factor for the electron energies
         d_i, d_o        Laser polarization in, out (0, 1, 2 for x, y, z respectively)
     Output:
         RI.npy          Numpy array containing the raman spectre
     """
 
-    par = MPI4PY()
+    par = MPI4PY()  # FIXME: use a comm from gpaw
 
     parprint("Calculating the Raman spectra: Laser frequency = {}".format(w_l))
 
-    if basename is None:
-        calc = GPAW('gs.gpw')
-    else:
-        calc = GPAW('gs_{}.gpw'.format(basename))
+    calc = GPAW(gpw_name)  # FIXME: should take calc as arg instead
 
     bzk_kc = calc.get_ibz_k_points()
     n = calc.wfs.bd.nbands
     nk = np.shape(bzk_kc)[0]
     cm = 1/8065.544
 
-    ph = Phonons(atoms = atoms, name="phonons", supercell = sc)
+    ph = Phonons(atoms=atoms, name="phonons", supercell=sc)
     ph.read()
     w_ph= np.array(ph.band_structure([[0,0,0]])[0])
     w_cm = np.linspace(0, int(np.max(w_ph)/cm+200), int(np.max(w_ph)/cm+200)) #Defined in cm^-1
@@ -391,6 +393,7 @@ def calculate_raman(atoms, sc = (1,1,1), permutations = True, ramanname = None, 
         E_el = E_kn[k]
         raman_lw += np.einsum('si,lij,ljs->l', f_n[:,None]*(1-f_n[None, :])*mom[d_i]/(w_l-(E_el[None,:]-E_el[:,None]) + complex(0,gamma_l)), elph, (1 - f_n[None,:,None])*mom[d_o,None, :,:]/(w_l-w_ph[:,None,None]-(E_el[None,:,None]- E_el[None,None,:]) + complex(0,gamma_l)))[:,None]
 
+        # FIXME: GOOD GOD WHAT IS THIS
         if permutations:
             raman_lw += np.einsum('si,wljs,ij->lw', f_n[:,None]*(1-f_n[None,:])*mom[d_i]/(w_l-(E_el[None,:]-E_el[:,None])+ complex(0,gamma_l)), (1-f_n[None,None,:,None])*elph[None,:,:,:]/(w[:,None,None,None]-(E_el[None,None,:,None]-E_el[None,None,None,:])+ complex(0,gamma_l)),mom[d_o])
 
@@ -543,29 +546,3 @@ def plot_raman(yscale = "linear", figname = "Raman.png", relative = False, w_min
             plt.yticks([])
         plt.savefig(figname, dpi=300)
         plt.clf()
-
-if __name__ == '__main__':
-    from os import getcwd
-    from os import listdir
-    from os.path import isfile, join
-    from pathlib import Path
-    from math import cos, sin, pi
-
-    par = MPI4PY()
-
-    #The Raman spectrum of three different excitation energies will be evaluated
-    wavelengths = np.array([488, 532, 633])
-    w_ls = _hplanck*_c*J/(wavelengths*10**(-9))
-
-    #The dipole transition matrix elements are found
-    if not Path("dip_vknm.npy").is_file():
-        get_dipole_transitions(atoms)
-
-    #And the three Raman spectra are calculated
-    for i, w_l in enumerate(w_ls):
-        name = "{}nm".format(wavelengths[i])
-        if not Path("RI_{}.npy".format(name)).is_file():
-            calculate_raman(atoms, sc = sc, w_l = w_l, ramanname = name)
-
-        #And plotted
-        plot_raman(relative = True, figname = "Raman_{}.png".format(name), ramanname = name)
