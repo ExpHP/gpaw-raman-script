@@ -384,7 +384,7 @@ def main__elph_phonopy(structure_path, supercell, log):
     super_symmetry = phonon.symmetry.get_symmetry_operations()
     oper_sfrac_rots = super_symmetry['rotations']
     oper_sfrac_trans = super_symmetry['translations']
-    oper_cart_rots = np.array([np.linalg.inv(super_lattice).T @ R @ super_lattice.T for R in oper_sfrac_rots])
+    oper_cart_rots = np.array([super_lattice.T @ Rfrac @ np.linalg.inv(super_lattice).T for Rfrac in oper_sfrac_rots])
     oper_cart_trans = oper_sfrac_trans @ super_lattice
     oper_coperms = phonon.symmetry.get_atomic_permutations()
     oper_deperms = np.argsort(oper_coperms, axis=1)
