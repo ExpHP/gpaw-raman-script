@@ -112,9 +112,7 @@ def main__elph_diamond(supercell, action, log):
         calc_fd_sym = GPAW(txt=log, **params_fd_sym)
         dummy_supercell_atoms = supercell_atoms.copy()
         dummy_supercell_atoms.calc = calc_fd_sym
-        calc_fd_sym._set_atoms(dummy_supercell_atoms)  # FIXME private method
-        calc_fd_sym.initialize()
-        calc_fd_sym.set_positions(dummy_supercell_atoms)
+        ensure_gpaw_setups_initialized(calc_fd_sym, dummy_supercell_atoms)
         return calc_fd_sym.wfs
 
     DISPLACEMENT_DIST = 1e-2  # FIXME supply as arg to gpaw
@@ -368,7 +366,7 @@ def main__elph_phonopy(structure_path, supercell, log):
             pickle.dump(forces, paropen(forces_path, 'wb'), protocol=2)
             pickle.dump(elph_data, paropen(elph_path, 'wb'), protocol=2)
 
-    supercell_atoms.get_potential_energy() # ensure wfs.setups are initialized
+    ensure_gpaw_setups_initialized(supercell_atoms.calc, supercell_atoms)
 
     do_structure(supercell_atoms, 'eq')
     eq_positions = supercell_atoms.get_positions()
@@ -487,6 +485,12 @@ def read_elph_input(displacement: tp.Union[interop.AseDisplacement, str]) -> tp.
     Vt_sG, dH_asp = pickle.load(open(f'elph.{displacement}.pckl', 'rb'))
     forces = pickle.load(open(f'phonons.{displacement}.pckl', 'rb'))
     return Vt_sG, dH_asp, forces
+
+def ensure_gpaw_setups_initialized(calc, atoms):
+    """ Initializes the Setups of a GPAW instance without running a groundstate computation. """
+    calc._set_atoms(atoms)  # FIXME private method
+    calc.initialize()
+    calc.set_positions(atoms)
 
 # ==============================================================================
 
