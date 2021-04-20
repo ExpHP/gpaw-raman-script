@@ -1,5 +1,5 @@
 import numpy as np
-
+import random
 import sys
 
 def permutation_outer_product(*perms):
@@ -49,3 +49,22 @@ class Tee :
         for fd in self.fds:
             if fd not in [sys.stdout, sys.stderr] and hasattr(fd, '__exit__'):
                 fd.__exit__(*args, **kw)
+
+
+def assert_allclose_with_counterexamples(x, y, rtol=1e-7, atol=0, equal_nan=True, max_examples=10, **kw):
+    x, y = np.array(x), np.array(y)
+    isclose_kw = dict(rtol=rtol, atol=atol, equal_nan=equal_nan)
+    allclose_kw = dict(kw, **isclose_kw)
+    try:
+        np.testing.assert_allclose(x, y, **allclose_kw)
+    except:
+        close_mask = np.isclose(x, y, **isclose_kw)
+        indices = [tuple(idx) for idx in np.indices(x.shape).reshape(len(x.shape), -1).T]
+        counterexamples = [
+            (index, x[index], y[index])  # yuck, lots of __getitem__
+            for index in indices if not close_mask[index]
+        ]
+        print(x.shape)
+        for (ix, x, y) in random.sample(counterexamples, min([max_examples, len(counterexamples)])):
+            print(f'{str(ix):10}   {x}   {y}', file=sys.stderr)
+        raise

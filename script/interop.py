@@ -5,6 +5,8 @@ import numpy as np
 import typing as tp
 from gpaw.wavefunctions.base import WaveFunctions
 
+import sys
+
 def ase_repeat_translational_symmetry_perms(natoms, repeats):
     """ Get the full quotient group of pure translational symmetries of ``atoms * repeats``,
     represented as permutations of atomic data.
@@ -137,7 +139,7 @@ def cart_rots_to_gpaw_op_scc(cart_rots: np.ndarray, lattice: np.ndarray):
     assert lattice.shape == (3,3)
 
     #  M = (A^-1 U A)^T  <===>   A M^T A^-1 = U
-    return np.einsum('ik,skl,lj->sij', lattice, cart_rots, np.linalg.inv(lattice))
+    return np.einsum('ik,skl,lj->sij', lattice, cart_rots.transpose(0, 2, 1), np.linalg.inv(lattice))
 
 def gpaw_flat_G_oper_permutations(wfs: WaveFunctions):
     """ Get spacegroup operators as permutations of a flattened 'G' axis in GPAW.
@@ -174,10 +176,19 @@ def _gpaw_flat_G_permutations(N_c, op_scc, ft_sc):
     # from gpaw that has an axis labeled 'G'
     gridpoints = lexically_ordered_integer_gridpoints(N_c)
     out = []
-    for intop_cc, intft_c in zip(intop_scc, intft_sc):
+    for intop_cc, intft_c, op_cc, ft_c in zip(intop_scc, intft_sc, op_scc, ft_sc):
         gridpoints_after_float = gridpoints @ intop_cc + intft_c  # transform the row vectors.  Q (not Q^T) acts on row vectors
         gridpoints_after = np.rint(gridpoints_after_float)
-        np.testing.assert_allclose(gridpoints_after_float, gridpoints_after, atol=max(N_c)*1e-10, err_msg="Symmetries are incompatible with grid!")
+        try:
+            utils.assert_allclose_with_counterexamples(
+                gridpoints_after_float.reshape(tuple(N_c) + (3,)),
+                gridpoints_after.reshape(tuple(N_c) + (3,)),
+                atol=max(N_c)*1e-10, err_msg="Symmetries are incompatible with grid!",
+            )
+        except:
+            print(' U: ', op_cc.tolist(), file=sys.stderr)
+            print('FT: ', ft_c.tolist(), file=sys.stderr)
+            raise
         gridpoints_after %= N_c
 
         # perm that turns gridpoints_after into original coordinates
