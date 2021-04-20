@@ -29,6 +29,8 @@ class Tee :
     def write(self, text):
         for fd in self.fds:
             fd.write(text)
+            if fd is sys.stdout or fd is sys.stderr:
+                fd.flush()
 
     def flush(self):
         for fd in self.fds:

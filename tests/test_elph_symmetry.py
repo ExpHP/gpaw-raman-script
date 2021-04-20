@@ -165,6 +165,28 @@ def test_symmetric_211_forces(data_symmetric_211):
 
 @pytest.fixture
 @memoize()
+def data_symmetric_211_from_on_demand_opers():
+    ensure_test_data()
+    # This is like data_symmetric_211 but we using our shim that computes the LCAO opers
+    op_scc = np.array([np.eye(3), np.array([[1.0, 0, 0], [0, 0, 1], [0, 1, 0]])])
+    data_subdir = 'sc-211'
+    full = do_elph_symmetry(
+        data_subdir = data_subdir,
+        params_fd = BASE_PARAMS,
+        supercell = (2, 1, 1),
+        all_displacements = [
+            AseDisplacement(atom=atom, axis=axis, sign=sign)
+            for atom in [0, 1]
+            for axis in [0, 1]  # only operator compatible with 2x1x1 is a b-c flip, so we need b displacements too
+            for sign in [-1, +1]
+        ],
+        symmetry_type = 'pointgroup',
+    )
+    disp_atom_offset = 2  # index of first atom of center cell
+    return data_subdir, full, disp_atom_offset
+
+@pytest.fixture
+@memoize()
 def data_supercell_311():
     ensure_test_data()
     data_subdir = 'sc-311'
