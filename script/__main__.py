@@ -3,6 +3,7 @@
 from . import symmetry
 from . import interop
 from . import utils
+from . import leffers
 
 import functools
 import os
@@ -425,6 +426,10 @@ def main__elph_phonopy(structure_path, supercell, log):
                     disp_forces = eq_forces + sign * DISPLACEMENT_DIST * delta_forces
                     pickle.dump(disp_forces, paropen(f'phonons.{disp}.pckl', 'wb'), protocol=2)
                     pickle.dump((disp_Vt, disp_dH), paropen(f'elph.{disp}.pckl', 'wb'), protocol=2)
+
+    if not os.path.exists('gqklnn.pckl'):
+        g_qklnn = leffers.get_elph_elements(calc.atoms, supercell_atoms, supercell=supercell)
+        pickle.dump(g_qklnn, open('full.pckl', 'wb'), protocol=2)
 
 def make_gpaw_supercell(calc: GPAW, supercell: tp.Tuple[int, int, int], **new_kw):
     atoms = calc.atoms
