@@ -145,9 +145,9 @@ def gpaw_flat_G_oper_permutations(wfs: WaveFunctions):
     """ Get spacegroup operators as permutations of a flattened 'G' axis in GPAW.
 
     The order of operators in the output matches GPAW's Symmetry class. """
-    return _gpaw_flat_G_permutations(wfs.gd.N_c, wfs.kd.symmetry.op_scc, wfs.kd.symmetry.ft_sc)
+    return _gpaw_flat_G_permutations(wfs.gd.N_c, wfs.kd.symmetry.op_scc, wfs.kd.symmetry.ft_sc, pbc_c=wfs.gd.pbc)
 
-def gpaw_flat_G_quotient_permutations(N_c, repeats):
+def gpaw_flat_G_quotient_permutations(N_c, repeats, pbc_c):
     """ Get pure translational symmetry operators as permutations of a flattened 'G' axis in GPAW.
 
     The order of operators in the output matches ``ase_repeat_translational_symmetry_perms``. """
@@ -156,9 +156,9 @@ def gpaw_flat_G_quotient_permutations(N_c, repeats):
 
     ft_sc = lexically_ordered_integer_gridpoints(repeats) / repeats[None, :]
     op_scc = np.tile(np.eye(3), (len(ft_sc), 1, 1))  # all identity matrices
-    return _gpaw_flat_G_permutations(N_c, op_scc, ft_sc)
+    return _gpaw_flat_G_permutations(N_c, op_scc, ft_sc, pbc_c)
 
-def _gpaw_flat_G_permutations(N_c, op_scc, ft_sc):
+def _gpaw_flat_G_permutations(N_c, op_scc, ft_sc, pbc_c):
     N_c = np.array(N_c)
     assert N_c.shape == (3,)
 
@@ -174,15 +174,16 @@ def _gpaw_flat_G_permutations(N_c, op_scc, ft_sc):
 
     # gridpoints initially in lexicographic order, matching the order you get from flattening data
     # from gpaw that has an axis labeled 'G'
-    gridpoints = lexically_ordered_integer_gridpoints(N_c)
+    gridpoints = lexically_ordered_integer_gridpoints(N_c, pbc_c)
+    gridshape = gpaw_grid_shape(N_c, pbc_c)
     out = []
     for intop_cc, intft_c, op_cc, ft_c in zip(intop_scc, intft_sc, op_scc, ft_sc):
         gridpoints_after_float = gridpoints @ intop_cc + intft_c  # transform the row vectors.  Q (not Q^T) acts on row vectors
         gridpoints_after = np.rint(gridpoints_after_float)
         try:
             utils.assert_allclose_with_counterexamples(
-                gridpoints_after_float.reshape(tuple(N_c) + (3,)),
-                gridpoints_after.reshape(tuple(N_c) + (3,)),
+                gridpoints_after_float.reshape(gridshape + (3,)),
+                gridpoints_after.reshape(gridshape + (3,)),
                 atol=max(N_c)*1e-10, err_msg="Symmetries are incompatible with grid!",
             )
         except:
@@ -198,10 +199,12 @@ def _gpaw_flat_G_permutations(N_c, op_scc, ft_sc):
         out.append(deperm)
     return np.array(out)
 
-def lexically_ordered_integer_gridpoints(dim, pbc):
-    """ Returns lexically ordered tuples of integers where the ``i``th element satisfies ``0 <= tuple[i] < dim[i]``. """
+def lexically_ordered_integer_gridpoints(dim, pbc=True):
+    """ Returns lexically ordered tuples of integers where the ``i``th element satisfies ``0 <= tuple[i] < dim[i]``.
+
+    ``pbc`` is gpaw PBC flags. The element at index 0 is omitted from an axis when PBC = False there. """
     dim = tuple(dim)
-    grid_ints = np.mgrid[tuple(slice(0, n) for n in np.broadcast(dim)]  # shape (len(dim), *dim)
+    grid_ints = np.mgrid[tuple(slice(1 - int(p), n) for (n, p) in np.broadcast(dim, pbc))]  # shape (len(dim), *dim)
     grid_ints = grid_ints.reshape(len(dim), -1)  # shape (len(dim), product(dim))
     return grid_ints.T  # shape  (product(dim), len(dim))
 
@@ -209,3 +212,6 @@ def _lexsort_rows(arr):
     """ Return the indices that lexically sort the rows of a matrix. """
     assert arr.ndim == 2
     return np.lexsort(arr[:, ::-1].T)  # np.lexsort bizarrely does a colexical sort
+
+def gpaw_grid_shape(N_c, pbc_c):
+    return tuple(np.array(N_c) - 1 + pbc_c)

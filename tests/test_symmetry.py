@@ -280,7 +280,7 @@ def test_gpaw_grid_C4_z():
     quotient_perms = None
     supercell = (1, 1, 1)
 
-    callbacks = symmetry.GpawLcaoVTCallbacks__from_parts(nspins=nspins, N_c=N_c, op_scc=op_scc, ft_sc=ft_sc, supercell=supercell)
+    callbacks = symmetry.GpawLcaoVTCallbacks__from_parts(nspins=nspins, N_c=N_c, op_scc=op_scc, ft_sc=ft_sc, supercell=supercell, pbc_c=True)
 
     def data_pointed(index_tuple, value):
         """ Creates Vt data with a single nonzero value. """

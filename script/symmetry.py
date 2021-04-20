@@ -340,20 +340,21 @@ def GpawLcaoVTCallbacks(wfs, symmetry: 'ElphGpawSymmetrySource', supercell):
         op_scc=symmetry.op_scc,
         ft_sc=symmetry.ft_sc,
         supercell=supercell,
+        pbc_c=wfs.gd.pbc_c,
     )
 
-def GpawLcaoVTCallbacks__from_parts(nspins, N_c, op_scc, ft_sc, supercell):
+def GpawLcaoVTCallbacks__from_parts(nspins, N_c, op_scc, ft_sc, supercell, pbc_c):
     from . import interop
 
     N_c = tuple(N_c)
     supercell = tuple(supercell)
-    grid_oper_deperms = interop._gpaw_flat_G_permutations(N_c, op_scc, ft_sc)
-    grid_quotient_deperms = interop.gpaw_flat_G_quotient_permutations(N_c=N_c, repeats=supercell)
+    grid_oper_deperms = interop._gpaw_flat_G_permutations(N_c, op_scc, ft_sc, pbc_c)
+    grid_quotient_deperms = interop.gpaw_flat_G_quotient_permutations(N_c=N_c, repeats=supercell, pbc_c=pbc_c)
 
     return WrappedCallbacks[np.ndarray, np.ndarray](
         # To apply these permutations we have to flatten the three grid axes.
         convert_into=lambda arr: arr.reshape((nspins, -1)),
-        convert_from=lambda arr: arr.reshape((nspins,) + N_c),
+        convert_from=lambda arr: arr.reshape((nspins,) + tuple(np.array(N_c) - 1 + pbc_c)),
         wrapped=GeneralArrayCallbacks(
             ['na', 'flatgrid'],
             (('flatgrid', 'oper'), 'perm', grid_oper_deperms),
