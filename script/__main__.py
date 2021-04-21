@@ -427,8 +427,12 @@ def main__elph_phonopy(structure_path, supercell, log):
                     pickle.dump(disp_forces, paropen(f'phonons.{disp}.pckl', 'wb'), protocol=2)
                     pickle.dump((disp_Vt, disp_dH), paropen(f'elph.{disp}.pckl', 'wb'), protocol=2)
 
+    elph = ElectronPhononCoupling(calc.atoms, supercell=supercell, calc=supercell_atoms.calc)
+    elph.set_lcao_calculator(supercell_atoms.calc)
+    elph.calculate_supercell_matrix(dump=1)
+
     if not os.path.exists('gqklnn.npy'):
-        leffers.get_elph_elements(calc.atoms, gpw_name=structure_path, params_fd=supercell_atoms.calc.parameters.copy(), sc=supercell)
+        leffers.get_elph_elements(calc.atoms, gpw_name=structure_path, calc_fd=supercell_atoms.calc, sc=supercell)
 
     from ase.units import _hplanck, _c, J
     #The Raman spectrum of three different excitation energies will be evaluated
@@ -436,17 +440,17 @@ def main__elph_phonopy(structure_path, supercell, log):
     w_ls = _hplanck*_c*J/(wavelengths*10**(-9))
 
     #The dipole transition matrix elements are found
-    if not os.path.is_file("dip_vknm.npy"):
+    if not os.path.isfile("dip_vknm.npy"):
         leffers.get_dipole_transitions(calc.atoms, gpw_name=structure_path)
 
     #And the three Raman spectra are calculated
     for i, w_l in enumerate(w_ls):
         name = "{}nm".format(wavelengths[i])
-        if not os.path.isfile(f"RI_{}.npy".format(name)):
+        if not os.path.isfile(f"RI_{name}.npy"):
             leffers.calculate_raman(calc.atoms, gpw_name=structure_path, sc=supercell, w_l = w_l, ramanname = name)
 
         #And plotted
-        leffers.plot_raman(relative = True, figname = "Raman_{}.png".format(name), ramanname = name)
+        leffers.plot_raman(relative = True, figname = f"Raman_{name}.png", ramanname = name)
 
 
 def make_gpaw_supercell(calc: GPAW, supercell: tp.Tuple[int, int, int], **new_kw):

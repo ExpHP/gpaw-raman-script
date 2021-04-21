@@ -12,7 +12,7 @@ from gpaw.fd_operators import Gradient
 from ase.phonons import Phonons
 from ase.parallel import rank, size, world, MPI4PY, parprint
 
-def get_elph_elements(atoms, gpw_name, params_fd, sc = (1,1,1), basename = None):
+def get_elph_elements(atoms, gpw_name, calc_fd, sc = (1,1,1), basename = None):
     """
         Evaluates the dipole transition matrix elements
 
@@ -33,7 +33,7 @@ def get_elph_elements(atoms, gpw_name, params_fd, sc = (1,1,1), basename = None)
     par.comm.Barrier()
     calc_gs = GPAW(gpw_name)
 
-    calc_fd = GPAW(**params_fd)
+    #calc_fd = GPAW(**params_fd)
     calc_gs.initialize_positions(atoms)
     kpts = calc_gs.get_ibz_k_points()
     nk = len(kpts)
@@ -41,6 +41,7 @@ def get_elph_elements(atoms, gpw_name, params_fd, sc = (1,1,1), basename = None)
     nbands = calc_gs.wfs.bd.nbands
     qpts = gamma_kpt
 
+    calc_fd.get_potential_energy()  # XXX needed to initialize C_nM ??????
 
     #Phonon calculation, We'll read the forces from the elph.run function
     #This only looks at gamma point phonons
@@ -55,7 +56,7 @@ def get_elph_elements(atoms, gpw_name, params_fd, sc = (1,1,1), basename = None)
     elph = ElectronPhononCoupling(atoms, calc=None, supercell = sc)
 
     elph.set_lcao_calculator(calc_fd)
-    elph.load_supercell_matrix(basis = "dzp")
+    elph.load_supercell_matrix(basis="dzp", dump=1)
     if rank == 0:
         print("Supercell matrix is loaded")
 
@@ -64,7 +65,7 @@ def get_elph_elements(atoms, gpw_name, params_fd, sc = (1,1,1), basename = None)
     c_kn = np.zeros((nk,nbands, nbands), dtype = complex)
 
     for k in range(len(kpts)):
-        c_k = calc_gs.wfs.collect_array("C_nM",k,0)
+        c_k = calc_fd.wfs.collect_array("C_nM",k,0)
         if rank == 0:
             c_kn[k] = c_k
 
