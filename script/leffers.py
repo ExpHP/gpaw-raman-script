@@ -61,11 +61,10 @@ def get_elph_elements(atoms, gpw_name, calc_fd, sc = (1,1,1), basename = None):
         print("Supercell matrix is loaded")
 
     #Find the bloch expansion coefficients
-    kpt_comm = calc_gs.wfs.kd.comm  # FIXME: unused
-    c_kn = np.zeros((nk,nbands, nbands), dtype = complex)
+    c_kn = np.zeros((nk, nbands, nbands), dtype = complex)
 
     for k in range(len(kpts)):
-        c_k = calc_fd.wfs.collect_array("C_nM",k,0)
+        c_k = calc_gs.wfs.collect_array("C_nM",k,0)
         if rank == 0:
             c_kn[k] = c_k
 
@@ -82,7 +81,7 @@ def get_elph_elements(atoms, gpw_name, calc_fd, sc = (1,1,1), basename = None):
 
 
 
-def get_dipole_transitions(atoms, gpw_name, momname = None, basename = None):
+def get_dipole_transitions(calc, momname = None, basename = None):
     """
     Finds the dipole matrix elements:
     <\psi_n|\nabla|\psi_m> = <u_n|nabla|u_m> + ik<u_n|u_m> where psi_n = u_n(r)*exp(ikr).
@@ -97,7 +96,7 @@ def get_dipole_transitions(atoms, gpw_name, momname = None, basename = None):
     """
 
     par = MPI4PY()  # FIXME: use a comm from gpaw
-    calc = GPAW(gpw_name)  # FIXME: take calc as input
+    #calc = atoms.calc
 
     bzk_kc = calc.get_ibz_k_points()
     n = calc.wfs.bd.nbands
@@ -105,11 +104,10 @@ def get_dipole_transitions(atoms, gpw_name, momname = None, basename = None):
 
     wfs = {}
 
-    calc.wfs.set_positions  # FIXME:  wtf
-    calc.initialize_positions(atoms)
-
     parprint("Distributing wavefunctions.")
 
+    if not calc.wfs.positions_set:
+        calc.initialize_positions()
     for k in range(nk):
         #Collects the wavefunctions and the projections to rank 0. Periodic -> u_n(r)
         wf = np.array([calc.wfs.get_wave_function_array(i, k, 0, realspace = True, periodic=True) for i in range(n)], dtype = complex)

@@ -72,9 +72,9 @@ def get_deperm_from_phonopy_sc_to_ase_sc(natoms, repeats):
     p_atoms = PhonopyAtoms(symbols=unitcell_symbols, positions=unitcell_positions, cell=unitcell_lattice)
     a_atoms = ase.Atoms(symbols=unitcell_symbols, positions=unitcell_positions, cell=unitcell_lattice)
 
-    # get supercells
+    # get supercells.  (is_symmetry=False in phonopy is because otherwise it may warn about the reduced symmetry of the supercell)
     a_sc_positions = (a_atoms * repeats).get_positions()
-    p_sc_positions = phonopy.Phonopy(p_atoms, supercell_matrix=np.diag(repeats)).supercell.get_positions()
+    p_sc_positions = phonopy.Phonopy(p_atoms, supercell_matrix=np.diag(repeats), is_symmetry=False).supercell.get_positions()
 
     # Positions had better be integers
     a_sc_positions_int = np.rint(a_sc_positions)

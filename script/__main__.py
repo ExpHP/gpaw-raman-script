@@ -334,6 +334,9 @@ def main__elph_phonopy(structure_path, supercell, log):
     from gpaw import GPAW
 
     calc = GPAW(structure_path)
+    if calc.wfs.kpt_u[0].C_nM is None:
+        parprint(f"'{structure_path}': no wavefunctions! You must save your .gpw file with 'mode=\"all\"'!")
+        sys.exit(1)
 
     # atoms = Cluster(ase.build.molecule('CH4'))
     # atoms.minimal_box(4)
@@ -356,8 +359,6 @@ def main__elph_phonopy(structure_path, supercell, log):
     # del elph  # that's all we needed it for
     # disp_sites = (disp_sites % natoms) + displaced_cell_index * natoms
 
-    supercell_atoms = make_gpaw_supercell(calc, supercell, txt=log)
-
     def do_structure(supercell_atoms, name):
         forces_path = f'phonons.{name}.pckl'
         elph_path = f'elph.{name}.pckl'
@@ -367,14 +368,23 @@ def main__elph_phonopy(structure_path, supercell, log):
             pickle.dump(forces, paropen(forces_path, 'wb'), protocol=2)
             pickle.dump(elph_data, paropen(elph_path, 'wb'), protocol=2)
 
-    ensure_gpaw_setups_initialized(supercell_atoms.calc, supercell_atoms)
+    if os.path.exists('supercell.eq.gpw'):
+        # FIXME check if this actually computes at displacements or if it just returns cached forces... :/
+        supercell_atoms = GPAW('supercell.eq.gpw', txt=log).get_atoms()
+    else:
+        supercell_atoms = make_gpaw_supercell(calc, supercell, txt=log)
+        ensure_gpaw_setups_initialized(supercell_atoms.calc, supercell_atoms)
+        supercell_atoms.get_potential_energy()
+        supercell_atoms.calc.write('supercell.eq.gpw', mode='all')
 
     do_structure(supercell_atoms, 'eq')
     eq_positions = supercell_atoms.get_positions()
     for disp_index, displaced_atoms in enumerate(iter_displaced_structures(supercell_atoms, disp_sites, disp_carts)):
         supercell_atoms.set_positions(displaced_atoms.get_positions())
         do_structure(supercell_atoms, f'sym-{disp_index}')
-    supercell_atoms.set_positions(eq_positions)
+
+    # Read back from file to avoid an unnecessary SCF computation later
+    supercell_atoms = GPAW('supercell.eq.gpw', txt=log).get_atoms()
 
     disp_values = [read_elph_input(f'sym-{index}') for index in range(len(disp_sites))]
 
@@ -387,9 +397,14 @@ def main__elph_phonopy(structure_path, supercell, log):
     oper_sfrac_trans = super_symmetry['translations']
     oper_cart_rots = np.array([super_lattice.T @ Rfrac @ np.linalg.inv(super_lattice).T for Rfrac in oper_sfrac_rots])
     oper_cart_trans = oper_sfrac_trans @ super_lattice
-    oper_coperms = phonon.symmetry.get_atomic_permutations()
-    oper_deperms = np.argsort(oper_coperms, axis=1)
-    del oper_coperms
+    oper_phonopy_coperms = phonon.symmetry.get_atomic_permutations()
+    oper_phonopy_deperms = np.argsort(oper_phonopy_coperms, axis=1)
+
+    # Convert permutations by composing the following three permutations:   into phonopy order, apply oper, back to ase order
+    parprint('phonopy deperms:', oper_phonopy_deperms.shape)
+    deperm_phonopy_to_ase = interop.get_deperm_from_phonopy_sc_to_ase_sc(natoms_prim, supercell)
+    oper_deperms = [np.argsort(deperm_phonopy_to_ase)[deperm][deperm_phonopy_to_ase] for deperm in oper_phonopy_deperms]
+    del oper_phonopy_coperms, oper_phonopy_deperms
 
     elphsym = symmetry.ElphGpawSymmetrySource.from_setups_and_ops(
         setups=supercell_atoms.calc.wfs.setups,
@@ -426,10 +441,23 @@ def main__elph_phonopy(structure_path, supercell, log):
                     disp_forces = eq_forces + sign * DISPLACEMENT_DIST * delta_forces
                     pickle.dump(disp_forces, paropen(f'phonons.{disp}.pckl', 'wb'), protocol=2)
                     pickle.dump((disp_Vt, disp_dH), paropen(f'elph.{disp}.pckl', 'wb'), protocol=2)
+    world.barrier()
 
-    elph = ElectronPhononCoupling(calc.atoms, supercell=supercell, calc=supercell_atoms.calc)
-    elph.set_lcao_calculator(supercell_atoms.calc)
-    elph.calculate_supercell_matrix(dump=1)
+    # function to scope variables
+    def do_supercell_matrix():
+        # calculate_supercell_matrix breaks if parallelized over domains so parallelize over kpt instead
+        # (note: it prints messages from all processes but it DOES run faster with more processes)
+        supercell_atoms = GPAW('supercell.eq.gpw', txt=log, parallel={'domain': (1,1,1), 'band': 1, 'kpt': world.size}).get_atoms()
+
+        elph = ElectronPhononCoupling(calc.atoms, supercell=supercell, calc=supercell_atoms.calc)
+        elph.set_lcao_calculator(supercell_atoms.calc)
+        ensure_gpaw_setups_initialized(supercell_atoms.calc, supercell_atoms)
+        elph.calculate_supercell_matrix(dump=1)
+
+        world.barrier()
+
+    if not os.path.exists(f'elph.supercell_matrix.{calc.parameters["basis"]}.pckl'):
+        do_supercell_matrix()
 
     if not os.path.exists('gqklnn.npy'):
         leffers.get_elph_elements(calc.atoms, gpw_name=structure_path, calc_fd=supercell_atoms.calc, sc=supercell)
@@ -441,7 +469,7 @@ def main__elph_phonopy(structure_path, supercell, log):
 
     #The dipole transition matrix elements are found
     if not os.path.isfile("dip_vknm.npy"):
-        leffers.get_dipole_transitions(calc.atoms, gpw_name=structure_path)
+        leffers.get_dipole_transitions(calc)
 
     #And the three Raman spectra are calculated
     for i, w_l in enumerate(w_ls):
