@@ -708,11 +708,14 @@ def get_minimum_displacements(
         return phonopy.load(cachepath, produce_fc=False)
     parprint(f'Getting displacements... ({cachepath})')
 
-    phonon = phonopy.Phonopy(unitcell, supercell_matrix, factor=phonopy.units.VaspToTHz)
-    phonon.generate_displacements(distance=displacement_distance)
     if world.rank == 0:
+        phonon = phonopy.Phonopy(unitcell, supercell_matrix, factor=phonopy.units.VaspToTHz)
+        phonon.generate_displacements(distance=displacement_distance)
+        parprint(f'Saving displacements...')
         phonon.save(cachepath)
+
     world.barrier()
+    parprint(f'Loading displacements...')
     return phonopy.load(cachepath, produce_fc=False)
 
 
