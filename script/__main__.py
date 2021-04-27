@@ -9,6 +9,7 @@ import functools
 import os
 import sys
 import copy
+import json
 
 from datetime import datetime
 import numpy as np
@@ -53,7 +54,8 @@ def main():
     p = subs.add_parser('ep')
     p.add_argument('INPUT', help='.gpw file for unitcell, with structure and relevant parameters')
     p.add_argument('--supercell', type=(lambda s: tuple(map(int, s))), dest='supercell', default=(1,1,1))
-    p.set_defaults(func=lambda args, log: main__elph_phonopy(structure_path=args.INPUT, supercell=args.supercell, log=log))
+    p.add_argument('--params-fd', help='json file with GPAW params to modify for finite displacement (supercell)')
+    p.set_defaults(func=lambda args, log: main__elph_phonopy(structure_path=args.INPUT, supercell=args.supercell, params_fd_path=args.params_fd, log=log))
 
     p = subs.add_parser('brute-gpw')
     p.add_argument('INPUT', help='.gpw file for unitcell, with structure and relevant parameters')
@@ -329,7 +331,7 @@ def main__brute_gpw(structure_path, supercell, log):
     return
 
 
-def main__elph_phonopy(structure_path, supercell, log):
+def main__elph_phonopy(structure_path, params_fd_path, supercell, log):
     from gpaw.elph.electronphonon import ElectronPhononCoupling
     from gpaw import GPAW
 
@@ -337,6 +339,11 @@ def main__elph_phonopy(structure_path, supercell, log):
     if calc.wfs.kpt_u[0].C_nM is None:
         parprint(f"'{structure_path}': no wavefunctions! You must save your .gpw file with 'mode=\"all\"'!")
         sys.exit(1)
+
+    if params_fd_path is not None:
+        params_fd = json.load(open(params_fd_path))
+    else:
+        params_fd = {}
 
     # atoms = Cluster(ase.build.molecule('CH4'))
     # atoms.minimal_box(4)
@@ -372,13 +379,12 @@ def main__elph_phonopy(structure_path, supercell, log):
         # FIXME check if this actually computes at displacements or if it just returns cached forces... :/
         supercell_atoms = GPAW('supercell.eq.gpw', txt=log).get_atoms()
     else:
-        supercell_atoms = make_gpaw_supercell(calc, supercell, txt=log)
+        supercell_atoms = make_gpaw_supercell(calc, supercell, **dict(params_fd, txt=log))
         ensure_gpaw_setups_initialized(supercell_atoms.calc, supercell_atoms)
         supercell_atoms.get_potential_energy()
         supercell_atoms.calc.write('supercell.eq.gpw', mode='all')
 
     do_structure(supercell_atoms, 'eq')
-    eq_positions = supercell_atoms.get_positions()
     for disp_index, displaced_atoms in enumerate(iter_displaced_structures(supercell_atoms, disp_sites, disp_carts)):
         supercell_atoms.set_positions(displaced_atoms.get_positions())
         do_structure(supercell_atoms, f'sym-{disp_index}')
@@ -451,6 +457,7 @@ def main__elph_phonopy(structure_path, supercell, log):
 
         elph = ElectronPhononCoupling(calc.atoms, supercell=supercell, calc=supercell_atoms.calc)
         elph.set_lcao_calculator(supercell_atoms.calc)
+        # to initialize bfs.M_a
         ensure_gpaw_setups_initialized(supercell_atoms.calc, supercell_atoms)
         elph.calculate_supercell_matrix(dump=1)
 
@@ -545,7 +552,7 @@ def ensure_gpaw_setups_initialized(calc, atoms):
     """ Initializes the Setups of a GPAW instance without running a groundstate computation. """
     calc._set_atoms(atoms)  # FIXME private method
     calc.initialize()
-    calc.set_positions(atoms)
+    calc.set_positions(atoms)  # FIXME: Apparently this breaks if there is domain parallelism? What?!?!?!
 
 # ==============================================================================
 
@@ -686,6 +693,7 @@ def relax_atoms(outpath, atoms):
     if os.path.exists(outpath):
         parprint(f'Found existing {outpath}')
         return
+    world.barrier()
     parprint(f'Relaxing structure... ({outpath})')
 
     dyn = optimize.FIRE(atoms)
@@ -706,6 +714,7 @@ def get_minimum_displacements(
     if os.path.exists(cachepath):
         parprint(f'Found existing {cachepath}')
         return phonopy.load(cachepath, produce_fc=False)
+    world.barrier()  # avoid race condition where rank 0 creates file before others enter
     parprint(f'Getting displacements... ({cachepath})')
 
     if world.rank == 0:
@@ -723,6 +732,7 @@ def make_force_sets_and_excitations(cachepath, disp_filenames, phonon, atoms, ex
     if os.path.exists(cachepath):
         parprint(f'Found existing {cachepath}')
         return np.load(cachepath)
+    world.barrier()
     parprint(f'Computing force sets and polarizability data at displacements... ({cachepath})')
 
     eq_atoms = atoms.copy()
@@ -741,6 +751,7 @@ def make_force_sets_and_excitations(cachepath, disp_filenames, phonon, atoms, ex
     for disp_kind, force_filename, ex_filename, disp_atoms in iter_displacement_files():
         if os.path.exists(ex_filename):
             continue
+        world.barrier()
         atoms.set_positions(disp_atoms.get_positions())
 
         disp_forces = atoms.get_forces()
@@ -773,6 +784,7 @@ def expand_raman_by_symmetry(cachepath,
     if os.path.exists(cachepath):
         parprint(f'Found existing {cachepath}')
         return np.load(cachepath)
+    world.barrier()
     parprint(f'Expanding raman data by symmetry... ({cachepath})')
 
     disp_phonopy_sites, disp_carts = get_phonopy_displacements(phonon)
@@ -818,6 +830,7 @@ def get_eigensolutions_at_q(cachepath, phonon, q):
     if os.path.exists('eigensolutions-gamma.npz'):
         parprint('Found existing eigensolutions-gamma.npz')
         return dict(np.load(cachepath))
+    world.barrier()
     parprint('Diagonalizing dynamical matrix at gamma... (eigensolutions-gamma.npz)')
 
     phonon.produce_force_constants()
@@ -835,6 +848,7 @@ def get_mode_raman(outpath, eigendata, cart_pol_derivs):
     if os.path.exists(outpath):
         parprint(f'Found existing {outpath}')
         return
+    world.barrier()
     parprint(f'Computing mode raman tensors... ({outpath})')
 
     cart_pol_derivs = np.load('raman-cart.npy')
@@ -863,6 +877,7 @@ def get_mode_raman_brute_force(eigendata, atoms, displacement_distance, get_pola
     if os.path.exists('mode-raman-gamma-expected.npy'):
         parprint('Found existing mode-raman-gamma-expected.npy')
         return
+    world.barrier()
     parprint('Computing mode raman tensors... (mode-raman-gamma-expected.npy)')
 
     eq_positions = atoms.get_positions().copy()
@@ -886,7 +901,9 @@ def get_mode_raman_brute_force(eigendata, atoms, displacement_distance, get_pola
 
         mode_pol_derivs.append((pol_plus - pol_minus)/(2*displacement_distance))
 
-    np.save('mode-raman-gamma-expected.npy', mode_pol_derivs)
+    if world.rank == 0:
+        np.save('mode-raman-gamma-expected.npy', mode_pol_derivs)
+    world.barrier()
 
 #----------------
 
