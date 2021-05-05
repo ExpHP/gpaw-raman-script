@@ -184,7 +184,12 @@ def _gpaw_flat_G_permutations(N_c, op_scc, ft_sc, pbc_c):
             utils.assert_allclose_with_counterexamples(
                 gridpoints_after_float.reshape(gridshape + (3,)),
                 gridpoints_after.reshape(gridshape + (3,)),
-                atol=max(N_c)*1e-10, err_msg="Symmetries are incompatible with grid!",
+                # grid points might not be EXACTLY compatible with symmetry operations due to poor centering of atoms,
+                # but we do want to check that at lest they match up 1-1.
+                # If they don't, the errors are typically evenly spaced in the interval -0.5 to 0.5, so there should be
+                #  at least one with an absolute error of >= 0.3.
+                atol=1e-1,
+                err_msg="Symmetries are incompatible with grid!",
             )
         except:
             print(' U: ', op_cc.tolist(), file=sys.stderr)

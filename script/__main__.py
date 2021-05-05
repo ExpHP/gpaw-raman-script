@@ -55,7 +55,8 @@ def main():
     p.add_argument('INPUT', help='.gpw file for unitcell, with structure and relevant parameters')
     p.add_argument('--supercell', type=(lambda s: tuple(map(int, s))), dest='supercell', default=(1,1,1))
     p.add_argument('--params-fd', help='json file with GPAW params to modify for finite displacement (supercell)')
-    p.set_defaults(func=lambda args, log: main__elph_phonopy(structure_path=args.INPUT, supercell=args.supercell, params_fd_path=args.params_fd, log=log))
+    p.add_argument('--symmetry-tol', type=float, default=1e-5)
+    p.set_defaults(func=lambda args, log: main__elph_phonopy(structure_path=args.INPUT, supercell=args.supercell, params_fd_path=args.params_fd, log=log, symmetry_tol=args.symmetry_tol))
 
     p = subs.add_parser('brute-gpw')
     p.add_argument('INPUT', help='.gpw file for unitcell, with structure and relevant parameters')
@@ -331,7 +332,7 @@ def main__brute_gpw(structure_path, supercell, log):
     return
 
 
-def main__elph_phonopy(structure_path, params_fd_path, supercell, log):
+def main__elph_phonopy(structure_path, params_fd_path, supercell, log, symmetry_tol):
     from gpaw.elph.electronphonon import ElectronPhononCoupling
     from gpaw import GPAW
 
@@ -355,6 +356,9 @@ def main__elph_phonopy(structure_path, params_fd_path, supercell, log):
         unitcell=ase_atoms_to_phonopy(calc.atoms),
         supercell_matrix=np.diag(supercell),
         displacement_distance=DISPLACEMENT_DIST,
+        phonopy_kw=dict(
+            symprec=symmetry_tol,
+        ),
     )
     natoms_prim = len(calc.atoms)
     disp_phonopy_sites, disp_carts = get_phonopy_displacements(phonon)
@@ -710,22 +714,25 @@ def get_minimum_displacements(
         unitcell: phonopy.structure.atoms.PhonopyAtoms,
         supercell_matrix: np.ndarray,
         displacement_distance: float,
+        phonopy_kw: dict = {},
         ):
+    # note: applying phonopy_kw on load is necessary because phonopy will recompute symmetry
+    load = lambda: phonopy.load(cachepath, produce_fc=False, **phonopy_kw)
     if os.path.exists(cachepath):
         parprint(f'Found existing {cachepath}')
-        return phonopy.load(cachepath, produce_fc=False)
+        return load()
     world.barrier()  # avoid race condition where rank 0 creates file before others enter
     parprint(f'Getting displacements... ({cachepath})')
 
     if world.rank == 0:
-        phonon = phonopy.Phonopy(unitcell, supercell_matrix, factor=phonopy.units.VaspToTHz)
+        phonon = phonopy.Phonopy(unitcell, supercell_matrix, factor=phonopy.units.VaspToTHz, **phonopy_kw)
         phonon.generate_displacements(distance=displacement_distance)
         parprint(f'Saving displacements...')
         phonon.save(cachepath)
 
     world.barrier()
     parprint(f'Loading displacements...')
-    return phonopy.load(cachepath, produce_fc=False)
+    return load()
 
 
 def make_force_sets_and_excitations(cachepath, disp_filenames, phonon, atoms, ex_kw):

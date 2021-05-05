@@ -660,7 +660,7 @@ class PrecomputedSymmetryIndexInfo:
         natoms = len(oper_deperms[0])
         missing_indices = set(range(natoms)) - set(from_reps)
         if missing_indices:
-            raise RuntimeError(f'no representative atoms were symmetrically equivalent to these indices: {sorted(missing_indices)}!')
+            raise RuntimeError(f'no representative atoms were symmetrically equivalent to these indices: {sorted(missing_indices)}!  (num symmetry opers: {len(oper_deperms)})')
 
         self.data = from_reps
 
