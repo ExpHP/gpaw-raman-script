@@ -229,37 +229,7 @@ def calculate_raman_tensor(atoms, gpw_name, sc = (1,1,1), permutations = True, r
         else:
             elph = np.load("gqklnn_{}.npy".format(basename))[0,:,:,:,:] #[0,k,l,:,:]
 
-    parprint("Distributing coupling terms")
-    for k in range(nk):
-        weight = calc.wfs.collect_auxiliary("weight", k, 0)
-        f_n = calc.wfs.collect_occupations(k, 0)
-
-        if world.rank == 0:
-            f_n = f_n/weight
-            if k % world.size == world.rank:
-                #WEIGHTED
-                k_info[k] = weight*elph[k], mom[:,k], f_n
-            else:
-                f_n = np.array(f_n, dtype = float)
-                #WEIGHTED
-                elph_k = weight*np.array(elph[k],dtype = complex)
-                #elph_k = np.array(elph[k],dtype = complex)
-                mom_k = np.array(mom[:,k],dtype = complex)
-
-                par.comm.Send(elph_k, dest = k % world.size, tag = k)
-                par.comm.Send(mom_k, dest = k % world.size, tag = nk + k)
-                par.comm.Send(f_n, dest = k % world.size, tag = 2*nk + k)
-        else:
-            if k % world.size == world.rank:
-                elph_k = np.empty((m,n,n), dtype = complex)
-                mom_k = np.empty((3,n,n), dtype = complex)
-                f_n = np.empty(n, dtype = float)
-
-                par.comm.Recv(elph_k, source = 0, tag = k)
-                par.comm.Recv(mom_k, source = 0, tag = nk + k)
-                par.comm.Recv(f_n, source = 0, tag = 2*nk + k)
-
-                k_info[k] = elph_k, mom_k, f_n
+    k_info = distribute_coupling_terms(nk, calc, elph, mom, par, m, n)
 
     #ab is in and out polarization
     #l is the phonon mode and w is the raman shift
@@ -334,8 +304,6 @@ def calculate_raman(atoms, gpw_name, sc = (1,1,1), permutations = True, ramannam
         if w_ph[l].real<0:
             InvPh = np.append(int(l), InvPh)
 
-    k_info = {}
-
     if rank == 0:
         if momname is None:
             mom = np.load("dip_vknm.npy") #[:,k,:,:]dim, k
@@ -346,38 +314,7 @@ def calculate_raman(atoms, gpw_name, sc = (1,1,1), permutations = True, ramannam
         else:
             elph = np.load("gqklnn_{}.npy".format(basename))[0] #[0,k,l,n,m]
 
-    parprint("Distributing coupling terms")
-    for k in range(nk):
-        weight = calc.wfs.collect_auxiliary("weight", k, 0)
-        f_n = calc.wfs.collect_occupations(k, 0)
-
-        if world.rank == 0:
-            f_n = f_n/weight
-            if k % world.size == world.rank:
-                #WEIGHTED
-                k_info[k] = weight*elph[k], mom[:,k], f_n
-                #k_info[k] = elph[k], mom[:,k], f_n
-            else:
-                f_n = np.array(f_n, dtype = float)
-                #WEIGHTED
-                elph_k = weight*np.array(elph[k],dtype = complex)
-                #elph_k = np.array(elph[k],dtype = complex)
-                mom_k = np.array(mom[:,k],dtype = complex)
-
-                par.comm.Send(elph_k, dest = k % world.size, tag = k)
-                par.comm.Send(mom_k, dest = k % world.size, tag = nk + k)
-                par.comm.Send(f_n, dest = k % world.size, tag = 2*nk + k)
-        else:
-            if k % world.size == world.rank:
-                elph_k = np.empty((m,n,n), dtype = complex)
-                mom_k = np.empty((3,n,n), dtype = complex)
-                f_n = np.empty(n, dtype = float)
-
-                par.comm.Recv(elph_k, source = 0, tag = k)
-                par.comm.Recv(mom_k, source = 0, tag = nk + k)
-                par.comm.Recv(f_n, source = 0, tag = 2*nk + k)
-
-                k_info[k] = elph_k, mom_k, f_n
+    k_info = distribute_coupling_terms(nk, calc, elph, mom, par, m, n)
 
     #ab is in and out polarization
     #l is the phonon mode and w is the raman shift
@@ -469,6 +406,43 @@ def analyse_raman_tensor(atoms,basename =  None, sc = (1,1,1), ramanname = None,
             np.save("RI.npy", raman)
         else:
             np.save("RI_{}.npy".format(ramanname), raman)
+
+# factors out some copypasta from the original implementation
+def distribute_coupling_terms(nk, calc, elph, mom, par, m, n):
+    parprint("Distributing coupling terms")
+    k_info = {}
+    for k in range(nk):
+        weight = calc.wfs.collect_auxiliary("weight", k, 0)
+        f_n = calc.wfs.collect_occupations(k, 0)
+
+        if world.rank == 0:
+            f_n = f_n/weight
+            if k % world.size == world.rank:
+                #WEIGHTED
+                k_info[k] = weight*elph[k], mom[:,k], f_n
+                #k_info[k] = elph[k], mom[:,k], f_n
+            else:
+                f_n = np.array(f_n, dtype = float)
+                #WEIGHTED
+                elph_k = weight*np.array(elph[k],dtype = complex)
+                #elph_k = np.array(elph[k],dtype = complex)
+                mom_k = np.array(mom[:,k],dtype = complex)
+
+                par.comm.Send(elph_k, dest = k % world.size, tag = k)
+                par.comm.Send(mom_k, dest = k % world.size, tag = nk + k)
+                par.comm.Send(f_n, dest = k % world.size, tag = 2*nk + k)
+        else:
+            if k % world.size == world.rank:
+                elph_k = np.empty((m,n,n), dtype = complex)
+                mom_k = np.empty((3,n,n), dtype = complex)
+                f_n = np.empty(n, dtype = float)
+
+                par.comm.Recv(elph_k, source = 0, tag = k)
+                par.comm.Recv(mom_k, source = 0, tag = nk + k)
+                par.comm.Recv(f_n, source = 0, tag = 2*nk + k)
+
+                k_info[k] = elph_k, mom_k, f_n
+    return k_info
 
 def plot_raman(yscale = "linear", figname = "Raman.png", relative = False, w_min = None, w_max = None, ramanname = None):
     """
