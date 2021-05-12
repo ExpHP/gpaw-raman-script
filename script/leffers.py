@@ -184,7 +184,7 @@ def L(w, gamma=10/8065.544):
     return lor
 
 
-def calculate_raman(atoms, gpw_name, sc=(1, 1, 1), permutations=True, ramanname=None, momname=None, basename=None, w_l=2.54066, gamma_l=0.2, d_i=0, d_o=0):
+def calculate_raman(atoms, gpw_name, sc=(1, 1, 1), permutations=True, w_cm=None, ramanname=None, momname=None, basename=None, w_l=2.54066, gamma_l=0.2, d_i=0, d_o=0):
     """
     Calculates the first order Raman spectre
 
@@ -195,6 +195,7 @@ def calculate_raman(atoms, gpw_name, sc=(1, 1, 1), permutations=True, ramanname=
         ramanname       Suffix for the raman.npy file
         momname         Suffix for the momentumfile
         basename        Suffix for the gqklnn.npy files
+        w_cm            Raman shift frequencies to compute at.
         w_l, gamma_l    Laser energy, broadening factor for the electron energies
         d_i, d_o        Laser polarization in, out (0, 1, 2 for x, y, z respectively)
     Output:
@@ -215,8 +216,8 @@ def calculate_raman(atoms, gpw_name, sc=(1, 1, 1), permutations=True, ramanname=
     ph = Phonons(atoms=atoms, name="phonons", supercell=sc)
     ph.read()
     w_ph = np.array(ph.band_structure([[0, 0, 0]])[0])
-    w_cm = np.linspace(0, int(np.max(w_ph)/cm+200),
-                       int(np.max(w_ph)/cm+200))  # Defined in cm^-1
+    if w_cm is None:
+        w_cm = np.arange(int(w_ph.max()/cm) + 201) * 1.0  # Defined in cm^-1
     w = w_cm*cm
     w_s = w_l-w
     m = len(w_ph)
