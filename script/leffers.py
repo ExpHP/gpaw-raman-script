@@ -222,11 +222,6 @@ def calculate_raman(atoms, gpw_name, sc=(1, 1, 1), permutations=True, w_cm=None,
     w_s = w_l-w
     m = len(w_ph)
 
-    InvPh = np.array([])
-    for l in range(m):
-        if w_ph[l].real < 0:
-            InvPh = np.append(int(l), InvPh)
-
     if rank == 0:
         if momname is None:
             mom = np.load("dip_vknm.npy")  # [:,k,:,:]dim, k
@@ -274,7 +269,7 @@ def calculate_raman(atoms, gpw_name, sc=(1, 1, 1), permutations=True, w_cm=None,
 
     RI = np.zeros(len(w))
     for l in range(m):
-        if not (l in InvPh):
+        if w_ph[l].real >= 0:
             parprint(
                 "Phonon {} with energy = {} registered".format(l, w_ph[l]))
             RI += (np.abs(raman_lw[l])**2)*np.array(L(w-w_ph[l]))
