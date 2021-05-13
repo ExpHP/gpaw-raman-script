@@ -237,12 +237,14 @@ def main__elph_phonopy(structure_path, params_fd_path, supercell, log, symmetry_
 
     #And the three Raman spectra are calculated
     for i, w_l in enumerate(w_ls):
-        name = "{}nm".format(wavelengths[i])
-        if not os.path.isfile(f"RI_{name}.npy"):
-            leffers.calculate_raman(calc.atoms, gpw_name=structure_path, sc=supercell, w_l = w_l, ramanname = name)
+        for d_i in range(3):
+            for d_o in range(3):
+                name = "{}nm-{}{}".format(wavelengths[i], 'xyz'[d_i], 'xyz'[d_o])
+                if not os.path.isfile(f"RI_{name}.npy"):
+                    leffers.calculate_raman(calc.atoms, gpw_name=structure_path, sc=supercell, w_l = w_l, ramanname = name, d_i=d_i, d_o=d_o)
 
-        #And plotted
-        leffers.plot_raman(relative = True, figname = f"Raman_{name}.png", ramanname = name)
+                #And plotted
+                leffers.plot_raman(relative = True, figname = f"Raman_{name}.png", ramanname = name)
 
 
 def make_gpaw_supercell(calc: GPAW, supercell: tp.Tuple[int, int, int], **new_kw):

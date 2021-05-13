@@ -61,8 +61,8 @@ def get_elph_elements(atoms, gpw_name, calc_fd, sc=(1, 1, 1), basename=None):
     if rank == 0:
         print("Supercell matrix is loaded")
 
-    # Find the bloch expansion coefficients
-    c_kn = np.zeros((nk, nbands, nbands), dtype=complex)
+    #Find the bloch expansion coefficients
+    c_kn = np.zeros((nk, nbands, calc_gs.wfs.setups.nao), dtype=complex)
 
     for k in range(len(kpts)):
         c_k = calc_gs.wfs.collect_array("C_nM", k, 0)
