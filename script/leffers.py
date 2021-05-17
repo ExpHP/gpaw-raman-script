@@ -10,8 +10,7 @@ from gpaw import GPAW, PW, FermiDirac
 from gpaw.fd_operators import Gradient
 
 from ase.phonons import Phonons
-from ase.parallel import rank, size, world, MPI4PY, parprint
-
+from ase.parallel import parprint
 
 def get_elph_elements(atoms, gpw_name, calc_fd, sc=(1, 1, 1), basename=None):
     """
@@ -30,9 +29,8 @@ def get_elph_elements(atoms, gpw_name, calc_fd, sc=(1, 1, 1), basename=None):
     from ase.phonons import Phonons
     from gpaw.elph.electronphonon import ElectronPhononCoupling
 
-    par = MPI4PY()
-    par.comm.Barrier()
     calc_gs = GPAW(gpw_name)
+    world = calc_gs.wfs.world
 
     #calc_fd = GPAW(**params_fd)
     calc_gs.initialize_positions(atoms)
@@ -42,7 +40,7 @@ def get_elph_elements(atoms, gpw_name, calc_fd, sc=(1, 1, 1), basename=None):
     nbands = calc_gs.wfs.bd.nbands
     qpts = gamma_kpt
 
-    calc_fd.get_potential_energy()  # XXX needed to initialize C_nM ??????
+    # calc_fd.get_potential_energy()  # XXX needed to initialize C_nM ??????
 
     # Phonon calculation, We'll read the forces from the elph.run function
     # This only looks at gamma point phonons
@@ -50,7 +48,7 @@ def get_elph_elements(atoms, gpw_name, calc_fd, sc=(1, 1, 1), basename=None):
     ph.read()
     frequencies, modes = ph.band_structure(qpts, modes=True)
 
-    if rank == 0:
+    if world.rank == 0:
         print("Phonon frequencies are loaded.")
 
     # Find el-ph matrix in the LCAO basis
@@ -58,28 +56,32 @@ def get_elph_elements(atoms, gpw_name, calc_fd, sc=(1, 1, 1), basename=None):
 
     elph.set_lcao_calculator(calc_fd)
     elph.load_supercell_matrix(basis="dzp", dump=1)
-    if rank == 0:
+    if world.rank == 0:
         print("Supercell matrix is loaded")
 
-    #Find the bloch expansion coefficients
-    c_kn = np.zeros((nk, nbands, calc_gs.wfs.setups.nao), dtype=complex)
+    # Non-root processes on GD comm seem to be missing kpoint data.
+    assert calc_gs.wfs.gd.comm.size == 1, "domain parallelism not supported"  # not sure how to fix this, sorry
 
-    for k in range(len(kpts)):
-        c_k = calc_gs.wfs.collect_array("C_nM", k, 0)
-        if rank == 0:
-            c_kn[k] = c_k
+    gcomm = calc_gs.wfs.gd.comm
+    kcomm = calc_gs.wfs.kd.comm
+    if gcomm.rank == 0:
+        # Find the bloch expansion coefficients
+        c_kn = np.empty((nk, nbands, calc_gs.wfs.setups.nao), dtype=complex)
+        for k in range(calc_gs.wfs.kd.nibzkpts):
+            c_k = calc_gs.wfs.collect_array("C_nM", k, 0)
+            if kcomm.rank == 0:
+                c_kn[k] = c_k
+        kcomm.broadcast(c_kn, 0)
 
-    par.comm.Bcast(c_kn, root=0)
+        # And we finally find the electron-phonon coupling matrix elements!
+        g_qklnn = elph.bloch_matrix(c_kn=c_kn, kpts=kpts, qpts=qpts, u_ql=modes)
 
-    # And we finally find the electron-phonon coupling matrix elements!
-    g_qklnn = elph.bloch_matrix(c_kn=c_kn, kpts=kpts, qpts=qpts, u_ql=modes)
-    if rank == 0:
+    if world.rank == 0:
         print("Saving the elctron-phonon coupling matrix")
         if basename is None:
             np.save("gqklnn.npy", np.array(g_qklnn))
         else:
             np.save("gqklnn_{}.npy".format(basename), np.array(g_qklnn))
-
 
 def get_dipole_transitions(calc, momname=None, basename=None):
     """
@@ -95,7 +97,7 @@ def get_dipole_transitions(calc, momname=None, basename=None):
         dip_vknm.npy    Array with dipole matrix elements
     """
 
-    par = MPI4PY()  # FIXME: use a comm from gpaw
+    # par = MPI4PY()  # FIXME: use a comm from gpaw
     #calc = atoms.calc
 
     bzk_kc = calc.get_ibz_k_points()
@@ -106,23 +108,26 @@ def get_dipole_transitions(calc, momname=None, basename=None):
 
     parprint("Distributing wavefunctions.")
 
+    kcomm = calc.wfs.kd.comm
+    world = calc.wfs.world
     if not calc.wfs.positions_set:
         calc.initialize_positions()
     for k in range(nk):
         # Collects the wavefunctions and the projections to rank 0. Periodic -> u_n(r)
+        spin = 0 # FIXME
         wf = np.array([calc.wfs.get_wave_function_array(
-            i, k, 0, realspace=True, periodic=True) for i in range(n)], dtype=complex)
-        P_nI = calc.wfs.collect_projections(k, 0)
+            i, k, spin, realspace=True, periodic=True) for i in range(n)], dtype=complex)
+        P_nI = calc.wfs.collect_projections(k, spin)
 
         # Distributes the information to rank k % size.
-        if world.rank == 0:
-            if k % world.size == world.rank:
+        if kcomm.rank == 0:
+            if k % kcomm.size == kcomm.rank:
                 wfs[k] = wf, P_nI
             else:
-                par.comm.Send(P_nI, dest=k % world.size, tag=nk+k)
-                par.comm.Send(wf, dest=k % world.size, tag=k)
+                kcomm.send(P_nI, dest=k % kcomm.size, tag=nk+k)
+                kcomm.send(wf, dest=k % kcomm.size, tag=k)
         else:
-            if k % world.size == world.rank:
+            if k % kcomm.size == kcomm.rank:
                 nproj = sum(setup.ni for setup in calc.wfs.setups)
                 if not calc.wfs.collinear:
                     nproj *= 2
@@ -131,8 +136,8 @@ def get_dipole_transitions(calc, momname=None, basename=None):
                 wf = np.tile(calc.wfs.empty(
                     shape, global_array=True, realspace=True), (n, 1, 1, 1))
 
-                par.comm.Recv(P_nI, source=0, tag=nk + k)
-                par.comm.Recv(wf, source=0, tag=k)
+                kcomm.receive(P_nI, src=0, tag=nk + k)
+                kcomm.receive(wf, src=0, tag=k)
 
                 wfs[k] = wf, P_nI
 
@@ -202,15 +207,13 @@ def calculate_raman(atoms, gpw_name, sc=(1, 1, 1), permutations=True, w_cm=None,
         RI.npy          Numpy array containing the raman spectre
     """
 
-    par = MPI4PY()  # FIXME: use a comm from gpaw
-
     parprint("Calculating the Raman spectra: Laser frequency = {}".format(w_l))
 
     calc = GPAW(gpw_name)  # FIXME: should take calc as arg instead
 
     bzk_kc = calc.get_ibz_k_points()
-    n = calc.wfs.bd.nbands
-    nk = np.shape(bzk_kc)[0]
+    nbands = calc.wfs.bd.nbands
+    nibzkpts = np.shape(bzk_kc)[0]
     cm = 1/8065.544
 
     ph = Phonons(atoms=atoms, name="phonons", supercell=sc)
@@ -220,9 +223,13 @@ def calculate_raman(atoms, gpw_name, sc=(1, 1, 1), permutations=True, w_cm=None,
         w_cm = np.arange(int(w_ph.max()/cm) + 201) * 1.0  # Defined in cm^-1
     w = w_cm*cm
     w_s = w_l-w
-    m = len(w_ph)
+    nphonons = len(w_ph)
 
-    if rank == 0:
+    assert calc.wfs.gd.comm.size == 1, "domain parallelism not supported"  # not sure how to fix this, sorry
+
+    kcomm = calc.wfs.kd.comm
+    world = calc.wfs.world
+    if kcomm.rank == 0:
         if momname is None:
             mom = np.load("dip_vknm.npy")  # [:,k,:,:]dim, k
         else:
@@ -232,69 +239,15 @@ def calculate_raman(atoms, gpw_name, sc=(1, 1, 1), permutations=True, w_cm=None,
         else:
             elph = np.load("gqklnn_{}.npy".format(basename))[0]  # [0,k,l,n,m]
 
-    k_info = distribute_coupling_terms(nk, calc, elph, mom, par, m, n)
-
-    # ab is in and out polarization
-    # l is the phonon mode and w is the raman shift
-    raman_lw = np.zeros((m, len(w)), dtype=complex)
-
-    parprint("Evaluating Raman sum")
-
-    E_kn = calc.band_structure().todict()["energies"][0]
-
-    for k, (elph, mom, f_n) in k_info.items():
-        print("For k = {}".format(k))
-        E_el = E_kn[k]
-        raman_lw += np.einsum('si,lij,ljs->l', f_n[:, None]*(1-f_n[None, :])*mom[d_i]/(w_l-(E_el[None, :]-E_el[:, None]) + complex(0, gamma_l)), elph, (
-            1 - f_n[None, :, None])*mom[d_o, None, :, :]/(w_l-w_ph[:, None, None]-(E_el[None, :, None] - E_el[None, None, :]) + complex(0, gamma_l)))[:, None]
-
-        # FIXME: GOOD GOD WHAT IS THIS
-        if permutations:
-            raman_lw += np.einsum('si,wljs,ij->lw', f_n[:, None]*(1-f_n[None, :])*mom[d_i]/(w_l-(E_el[None, :]-E_el[:, None]) + complex(0, gamma_l)), (
-                1-f_n[None, None, :, None])*elph[None, :, :, :]/(w[:, None, None, None]-(E_el[None, None, :, None]-E_el[None, None, None, :]) + complex(0, gamma_l)), mom[d_o])
-
-            raman_lw += np.einsum('wsi,lij,wljs->lw', f_n[None, :, None]*(1-f_n[None, None, :])*mom[d_o, None, :, :]/(-w_s[:, None, None]-(E_el[None, None, :]-E_el[None, :, None]) + complex(
-                0, gamma_l)), elph, (1-f_n[None, None, :, None])*mom[d_i, None, None, :, :]/(-w_s[:, None, None, None]-w_ph[None, :, None, None]-(E_el[None, None, :, None]-E_el[None, None, None, :]) + complex(0, gamma_l)))
-
-            raman_lw += np.einsum('wsi,ij,wljs->lw', f_n[None, :, None]*(1-f_n[None, None, :])*mom[d_o, None, :, :]/(-w_s[:, None, None]-(E_el[None, None, :]-E_el[None, :, None]) + complex(
-                0, gamma_l)), mom[d_i], (1-f_n[None, None, :, None])*elph[None, :, :, :]/(-w_s[:, None, None, None]+w_l-(E_el[None, None, :, None]-E_el[None, None, None, :]) + complex(0, gamma_l)))
-
-            raman_lw += np.einsum('lsi,ij,ljs->l', f_n[None, :, None]*(1-f_n[None, None, :])*elph/(-w_ph[:, None, None]-(E_el[None, None, :]-E_el[None, :, None]) + complex(
-                0, gamma_l)), mom[d_i], (1-f_n[None, :, None])*mom[d_o, None, :, :]/(-w_ph[:, None, None]+w_l-(E_el[None, :, None]-E_el[None, None, :]) + complex(0, gamma_l)))[:, None]
-
-            raman_lw += np.einsum('lsi,ij,wljs->lw', f_n[None, :, None]*(1-f_n[None, None, :])*elph/(-w_ph[:, None, None]-(E_el[None, None, :]-E_el[None, :, None]) + complex(0, gamma_l)), mom[d_o], (
-                1-f_n[None, None, :, None])*mom[d_i, None, None, :, :]/(-w_ph[None, :, None, None]-w_s[:, None, None, None]-(E_el[None, None, :, None]-E_el[None, None, None, :]) + complex(0, gamma_l)))
-
-    world.sum(raman_lw)
-
-    RI = np.zeros(len(w))
-    for l in range(m):
-        if w_ph[l].real >= 0:
-            parprint(
-                "Phonon {} with energy = {} registered".format(l, w_ph[l]))
-            RI += (np.abs(raman_lw[l])**2)*np.array(L(w-w_ph[l]))
-
-    raman = np.vstack((w_cm, RI))
-
-    if rank == 0:
-        if ramanname is None:
-            np.save("RI.npy", raman)
-        else:
-            np.save("RI_{}.npy".format(ramanname), raman)
-
-# factors out some copypasta from the original implementation
-
-
-def distribute_coupling_terms(nk, calc, elph, mom, par, m, n):
     parprint("Distributing coupling terms")
     k_info = {}
-    for k in range(nk):
+    for k in range(nibzkpts):
         weight = calc.wfs.collect_auxiliary("weight", k, 0)
         f_n = calc.wfs.collect_occupations(k, 0)
 
-        if world.rank == 0:
+        if kcomm.rank == 0:
             f_n = f_n/weight
-            if k % world.size == world.rank:
+            if k % kcomm.size == kcomm.rank:
                 # WEIGHTED
                 k_info[k] = weight*elph[k], mom[:, k], f_n
                 #k_info[k] = elph[k], mom[:,k], f_n
@@ -305,21 +258,132 @@ def distribute_coupling_terms(nk, calc, elph, mom, par, m, n):
                 #elph_k = np.array(elph[k],dtype = complex)
                 mom_k = np.array(mom[:, k], dtype=complex)
 
-                par.comm.Send(elph_k, dest=k % world.size, tag=k)
-                par.comm.Send(mom_k, dest=k % world.size, tag=nk + k)
-                par.comm.Send(f_n, dest=k % world.size, tag=2*nk + k)
+                kcomm.send(elph_k, dest=k % kcomm.size, tag=k)
+                kcomm.send(mom_k, dest=k % kcomm.size, tag=nibzkpts + k)
+                kcomm.send(f_n, dest=k % kcomm.size, tag=2*nibzkpts + k)
         else:
-            if k % world.size == world.rank:
-                elph_k = np.empty((m, n, n), dtype=complex)
-                mom_k = np.empty((3, n, n), dtype=complex)
-                f_n = np.empty(n, dtype=float)
+            if k % kcomm.size == kcomm.rank:
+                elph_k = np.empty((nphonons, nbands, nbands), dtype=complex)
+                mom_k = np.empty((3, nbands, nbands), dtype=complex)
+                f_n = np.empty(nbands, dtype=float)
 
-                par.comm.Recv(elph_k, source=0, tag=k)
-                par.comm.Recv(mom_k, source=0, tag=nk + k)
-                par.comm.Recv(f_n, source=0, tag=2*nk + k)
+                kcomm.receive(elph_k, src=0, tag=k)
+                kcomm.receive(mom_k, src=0, tag=nibzkpts + k)
+                kcomm.receive(f_n, src=0, tag=2*nibzkpts + k)
 
                 k_info[k] = elph_k, mom_k, f_n
-    return k_info
+
+    # ab is in and out polarization
+    # l is the phonon mode and w is the raman shift
+    raman_lw = np.zeros((nphonons, len(w)), dtype=complex)
+
+    parprint("Evaluating Raman sum")
+
+    E_kn = calc.band_structure().todict()["energies"][0]
+
+    for k, (elph, mom, f_n) in k_info.items():
+        print("For k = {}".format(k))
+        E_el = E_kn[k]
+
+        _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, w, w_s, mom, elph, f_n, E_el)
+
+    kcomm.sum(raman_lw)
+
+    RI = np.zeros(len(w))
+    for l in range(nphonons):
+        if w_ph[l].real >= 0:
+            parprint(
+                "Phonon {} with energy = {} registered".format(l, w_ph[l]))
+            RI += (np.abs(raman_lw[l])**2)*np.array(L(w-w_ph[l]))
+
+    raman = np.vstack((w_cm, RI))
+
+    if world.rank == 0:
+        if ramanname is None:
+            np.save("RI.npy", raman)
+        else:
+            np.save("RI_{}.npy".format(ramanname), raman)
+
+def _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, w, w_s, mom, elph, f_n, E_el):
+    # si
+    factor_1_in = (f_n[:,None]*(1-f_n[None,:])*mom[d_i]
+        / (w_l-(E_el[None,:]-E_el[:,None]) + complex(0,gamma_l)))
+
+    # lsi
+    factor_1_elph = (f_n[None,:,None]*(1-f_n[None,None,:])*elph
+        / (-w_ph[:,None,None]-(E_el[None,None,:]-E_el[None,:,None]) + complex(0,gamma_l)))
+
+    # wsi
+    factor_1_out = (f_n[None,:,None]*(1-f_n[None,None,:])*mom[d_o,None,:,:]
+        / (-w_s[:,None,None]-(E_el[None,None,:]-E_el[None,:,None]) + complex(0,gamma_l)))
+
+    # ljs
+    factor_2_out = ((1-f_n[None,:,None])*mom[d_o,None,:,:]
+        / (w_l-w_ph[:,None,None]-(E_el[None,:,None]-E_el[None,None,:]) + complex(0,gamma_l)))
+
+    # wljs
+    factor_2_in = ((1-f_n[None,None,:,None])*mom[d_i,None,None,:,:]
+        / (-w_s[:,None,None,None]-w_ph[None,:,None,None]-(E_el[None,None,:,None]-E_el[None,None,None,:]) + complex(0,gamma_l)))
+
+    # wljs
+    factor_2_elph = ((1-f_n[None,None,:,None])*elph[None,:,:,:]
+        / (w[:,None,None,None]-(E_el[None,None,:,None]-E_el[None,None,None,:]) + complex(0,gamma_l)))
+
+    raman_lw += np.einsum('si,lij,ljs->l', factor_1_in, elph, factor_2_out)[:,None]
+    if permutations:
+        raman_lw += np.einsum('si,ij,wljs->lw', factor_1_in, mom[d_o], factor_2_elph)
+        raman_lw += np.einsum('wsi,lij,wljs->lw', factor_1_out, elph, factor_2_in)
+        raman_lw += np.einsum('wsi,ij,wljs->lw', factor_1_out, mom[d_i], factor_2_elph)
+        raman_lw += np.einsum('lsi,ij,ljs->l', factor_1_elph, mom[d_i], factor_2_out)[:,None]
+        raman_lw += np.einsum('lsi,ij,wljs->lw', factor_1_elph, mom[d_o], factor_2_in)
+
+# Closer to the original code.
+def _old__add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, w, w_s, mom, elph, f_n, E_el):
+    raman_lw += np.einsum('si,lij,ljs->l',
+        f_n[:,None]*(1-f_n[None,:])*mom[d_i]
+            / (w_l-(E_el[None,:]-E_el[:,None]) + complex(0,gamma_l)),
+        elph,
+        (1-f_n[None,:,None])*mom[d_o,None,:,:]
+            / (w_l-w_ph[:,None,None]-(E_el[None,:,None]-E_el[None,None,:]) + complex(0,gamma_l)),
+    )[:,None]
+
+    # FIXME: GOOD GOD WHAT IS THIS
+    if permutations:
+        raman_lw += np.einsum('si,wljs,ij->lw',
+            f_n[:, None]*(1-f_n[None, :])*mom[d_i]
+                / (w_l-(E_el[None, :]-E_el[:, None]) + complex(0, gamma_l)),
+            (1-f_n[None, None, :, None])*elph[None, :, :, :]
+                / (w[:, None, None, None]-(E_el[None, None, :, None]-E_el[None, None, None, :]) + complex(0, gamma_l)),
+            mom[d_o],
+        )
+        raman_lw += np.einsum('wsi,lij,wljs->lw',
+            f_n[None,:,None]*(1-f_n[None,None,:])*mom[d_o,None,:,:]
+                / (-w_s[:,None,None]-(E_el[None,None,:]-E_el[None,:,None]) + complex(0,gamma_l)),
+            elph,
+            (1-f_n[None,None,:,None])*mom[d_i,None,None,:,:]
+                / (-w_s[:,None,None,None]-w_ph[None,:,None,None]-(E_el[None,None,:,None]-E_el[None,None,None,:]) + complex(0,gamma_l)),
+        )
+        raman_lw += np.einsum('wsi,ij,wljs->lw',
+            f_n[None,:,None]*(1-f_n[None,None,:])*mom[d_o,None,:,:]
+                / (-w_s[:,None,None]-(E_el[None,None,:]-E_el[None,:,None]) + complex(0,gamma_l)),
+            mom[d_i],
+            (1-f_n[None,None,:,None])*elph[None,:,:,:]
+                / (-w_s[:,None,None,None]+w_l-(E_el[None,None,:,None]-E_el[None,None,None,:]) + complex(0,gamma_l)),
+        )
+        raman_lw += np.einsum('lsi,ij,ljs->l',
+            f_n[None,:,None]*(1-f_n[None,None,:])*elph
+                / (-w_ph[:,None,None]-(E_el[None,None,:]-E_el[None,:,None]) + complex(0,gamma_l)),
+            mom[d_i],
+            (1-f_n[None,:,None])*mom[d_o,None,:,:]
+                / (-w_ph[:,None,None]+w_l-(E_el[None,:,None]-E_el[None,None,:]) + complex(0,gamma_l)),
+        )[:,None]
+        raman_lw += np.einsum('lsi,ij,wljs->lw',
+            f_n[None,:,None]*(1-f_n[None,None,:])*elph
+                / (-w_ph[:,None,None]-(E_el[None,None,:]-E_el[None,:,None]) + complex(0,gamma_l)),
+            mom[d_o],
+            (1-f_n[None,None,:,None])*mom[d_i,None,None,:,:]
+                / (-w_ph[None,:,None,None]-w_s[:,None,None,None]-(E_el[None,None,:,None]-E_el[None,None,None,:]) + complex(0, gamma_l)),
+        )
 
 
 def plot_raman(yscale="linear", figname="Raman.png", relative=False, w_min=None, w_max=None, ramanname=None):
@@ -343,9 +407,11 @@ def plot_raman(yscale="linear", figname="Raman.png", relative=False, w_min=None,
     import matplotlib.colors as colors
     import matplotlib.cm as cmx
 
+    from ase.parallel import world
+
     # Plotting function
 
-    if rank == 0:
+    if world.rank == 0:
         if ramanname is None:
             legend = False
             RI_name = ["RI.npy"]
