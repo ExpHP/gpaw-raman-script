@@ -285,7 +285,7 @@ def calculate_raman(atoms, gpw_name, sc=(1, 1, 1), permutations=True, w_cm=None,
         print("For k = {}".format(k))
         E_el = E_kn[k]
 
-        _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, w, w_s, mom, elph, f_n, E_el)
+        _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, w_s, mom, elph, f_n, E_el)
 
     kcomm.sum(raman_lw)
 
@@ -304,41 +304,89 @@ def calculate_raman(atoms, gpw_name, sc=(1, 1, 1), permutations=True, w_cm=None,
         else:
             np.save("RI_{}.npy".format(ramanname), raman)
 
-def _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, w, w_s, mom, elph, f_n, E_el):
-    # si
-    factor_1_in = (f_n[:,None]*(1-f_n[None,:])*mom[d_i]
-        / (w_l-(E_el[None,:]-E_el[:,None]) + complex(0,gamma_l)))
+def _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, w_s, mom, elph, f_n, E_el):
+    # This is a refactoring of some code by Ulrik Leffers in https://gitlab.com/gpaw/gpaw/-/merge_requests/563,
+    # which appears to be an implementation of Equation 10 in https://www.nature.com/articles/s41467-020-16529-6
+    # (though it most certainly does not map 1-1 to the symbols in that equation and I'm not sure
+    #  how to derive the formulas that are ultimately used in the code).
+    #
+    # Third-order perturbation theory produces six terms based on the ordering of three events:
+    # light absorption, phonon creation, light emission.
+    # In the original code, each term manifested as a tensor product over three tensors.  Each of these
+    # tensors took on one of three forms depending on which event it represented (though this was somewhat
+    # obfuscated by arbitrary differences in how some of the denominators were written, or in the ordering
+    # of arguments to einsum).
+    #
+    # We will start by factoring out these tensors.
+    #
+    # But first: Some parts common to many of the tensors.
+    Ediff_el = E_el[None,:]-E_el[:,None]  # antisymmetric tensor that shows up in all denominators
+    occu1 = f_n[:,None]*(1-f_n[None,:])  # occupation-based part that always appears in the 1st tensor
+    occu3 = 1-f_n[:,None]  # occupation-based part that always appears in the 3rd tensor
 
-    # lsi
-    factor_1_elph = (f_n[None,:,None]*(1-f_n[None,None,:])*elph
-        / (-w_ph[:,None,None]-(E_el[None,None,:]-E_el[None,:,None]) + complex(0,gamma_l)))
+    # And now, the 9 tensors.
+    #
+    # Some of these tensors were VERY LARGE;  over 50 GB for 17-agnr.
+    # Thus, to reduce memory requirements, I have rewritten them to not include axes for the phonon mode or
+    # raman shift;  Instead they are all lambdas that produce a matrix of size (nbands, nbands), and we'll
+    # evaluate them at a single phonon/raman shift at a time).
+    f1_in_ = lambda: occu1[:,:] * mom[d_i,:,:] / (w_l-Ediff_el[:,:] + 1j*gamma_l)
+    f1_elph_ = lambda l: occu1[:,:] * elph[l,:,:] / (-w_ph[l]-Ediff_el[:,:] + 1j*gamma_l)
+    f1_out_ = lambda w: occu1[:,:] * mom[d_o,:,:] / (-w_s[w]-Ediff_el[:,:] + 1j*gamma_l)
+    f2_in_ = lambda: mom[d_i,:,:]
+    f2_elph_ = lambda l: elph[l,:,:]
+    f2_out_ = lambda: mom[d_o,:,:]
+    f3_in_ = lambda w, l: occu3[:,:] * mom[d_i,:,:] / (-w_s[w]-w_ph[l]-Ediff_el.T + 1j*gamma_l)
+    f3_elph_ = lambda w, l: occu3[:,:] * elph[l,:,:] / (w_l-w_s[w]-Ediff_el.T + 1j*gamma_l)
+    f3_out_ = lambda l: occu3[:,:] * mom[d_o,:,:] / (w_l-w_ph[l]-Ediff_el.T + 1j*gamma_l)
 
-    # wsi
-    factor_1_out = (f_n[None,:,None]*(1-f_n[None,None,:])*mom[d_o,None,:,:]
-        / (-w_s[:,None,None]-(E_el[None,None,:]-E_el[None,:,None]) + complex(0,gamma_l)))
+    # f1_in_ = lambda: (f_n[:,None]*(1-f_n[None,:])*mom[d_i,:,:]
+    #     / (w_l-(E_el[None,:]-E_el[:,None]) + complex(0,gamma_l)))
+    # f1_elph_ = lambda l: (f_n[:,None]*(1-f_n[None,:])*elph[l,:,:]
+    #     / (-w_ph[l]-(E_el[None,:]-E_el[:,None]) + complex(0,gamma_l)))
+    # f1_out_ = lambda w: (f_n[:,None]*(1-f_n[None,:])*mom[d_o,:,:]
+    #     / (-w_s[w]-(E_el[None,:]-E_el[:,None]) + complex(0,gamma_l)))
+    # f2_in_ = lambda: mom[d_i,:,:]
+    # f2_elph_ = lambda l: elph[l,:,:]
+    # f2_out_ = lambda: mom[d_o,:,:]
+    # f3_in_ = lambda w, l: ((1-f_n[:,None])*mom[d_i,:,:]
+    #     / (-w_s[w]-w_ph[l]-(E_el[:,None]-E_el[None,:]) + complex(0,gamma_l)))
+    # f3_elph_ = lambda w, l: ((1-f_n[:,None])*elph[l,:,:]
+    #     / (w_l-w_s[w]-(E_el[:,None]-E_el[None,:]) + complex(0,gamma_l)))
+    # f3_out_ = lambda l: ((1-f_n[:,None])*mom[d_o,:,:]
+    #     / (w_l-w_ph[l]-(E_el[:,None]-E_el[None,:]) + complex(0,gamma_l)))
 
-    # ljs
-    factor_2_out = ((1-f_n[None,:,None])*mom[d_o,None,:,:]
-        / (w_l-w_ph[:,None,None]-(E_el[None,:,None]-E_el[None,None,:]) + complex(0,gamma_l)))
+    # Some of these factors don't depend on anything and can be evaluated right now.
+    f1_in = f1_in_()
+    f2_in = f2_in_()
+    f2_out = f2_out_()
+    for l in range(len(w_ph)):
+        # Work with factors for a single phonon mode.
+        f1_elph = f1_elph_(l)
+        f2_elph = f2_elph_(l)
+        f3_out = f3_out_(l)
 
-    # wljs
-    factor_2_in = ((1-f_n[None,None,:,None])*mom[d_i,None,None,:,:]
-        / (-w_s[:,None,None,None]-w_ph[None,:,None,None]-(E_el[None,None,:,None]-E_el[None,None,None,:]) + complex(0,gamma_l)))
+        # compared to gpaw!563, I have rearranged the order of the terms to group together
+        # the two that don't depend on the shift.
+        raman_lw[l, :] += np.einsum('si,ij,js->', f1_in, f2_elph, f3_out)
 
-    # wljs
-    factor_2_elph = ((1-f_n[None,None,:,None])*elph[None,:,:,:]
-        / (w[:,None,None,None]-(E_el[None,None,:,None]-E_el[None,None,None,:]) + complex(0,gamma_l)))
+        if permutations:
+            raman_lw[l, :] += np.einsum('si,ij,js->', f1_elph, f2_in, f3_out)
 
-    raman_lw += np.einsum('si,lij,ljs->l', factor_1_in, elph, factor_2_out)[:,None]
-    if permutations:
-        raman_lw += np.einsum('si,ij,wljs->lw', factor_1_in, mom[d_o], factor_2_elph)
-        raman_lw += np.einsum('wsi,lij,wljs->lw', factor_1_out, elph, factor_2_in)
-        raman_lw += np.einsum('wsi,ij,wljs->lw', factor_1_out, mom[d_i], factor_2_elph)
-        raman_lw += np.einsum('lsi,ij,ljs->l', factor_1_elph, mom[d_i], factor_2_out)[:,None]
-        raman_lw += np.einsum('lsi,ij,wljs->lw', factor_1_elph, mom[d_o], factor_2_in)
+            # The remaining four terms depend on the raman shift.
+            for w in range(len(w_s)):
+                f1_out = f1_out_(w)
+                f3_in = f3_in_(w, l)
+                f3_elph = f3_elph_(w, l)
+
+                raman_lw[l, w] += np.einsum('si,ij,js->', f1_in, f2_out, f3_elph)
+                raman_lw[l, w] += np.einsum('si,ij,js->', f1_out, f2_in, f3_elph)
+                raman_lw[l, w] += np.einsum('si,ij,js->', f1_elph, f2_out, f3_in)
+                raman_lw[l, w] += np.einsum('si,ij,js->', f1_out, f2_elph, f3_in)
 
 # Closer to the original code.
-def _old__add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, w, w_s, mom, elph, f_n, E_el):
+def _old__add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, w_s, mom, elph, f_n, E_el):
+    w = w_l-w_s
     raman_lw += np.einsum('si,lij,ljs->l',
         f_n[:,None]*(1-f_n[None,:])*mom[d_i]
             / (w_l-(E_el[None,:]-E_el[:,None]) + complex(0,gamma_l)),
