@@ -11,6 +11,7 @@ import sys
 import copy
 import json
 
+from collections import namedtuple
 from datetime import datetime
 import numpy as np
 from ase.parallel import parprint, paropen, world
@@ -48,7 +49,13 @@ def main():
     p.add_argument('--supercell', type=(lambda s: tuple(map(int, s))), dest='supercell', default=(1,1,1))
     p.add_argument('--params-fd', help='json file with GPAW params to modify for finite displacement (supercell)')
     p.add_argument('--symmetry-tol', type=float, default=1e-5)
-    p.set_defaults(func=lambda args, log: main__elph_phonopy(structure_path=args.INPUT, supercell=args.supercell, params_fd_path=args.params_fd, log=log, symmetry_tol=args.symmetry_tol))
+    p.add_argument('--disp-split', metavar="IDX,MOD", type=parse_disp_split, default=None, help='Only compute displacements with index IDX modulo MOD.  If provided, this process will stop after displacements.')
+    p.set_defaults(func=lambda args, log: main__elph_phonopy(
+        structure_path=args.INPUT, supercell=args.supercell, params_fd_path=args.params_fd, log=log,
+        symmetry_tol=args.symmetry_tol,
+        disp_split=DispSplit(0, 1) if args.disp_split is None else args.disp_split,
+        stop_after_displacements=args.disp_split is not None,
+    ))
 
     p = subs.add_parser('brute-gpw')
     p.add_argument('INPUT', help='.gpw file for unitcell, with structure and relevant parameters')
@@ -65,6 +72,12 @@ def start_log_entry(path):
     parprint('=====================================', file=logfile)
     parprint('===', datetime.now().isoformat(), file=logfile)
     return utils.Tee(logfile, sys.stdout)
+
+DispSplit = namedtuple('DispSplit', ['index', 'mod'])
+def parse_disp_split(s):
+    idx, mod = map(int, s.split(','))
+    assert 0 <= idx < mod, "invalid --split-index (should satisfy 0 <= IDX < MOD)"
+    return DispSplit(idx, mod)
 
 # ==============================================================================
 
@@ -85,7 +98,7 @@ def main__brute_gpw(structure_path, supercell, log):
     return
 
 
-def main__elph_phonopy(structure_path, params_fd_path, supercell, log, symmetry_tol):
+def main__elph_phonopy(structure_path, params_fd_path, supercell, log, symmetry_tol, disp_split, stop_after_displacements):
     from gpaw.elph.electronphonon import ElectronPhononCoupling
     from gpaw import GPAW
 
@@ -93,6 +106,9 @@ def main__elph_phonopy(structure_path, params_fd_path, supercell, log, symmetry_
     if calc.wfs.kpt_u[0].C_nM is None:
         parprint(f"'{structure_path}': no wavefunctions! You must save your .gpw file with 'mode=\"all\"'!")
         sys.exit(1)
+
+    if calc.parameters['convergence']['bands'] == 'occupied':
+        parprint(f"'{structure_path}': WARNING: only occupied bands were converged!  Please converge some conduction band states as these are an explicit part of the electron-phonon computation.")
 
     if params_fd_path is not None:
         params_fd = json.load(open(params_fd_path))
@@ -105,6 +121,7 @@ def main__elph_phonopy(structure_path, params_fd_path, supercell, log, symmetry_
 
     DISPLACEMENT_DIST = 1e-2  # FIXME supply as arg to gpaw
 
+    # FIXME: There's definitely a race condition here when using disp_split if the file doesn't already exist.
     phonon = get_minimum_displacements(cachepath='phonopy_disp.yaml',
         unitcell=ase_atoms_to_phonopy(calc.atoms),
         supercell_matrix=np.diag(supercell),
@@ -117,23 +134,19 @@ def main__elph_phonopy(structure_path, params_fd_path, supercell, log, symmetry_
     disp_phonopy_sites, disp_carts = get_phonopy_displacements(phonon)
     disp_sites = phonopy_sc_indices_to_ase_sc_indices(disp_phonopy_sites, natoms_prim, supercell)
 
-    # GPAW displaces the center cell for some reason.
-    # elph = ElectronPhononCoupling(calc.atoms, calc=calc, supercell=supercell)
-    # displaced_cell_index = elph.offset
-    # del elph  # that's all we needed it for
-    # disp_sites = (disp_sites % natoms) + displaced_cell_index * natoms
-
     def do_structure(supercell_atoms, name):
         forces_path = f'phonons.{name}.pckl'
         elph_path = f'elph.{name}.pckl'
         if not os.path.exists(elph_path):
+            parprint(f'== computing  elph.{name}.pckl')
             elph_data = get_elph_data(supercell_atoms)
             forces = supercell_atoms.get_forces()
             pickle.dump(forces, paropen(forces_path, 'wb'), protocol=2)
             pickle.dump(elph_data, paropen(elph_path, 'wb'), protocol=2)
 
+    # FIXME: There's definitely a race condition here when using disp_split if the file doesn't already exist.
     if os.path.exists('supercell.eq.gpw'):
-        # FIXME check if this actually computes at displacements or if it just returns cached forces... :/
+        # calling .get_atoms() (instead of just accessing .atoms) is important to make sure it doesn't read cached forces
         supercell_atoms = GPAW('supercell.eq.gpw', txt=log).get_atoms()
     else:
         supercell_atoms = make_gpaw_supercell(calc, supercell, **dict(params_fd, txt=log))
@@ -141,10 +154,17 @@ def main__elph_phonopy(structure_path, params_fd_path, supercell, log, symmetry_
         supercell_atoms.get_potential_energy()
         supercell_atoms.calc.write('supercell.eq.gpw', mode='all')
 
-    do_structure(supercell_atoms, 'eq')
+    if disp_split.index == 0:
+        do_structure(supercell_atoms, 'eq')
+
     for disp_index, displaced_atoms in enumerate(iter_displaced_structures(supercell_atoms, disp_sites, disp_carts)):
         supercell_atoms.set_positions(displaced_atoms.get_positions())
-        do_structure(supercell_atoms, f'sym-{disp_index}')
+        if (disp_index + 1) % disp_split.mod == disp_split.index:  # + 1 because equilibrium was zero
+            do_structure(supercell_atoms, f'sym-{disp_index}')
+
+    if stop_after_displacements:
+        parprint("Stopping due to usage of --disp-split. Please resume without --disp-split once all other jobs finish.")
+        return
 
     # Read back from file to avoid an unnecessary SCF computation later
     supercell_atoms = GPAW('supercell.eq.gpw', txt=log).get_atoms()
