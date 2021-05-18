@@ -220,7 +220,7 @@ def calculate_raman(atoms, gpw_name, sc=(1, 1, 1), permutations=True, w_cm=None,
     ph.read()
     w_ph = np.array(ph.band_structure([[0, 0, 0]])[0])
     if w_cm is None:
-        w_cm = np.arange(int(w_ph.max()/cm) + 201) * 1.0  # Defined in cm^-1
+        w_cm = np.arange(0, int(w_ph.max()/cm) + 201, 4) * 1.0  # Defined in cm^-1
     w = w_cm*cm
     w_s = w_l-w
     nphonons = len(w_ph)
@@ -322,7 +322,17 @@ def _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, 
     # But first: Some parts common to many of the tensors.
     Ediff_el = E_el[None,:]-E_el[:,None]  # antisymmetric tensor that shows up in all denominators
     occu1 = f_n[:,None]*(1-f_n[None,:])  # occupation-based part that always appears in the 1st tensor
-    occu3 = 1-f_n[:,None]  # occupation-based part that always appears in the 3rd tensor
+    occu3 = 1-f_n[:, None]  # occupation-based part that always appears in the 3rd tensor
+
+    # There may be many bands that are fully occupied or unoccupied and therefore incapable of appearing
+    # in one or more of the axes that we sum over.  Computing these elements is a waste of time.
+    #
+    # Define three lambdas that each mask a (nbands,nbands) matrix to only have bands appropriate in that position.
+    not0 = abs(f_n) > 1e-20
+    not1 = f_n != 1
+    mask1 = lambda mat: mat[not0][:, not1]
+    mask2 = lambda mat: mat[not1][:, not1]
+    mask3 = lambda mat: mat[not1][:, not0]
 
     # And now, the 9 tensors.
     #
@@ -330,37 +340,22 @@ def _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, 
     # Thus, to reduce memory requirements, I have rewritten them to not include axes for the phonon mode or
     # raman shift;  Instead they are all lambdas that produce a matrix of size (nbands, nbands), and we'll
     # evaluate them at a single phonon/raman shift at a time).
-    f1_in_ = lambda: occu1[:,:] * mom[d_i,:,:] / (w_l-Ediff_el[:,:] + 1j*gamma_l)
-    f1_elph_ = lambda l: occu1[:,:] * elph[l,:,:] / (-w_ph[l]-Ediff_el[:,:] + 1j*gamma_l)
-    f1_out_ = lambda w: occu1[:,:] * mom[d_o,:,:] / (-w_s[w]-Ediff_el[:,:] + 1j*gamma_l)
-    f2_in_ = lambda: mom[d_i,:,:]
-    f2_elph_ = lambda l: elph[l,:,:]
-    f2_out_ = lambda: mom[d_o,:,:]
-    f3_in_ = lambda w, l: occu3[:,:] * mom[d_i,:,:] / (-w_s[w]-w_ph[l]-Ediff_el.T + 1j*gamma_l)
-    f3_elph_ = lambda w, l: occu3[:,:] * elph[l,:,:] / (w_l-w_s[w]-Ediff_el.T + 1j*gamma_l)
-    f3_out_ = lambda l: occu3[:,:] * mom[d_o,:,:] / (w_l-w_ph[l]-Ediff_el.T + 1j*gamma_l)
-
-    # f1_in_ = lambda: (f_n[:,None]*(1-f_n[None,:])*mom[d_i,:,:]
-    #     / (w_l-(E_el[None,:]-E_el[:,None]) + complex(0,gamma_l)))
-    # f1_elph_ = lambda l: (f_n[:,None]*(1-f_n[None,:])*elph[l,:,:]
-    #     / (-w_ph[l]-(E_el[None,:]-E_el[:,None]) + complex(0,gamma_l)))
-    # f1_out_ = lambda w: (f_n[:,None]*(1-f_n[None,:])*mom[d_o,:,:]
-    #     / (-w_s[w]-(E_el[None,:]-E_el[:,None]) + complex(0,gamma_l)))
-    # f2_in_ = lambda: mom[d_i,:,:]
-    # f2_elph_ = lambda l: elph[l,:,:]
-    # f2_out_ = lambda: mom[d_o,:,:]
-    # f3_in_ = lambda w, l: ((1-f_n[:,None])*mom[d_i,:,:]
-    #     / (-w_s[w]-w_ph[l]-(E_el[:,None]-E_el[None,:]) + complex(0,gamma_l)))
-    # f3_elph_ = lambda w, l: ((1-f_n[:,None])*elph[l,:,:]
-    #     / (w_l-w_s[w]-(E_el[:,None]-E_el[None,:]) + complex(0,gamma_l)))
-    # f3_out_ = lambda l: ((1-f_n[:,None])*mom[d_o,:,:]
-    #     / (w_l-w_ph[l]-(E_el[:,None]-E_el[None,:]) + complex(0,gamma_l)))
+    f1_in_ = lambda: mask1(occu1) * mask1(mom[d_i]) / (w_l-mask1(Ediff_el) + 1j*gamma_l)
+    f1_elph_ = lambda l: mask1(occu1) * mask1(elph[l]) / (-w_ph[l]-mask1(Ediff_el) + 1j*gamma_l)
+    f1_out_ = lambda w: mask1(occu1) * mask1(mom[d_o]) / (-w_s[w]-mask1(Ediff_el) + 1j*gamma_l)
+    f2_in_ = lambda: mask2(mom[d_i])
+    f2_elph_ = lambda l: mask2(elph[l])
+    f2_out_ = lambda: mask2(mom[d_o])
+    f3_in_ = lambda w, l: mask3(occu3) * mask3(mom[d_i]) / (-w_s[w]-w_ph[l]-mask3(Ediff_el.T) + 1j*gamma_l)
+    f3_elph_ = lambda w, l: mask3(occu3) * mask3(elph[l]) / (w_l-w_s[w]-mask3(Ediff_el.T) + 1j*gamma_l)
+    f3_out_ = lambda l: mask3(occu3) * mask3(mom[d_o]) / (w_l-w_ph[l]-mask3(Ediff_el.T) + 1j*gamma_l)
 
     # Some of these factors don't depend on anything and can be evaluated right now.
     f1_in = f1_in_()
     f2_in = f2_in_()
     f2_out = f2_out_()
     for l in range(len(w_ph)):
+        print("    l = {} / {}".format(l, len(w_ph)))
         # Work with factors for a single phonon mode.
         f1_elph = f1_elph_(l)
         f2_elph = f2_elph_(l)
