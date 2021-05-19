@@ -50,11 +50,21 @@ def main():
     p.add_argument('--params-fd', help='json file with GPAW params to modify for finite displacement (supercell)')
     p.add_argument('--symmetry-tol', type=float, default=1e-5)
     p.add_argument('--disp-split', metavar="IDX,MOD", type=parse_disp_split, default=None, help='Only compute displacements with index IDX modulo MOD.  If provided, this process will stop after displacements.')
+    p.add_argument('--laser-broadening', type=float, default=0.2, help='broadening in eV (imaginary part added to light freqencies)')
+    p.add_argument('--polarizations', type=lambda s: list(s.split(',')), default=[i+o for i in 'xyz' for o in 'xyz'], help='comma-separated list of raman polarizations to do (e.g. xx,xy,xz)')
+    p.add_argument('--no-permutations', dest='do_permutations', action='store_false', help='disable all but one of the raman terms. Can drastically improve performance of the raman computation')
+    p.add_argument('--laser-freqs', type=lambda s: list(map(int, s.split(','))), default=[488,532,633], help='comma-separated list of laser wavelengths (nm)')
+    p.add_argument('--shift-step', type=int, default=1, help='step for x axis of raman shift (cm-1)')
     p.set_defaults(func=lambda args, log: main__elph_phonopy(
         structure_path=args.INPUT, supercell=args.supercell, params_fd_path=args.params_fd, log=log,
         symmetry_tol=args.symmetry_tol,
         disp_split=DispSplit(0, 1) if args.disp_split is None else args.disp_split,
         stop_after_displacements=args.disp_split is not None,
+        laser_broadening=args.laser_broadening,
+        polarizations=args.polarizations,
+        laser_freqs=args.laser_freqs,
+        do_permutations=args.do_permutations,
+        shift_step=args.shift_step,
     ))
 
     p = subs.add_parser('brute-gpw')
@@ -98,7 +108,19 @@ def main__brute_gpw(structure_path, supercell, log):
     return
 
 
-def main__elph_phonopy(structure_path, params_fd_path, supercell, log, symmetry_tol, disp_split, stop_after_displacements):
+def main__elph_phonopy(
+        structure_path,
+        params_fd_path,
+        supercell,
+        log,
+        symmetry_tol,
+        disp_split,
+        stop_after_displacements,
+        laser_broadening,
+        laser_freqs,
+        polarizations,
+        do_permutations,
+        shift_step):
     from gpaw.elph.electronphonon import ElectronPhononCoupling
     from gpaw import GPAW
 
@@ -247,24 +269,25 @@ def main__elph_phonopy(structure_path, params_fd_path, supercell, log, symmetry_
         leffers.get_elph_elements(calc.atoms, gpw_name=structure_path, calc_fd=supercell_atoms.calc, sc=supercell)
 
     from ase.units import _hplanck, _c, J
-    #The Raman spectrum of three different excitation energies will be evaluated
-    wavelengths = np.array([488, 532, 633])
-    w_ls = _hplanck*_c*J/(wavelengths*10**(-9))
 
-    #The dipole transition matrix elements are found
+    # The dipole transition matrix elements are found
     if not os.path.isfile("dip_vknm.npy"):
         leffers.get_dipole_transitions(calc)
 
-    #And the three Raman spectra are calculated
-    for i, w_l in enumerate(w_ls):
-        for d_i in range(3):
-            for d_o in range(3):
-                name = "{}nm-{}{}".format(wavelengths[i], 'xyz'[d_i], 'xyz'[d_o])
-                if not os.path.isfile(f"RI_{name}.npy"):
-                    leffers.calculate_raman(calc.atoms, gpw_name=structure_path, sc=supercell, w_l = w_l, ramanname = name, d_i=d_i, d_o=d_o)
+    # And the Raman spectra are calculated
+    for laser_nm in laser_freqs:
+        w_l = _hplanck*_c*J/(laser_nm*10**(-9))
+        for polarization in polarizations:
+            if len(polarization) != 2:
+                raise ValueError(f'invalid polarization "{polarization}", should be two characters like "xy"')
+            d_i = 'xyz'.index(polarization[0])
+            d_o = 'xyz'.index(polarization[1])
+            name = "{}nm-{}".format(laser_nm, polarization)
+            if not os.path.isfile(f"RI_{name}.npy"):
+                leffers.calculate_raman(calc.atoms, permutations=do_permutations, gpw_name=structure_path, sc=supercell, w_l = w_l, ramanname = name, d_i=d_i, d_o=d_o, gamma_l=laser_broadening, shift_step=shift_step)
 
-                #And plotted
-                leffers.plot_raman(relative = True, figname = f"Raman_{name}.png", ramanname = name)
+            #And plotted
+            leffers.plot_raman(relative = True, figname = f"Raman_{name}.png", ramanname = name)
 
 
 def make_gpaw_supercell(calc: GPAW, supercell: tp.Tuple[int, int, int], **new_kw):

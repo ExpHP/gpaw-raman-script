@@ -188,8 +188,10 @@ def L(w, gamma=10/8065.544):
     lor = 0.5*gamma/(pi*((w.real)**2+0.25*gamma**2))
     return lor
 
+def gaussian(w, sigma=3/8065.544):
+    return (sigma * (2*pi)**0.5) ** -1 * np.exp(-w**2 / (2 * sigma**2))
 
-def calculate_raman(atoms, gpw_name, sc=(1, 1, 1), permutations=True, w_cm=None, ramanname=None, momname=None, basename=None, w_l=2.54066, gamma_l=0.2, d_i=0, d_o=0):
+def calculate_raman(atoms, gpw_name, sc=(1, 1, 1), permutations=True, w_cm=None, ramanname=None, momname=None, basename=None, w_l=2.54066, gamma_l=0.2, d_i=0, d_o=0, shift_step=1):
     """
     Calculates the first order Raman spectre
 
@@ -220,7 +222,7 @@ def calculate_raman(atoms, gpw_name, sc=(1, 1, 1), permutations=True, w_cm=None,
     ph.read()
     w_ph = np.array(ph.band_structure([[0, 0, 0]])[0])
     if w_cm is None:
-        w_cm = np.arange(0, int(w_ph.max()/cm) + 201, 4) * 1.0  # Defined in cm^-1
+        w_cm = np.arange(0, int(w_ph.max()/cm) + 201, shift_step) * 1.0  # Defined in cm^-1
     w = w_cm*cm
     w_s = w_l-w
     nphonons = len(w_ph)
@@ -294,7 +296,7 @@ def calculate_raman(atoms, gpw_name, sc=(1, 1, 1), permutations=True, w_cm=None,
         if w_ph[l].real >= 0:
             parprint(
                 "Phonon {} with energy = {} registered".format(l, w_ph[l]))
-            RI += (np.abs(raman_lw[l])**2)*np.array(L(w-w_ph[l]))
+            RI += (np.abs(raman_lw[l])**2)*np.array(gaussian(w-w_ph[l]))
 
     raman = np.vstack((w_cm, RI))
 
