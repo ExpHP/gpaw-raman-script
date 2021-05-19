@@ -52,6 +52,7 @@ def main():
     p.add_argument('--symmetry-tol', type=float, default=1e-5)
     p.add_argument('--disp-split', metavar="IDX,MOD", type=parse_disp_split, default=None, help='Only compute displacements with index IDX modulo MOD.  If provided, this process will stop after displacements.')
     p.add_argument('--laser-broadening', type=float, default=0.2, help='broadening in eV (imaginary part added to light freqencies)')
+    p.add_argument('--phonon-broadening', type=float, default=3, help='phonon gaussian variance in cm-1')
     p.add_argument('--polarizations', type=lambda s: list(s.split(',')), default=[i+o for i in 'xyz' for o in 'xyz'], help='comma-separated list of raman polarizations to do (e.g. xx,xy,xz)')
     p.add_argument('--no-permutations', dest='do_permutations', action='store_false', help='disable all but one of the raman terms. Can drastically improve performance of the raman computation')
     p.add_argument('--laser-freqs', type=lambda s: list(map(int, s.split(','))), default=[488,532,633], help='comma-separated list of laser wavelengths (nm)')
@@ -62,6 +63,7 @@ def main():
         disp_split=DispSplit(0, 1) if args.disp_split is None else args.disp_split,
         stop_after_displacements=args.disp_split is not None,
         laser_broadening=args.laser_broadening,
+        phonon_broadening=args.phonon_broadening,
         polarizations=args.polarizations,
         laser_freqs=args.laser_freqs,
         do_permutations=args.do_permutations,
@@ -118,6 +120,7 @@ def main__elph_phonopy(
         disp_split,
         stop_after_displacements,
         laser_broadening,
+        phonon_broadening,
         laser_freqs,
         polarizations,
         do_permutations,
@@ -290,7 +293,7 @@ def main__elph_phonopy(
             d_o = 'xyz'.index(polarization[1])
             name = "{}nm-{}".format(laser_nm, polarization)
             if not os.path.isfile(f"RI_{name}.npy"):
-                leffers.calculate_raman(calc=calc, w_ph=w_ph, permutations=do_permutations, w_l = w_l, ramanname = name, d_i=d_i, d_o=d_o, gamma_l=laser_broadening, shift_step=shift_step)
+                leffers.calculate_raman(calc=calc, w_ph=w_ph, permutations=do_permutations, w_l = w_l, ramanname = name, d_i=d_i, d_o=d_o, gamma_l=laser_broadening, phonon_sigma=phonon_broadening, shift_step=shift_step)
 
             #And plotted
             leffers.plot_raman(relative = True, figname = f"Raman_{name}.png", ramanname = name)
