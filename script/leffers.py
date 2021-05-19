@@ -191,13 +191,12 @@ def L(w, gamma=10/8065.544):
 def gaussian(w, sigma=3/8065.544):
     return (sigma * (2*pi)**0.5) ** -1 * np.exp(-w**2 / (2 * sigma**2))
 
-def calculate_raman(atoms, gpw_name, sc=(1, 1, 1), permutations=True, w_cm=None, ramanname=None, momname=None, basename=None, w_l=2.54066, gamma_l=0.2, d_i=0, d_o=0, shift_step=1):
+def calculate_raman(calc, w_ph, permutations=True, w_cm=None, ramanname=None, momname=None, basename=None, w_l=2.54066, gamma_l=0.2, d_i=0, d_o=0, shift_step=1):
     """
     Calculates the first order Raman spectre
 
     Input:
-        atoms           ASE atoms object used for the phonon calculation
-        sc              Supercell from the phonon calculation
+        w_ph            Gamma phonon energies in eV.
         permutations    Used all fermi terms (True) or only the resonant term (False)
         ramanname       Suffix for the raman.npy file
         momname         Suffix for the momentumfile
@@ -211,16 +210,11 @@ def calculate_raman(atoms, gpw_name, sc=(1, 1, 1), permutations=True, w_cm=None,
 
     parprint("Calculating the Raman spectra: Laser frequency = {}".format(w_l))
 
-    calc = GPAW(gpw_name)  # FIXME: should take calc as arg instead
-
     bzk_kc = calc.get_ibz_k_points()
     nbands = calc.wfs.bd.nbands
     nibzkpts = np.shape(bzk_kc)[0]
     cm = 1/8065.544
 
-    ph = Phonons(atoms=atoms, name="phonons", supercell=sc)
-    ph.read()
-    w_ph = np.array(ph.band_structure([[0, 0, 0]])[0])
     if w_cm is None:
         w_cm = np.arange(0, int(w_ph.max()/cm) + 201, shift_step) * 1.0  # Defined in cm^-1
     w = w_cm*cm

@@ -17,6 +17,7 @@ import numpy as np
 from ase.parallel import parprint, paropen, world
 import phonopy
 import ase.build
+import ase.phonons
 import gpaw
 from gpaw import GPAW
 from gpaw.lrtddft import LrTDDFT
@@ -274,6 +275,11 @@ def main__elph_phonopy(
     if not os.path.isfile("dip_vknm.npy"):
         leffers.get_dipole_transitions(calc)
 
+    parprint('Computing phonons')
+    ph = ase.phonons.Phonons(atoms=calc.atoms, name="phonons", supercell=supercell)
+    ph.read()
+    w_ph = np.array(ph.band_structure([[0, 0, 0]])[0])
+
     # And the Raman spectra are calculated
     for laser_nm in laser_freqs:
         w_l = _hplanck*_c*J/(laser_nm*10**(-9))
@@ -284,7 +290,7 @@ def main__elph_phonopy(
             d_o = 'xyz'.index(polarization[1])
             name = "{}nm-{}".format(laser_nm, polarization)
             if not os.path.isfile(f"RI_{name}.npy"):
-                leffers.calculate_raman(calc.atoms, permutations=do_permutations, gpw_name=structure_path, sc=supercell, w_l = w_l, ramanname = name, d_i=d_i, d_o=d_o, gamma_l=laser_broadening, shift_step=shift_step)
+                leffers.calculate_raman(calc=calc, w_ph=w_ph, permutations=do_permutations, w_l = w_l, ramanname = name, d_i=d_i, d_o=d_o, gamma_l=laser_broadening, shift_step=shift_step)
 
             #And plotted
             leffers.plot_raman(relative = True, figname = f"Raman_{name}.png", ramanname = name)
