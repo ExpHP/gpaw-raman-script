@@ -49,8 +49,14 @@ def main():
     p.add_argument('INPUT', help='.gpw file for unitcell, with structure and relevant parameters')
     p.add_argument('--supercell', type=(lambda s: tuple(map(int, s))), dest='supercell', default=(1,1,1))
     p.add_argument('--params-fd', help='json file with GPAW params to modify for finite displacement (supercell)')
-    p.add_argument('--symmetry-tol', type=float, default=1e-5)
-    p.add_argument('--disp-split', metavar="IDX,MOD", type=parse_disp_split, default=None, help='Only compute displacements with index IDX modulo MOD.  If provided, this process will stop after displacements.')
+    p.add_argument('--symmetry-tol', type=float, default=1e-5, help=
+        'Symmetry tolerance for phonopy.  This needs to be provided on every run, even after displacements are done',
+    )
+    p.add_argument('--disp-split', metavar="IDX,MOD", type=parse_disp_split, default=None, help=
+        'Only compute displacements with index IDX modulo MOD.  '
+        'If provided, this process will stop after displacements.  '
+        'Use --disp-split=stop to create everything BEFORE doing displacements. '
+        '(it is recommended to do one run with --disp-split=stop before starting parallel runs to avoid race conditions.)')
     p.add_argument('--laser-broadening', type=float, default=0.2, help='broadening in eV (imaginary part added to light freqencies)')
     p.add_argument('--phonon-broadening', type=float, default=3, help='phonon gaussian variance in cm-1')
     p.add_argument('--polarizations', type=lambda s: list(s.split(',')), default=[i+o for i in 'xyz' for o in 'xyz'], help='comma-separated list of raman polarizations to do (e.g. xx,xy,xz)')
@@ -88,6 +94,8 @@ def start_log_entry(path):
 
 DispSplit = namedtuple('DispSplit', ['index', 'mod'])
 def parse_disp_split(s):
+    if s == 'stop':
+        return 'stop'
     idx, mod = map(int, s.split(','))
     assert 0 <= idx < mod, "invalid --split-index (should satisfy 0 <= IDX < MOD)"
     return DispSplit(idx, mod)
@@ -179,6 +187,9 @@ def main__elph_phonopy(
         ensure_gpaw_setups_initialized(supercell_atoms.calc, supercell_atoms)
         supercell_atoms.get_potential_energy()
         supercell_atoms.calc.write('supercell.eq.gpw', mode='all')
+
+    if disp_split == 'stop':
+        return  # stop right before doing displacements
 
     if disp_split.index == 0:
         do_structure(supercell_atoms, 'eq')
