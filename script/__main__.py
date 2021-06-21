@@ -55,8 +55,8 @@ def main():
     p.add_argument('--disp-split', metavar="IDX,MOD", type=parse_disp_split, default=None, help=
         'Only compute displacements with index IDX modulo MOD.  '
         'If provided, this process will stop after displacements.  '
-        'Use --disp-split=stop to create everything BEFORE doing displacements. '
-        '(it is recommended to do one run with --disp-split=stop before starting parallel runs to avoid race conditions.)')
+        'Use --disp-split=stop to run the script up to the point JUST BEFORE doing displacements. '
+        '(it is recommended to do one run with --disp-split=stop before starting multiple --disp-split runs, to avoid race conditions.)')
     p.add_argument('--laser-broadening', type=float, default=0.2, help='broadening in eV (imaginary part added to light freqencies)')
     p.add_argument('--phonon-broadening', type=float, default=3, help='phonon gaussian variance in cm-1')
     p.add_argument('--polarizations', type=lambda s: list(s.split(',')), default=[i+o for i in 'xyz' for o in 'xyz'], help='comma-separated list of raman polarizations to do (e.g. xx,xy,xz)')
@@ -68,12 +68,14 @@ def main():
         symmetry_tol=args.symmetry_tol,
         disp_split=DispSplit(0, 1) if args.disp_split is None else args.disp_split,
         stop_after_displacements=args.disp_split is not None,
-        laser_broadening=args.laser_broadening,
-        phonon_broadening=args.phonon_broadening,
-        polarizations=args.polarizations,
-        laser_freqs=args.laser_freqs,
-        do_permutations=args.do_permutations,
-        shift_step=args.shift_step,
+        raman_settings=dict(
+            laser_broadening=args.laser_broadening,
+            phonon_broadening=args.phonon_broadening,
+            do_permutations=args.do_permutations,
+            polarizations=args.polarizations,
+            laser_freqs=args.laser_freqs,
+            shift_step=args.shift_step,
+        ),
     ))
 
     p = subs.add_parser('brute-gpw')
@@ -127,12 +129,7 @@ def main__elph_phonopy(
         symmetry_tol,
         disp_split,
         stop_after_displacements,
-        laser_broadening,
-        phonon_broadening,
-        laser_freqs,
-        polarizations,
-        do_permutations,
-        shift_step):
+        raman_settings):
     from gpaw.elph.electronphonon import ElectronPhononCoupling
     from gpaw import GPAW
 
@@ -206,6 +203,24 @@ def main__elph_phonopy(
     # Read back from file to avoid an unnecessary SCF computation later
     supercell_atoms = GPAW('supercell.eq.gpw', txt=log).get_atoms()
 
+    elph_do_symmetry_expansion(supercell, calc, DISPLACEMENT_DIST, phonon, disp_carts, disp_sites, supercell_atoms)
+
+    if not os.path.exists(f'elph.supercell_matrix.{calc.parameters["basis"]}.pckl'):
+        elph_do_supercell_matrix()
+
+    if not os.path.exists('gqklnn.npy'):
+        leffers.get_elph_elements(calc.atoms, gpw_name=structure_path, calc_fd=supercell_atoms.calc, sc=supercell)
+
+    # The dipole transition matrix elements are found
+    if not os.path.isfile("dip_vknm.npy"):
+        leffers.get_dipole_transitions(calc)
+
+    elph_do_raman_spectra(calc, supercell, *raman_settings)
+
+def elph_do_symmetry_expansion(supercell, calc, displacement_dist, phonon, disp_carts, disp_sites, supercell_atoms):
+    from gpaw.elph.electronphonon import ElectronPhononCoupling
+
+    natoms_prim = len(calc)
     disp_values = [read_elph_input(f'sym-{index}') for index in range(len(disp_sites))]
 
     # NOTE: phonon.symmetry includes pure translational symmetries of the supercell
@@ -256,59 +271,12 @@ def main__elph_phonopy(
                 delta_Vt, delta_dH, delta_forces = full_derivatives[natoms_prim * displaced_cell_index + a][c]
                 for sign in [-1, +1]:
                     disp = interop.AseDisplacement(atom=a, axis=c, sign=sign)
-                    disp_Vt = eq_Vt + sign * DISPLACEMENT_DIST * delta_Vt
-                    disp_dH = {k: eq_dH[k] + sign * DISPLACEMENT_DIST * delta_dH[k] for k in eq_dH}
-                    disp_forces = eq_forces + sign * DISPLACEMENT_DIST * delta_forces
+                    disp_Vt = eq_Vt + sign * displacement_dist * delta_Vt
+                    disp_dH = {k: eq_dH[k] + sign * displacement_dist * delta_dH[k] for k in eq_dH}
+                    disp_forces = eq_forces + sign * displacement_dist * delta_forces
                     pickle.dump(disp_forces, paropen(f'phonons.{disp}.pckl', 'wb'), protocol=2)
                     pickle.dump((disp_Vt, disp_dH), paropen(f'elph.{disp}.pckl', 'wb'), protocol=2)
     world.barrier()
-
-    # function to scope variables
-    def do_supercell_matrix():
-        # calculate_supercell_matrix breaks if parallelized over domains so parallelize over kpt instead
-        # (note: it prints messages from all processes but it DOES run faster with more processes)
-        supercell_atoms = GPAW('supercell.eq.gpw', txt=log, parallel={'domain': (1,1,1), 'band': 1, 'kpt': world.size}).get_atoms()
-
-        elph = ElectronPhononCoupling(calc.atoms, supercell=supercell, calc=supercell_atoms.calc)
-        elph.set_lcao_calculator(supercell_atoms.calc)
-        # to initialize bfs.M_a
-        ensure_gpaw_setups_initialized(supercell_atoms.calc, supercell_atoms)
-        elph.calculate_supercell_matrix(dump=1)
-
-        world.barrier()
-
-    if not os.path.exists(f'elph.supercell_matrix.{calc.parameters["basis"]}.pckl'):
-        do_supercell_matrix()
-
-    if not os.path.exists('gqklnn.npy'):
-        leffers.get_elph_elements(calc.atoms, gpw_name=structure_path, calc_fd=supercell_atoms.calc, sc=supercell)
-
-    from ase.units import _hplanck, _c, J
-
-    # The dipole transition matrix elements are found
-    if not os.path.isfile("dip_vknm.npy"):
-        leffers.get_dipole_transitions(calc)
-
-    parprint('Computing phonons')
-    ph = ase.phonons.Phonons(atoms=calc.atoms, name="phonons", supercell=supercell)
-    ph.read()
-    w_ph = np.array(ph.band_structure([[0, 0, 0]])[0])
-
-    # And the Raman spectra are calculated
-    for laser_nm in laser_freqs:
-        w_l = _hplanck*_c*J/(laser_nm*10**(-9))
-        for polarization in polarizations:
-            if len(polarization) != 2:
-                raise ValueError(f'invalid polarization "{polarization}", should be two characters like "xy"')
-            d_i = 'xyz'.index(polarization[0])
-            d_o = 'xyz'.index(polarization[1])
-            name = "{}nm-{}".format(laser_nm, polarization)
-            if not os.path.isfile(f"RI_{name}.npy"):
-                leffers.calculate_raman(calc=calc, w_ph=w_ph, permutations=do_permutations, w_l = w_l, ramanname = name, d_i=d_i, d_o=d_o, gamma_l=laser_broadening, phonon_sigma=phonon_broadening, shift_step=shift_step)
-
-            #And plotted
-            leffers.plot_raman(relative = True, figname = f"Raman_{name}.png", ramanname = name)
-
 
 def make_gpaw_supercell(calc: GPAW, supercell: tp.Tuple[int, int, int], **new_kw):
     atoms = calc.atoms
@@ -353,6 +321,53 @@ def get_elph_data(atoms):
     Vt_sG = calc.wfs.gd.collect(calc.hamiltonian.vt_sG, broadcast=True)
     dH_asp = interop.gpaw_broadcast_array_dict_to_dicts(calc.hamiltonian.dH_asp)
     return Vt_sG, dH_asp
+
+# function to scope variables
+def elph_do_supercell_matrix(log, calc, supercell):
+    from gpaw.elph.electronphonon import ElectronPhononCoupling
+
+    # calculate_supercell_matrix breaks if parallelized over domains so parallelize over kpt instead
+    # (note: it prints messages from all processes but it DOES run faster with more processes)
+    supercell_atoms = GPAW('supercell.eq.gpw', txt=log, parallel={'domain': (1,1,1), 'band': 1, 'kpt': world.size}).get_atoms()
+
+    elph = ElectronPhononCoupling(calc.atoms, supercell=supercell, calc=supercell_atoms.calc)
+    elph.set_lcao_calculator(supercell_atoms.calc)
+    # to initialize bfs.M_a
+    ensure_gpaw_setups_initialized(supercell_atoms.calc, supercell_atoms)
+    elph.calculate_supercell_matrix(dump=1)
+
+    world.barrier()
+
+def elph_do_raman_spectra(calc, supercell, laser_freqs, do_permutations, laser_broadening, phonon_broadening, shift_step, polarizations):
+    from ase.units import _hplanck, _c, J
+
+    parprint('Computing phonons')
+    ph = ase.phonons.Phonons(atoms=calc.atoms, name="phonons", supercell=supercell)
+    ph.read()
+    w_ph = np.array(ph.band_structure([[0, 0, 0]])[0])
+
+    if calc.world.rank == 0:
+        np.save('frequencies.npy', w_ph * 8065.544)  # frequencies in cm-1
+
+    # And the Raman spectra are calculated
+    for laser_nm in laser_freqs:
+        w_l = _hplanck*_c*J/(laser_nm*10**(-9))
+        for polarization in polarizations:
+            if len(polarization) != 2:
+                raise ValueError(f'invalid polarization "{polarization}", should be two characters like "xy"')
+            d_i = 'xyz'.index(polarization[0])
+            d_o = 'xyz'.index(polarization[1])
+            name = "{}nm-{}".format(laser_nm, polarization)
+            if not os.path.isfile(f"RI_{name}.npy"):
+                leffers.calculate_raman(
+                    calc=calc, w_ph=w_ph, permutations=do_permutations,
+                    w_l=w_l, ramanname=name, d_i=d_i, d_o=d_o,
+                    gamma_l=laser_broadening, phonon_sigma=phonon_broadening,
+                    shift_step=shift_step,
+                )
+
+            #And plotted
+            leffers.plot_raman(relative = True, figname = f"Raman_{name}.png", ramanname = name)
 
 def elph_callbacks(wfs_with_symmetry: gpaw.wavefunctions.base.WaveFunctions, supercell):
     elphsym = symmetry.ElphGpawSymmetrySource.from_wfs_with_symmetry(wfs_with_symmetry)
@@ -440,9 +455,6 @@ def main__raman_ch4(structure, supercell, log):
     get_polarizability = functools.partial(polarizability, omega=omega, form='v', tensor=True)
     subtract_equilibrium_polarizability = False
 
-    # for testing purposes
-    also_try_brute_force_raman = False
-
     #=============================================
     # Process
 
@@ -493,18 +505,6 @@ def main__raman_ch4(structure, supercell, log):
     get_mode_raman(outpath='mode-raman-gamma.npy',
             eigendata=gamma_eigendata, cart_pol_derivs=cart_pol_derivs,
     )
-
-    if also_try_brute_force_raman:
-        eq_atoms = Cluster(phonopy_atoms_to_ase(phonon.supercell))
-        eq_atoms.pbc = pbc
-        if raman_grid_sep != relax_grid_sep:
-            eq_atoms.minimal_box(vacuum_sep, h=raman_grid_sep)
-        eq_atoms.calc = make_calc_raman()
-
-        get_mode_raman_brute_force(
-            eigendata=gamma_eigendata, atoms=eq_atoms, displacement_distance=displacement_distance,
-            get_polarizability=get_polarizability, ex_kw=ex_kw,
-        )
 
 # ==================================
 # Steps of the procedure.  Each function caches their results, for restart purposes.
@@ -695,40 +695,6 @@ def get_mode_raman(outpath, eigendata, cart_pol_derivs):
         ).reshape((3, 3))
         mode_pol_derivs.append(mode_pol_deriv)
     np.save(outpath, mode_pol_derivs)
-
-
-# For testing purposes: Compute raman by getting polarizability at +/- displacements along mode
-def get_mode_raman_brute_force(eigendata, atoms, displacement_distance, get_polarizability, ex_kw):
-    if os.path.exists('mode-raman-gamma-expected.npy'):
-        parprint('Found existing mode-raman-gamma-expected.npy')
-        return
-    world.barrier()
-    parprint('Computing mode raman tensors... (mode-raman-gamma-expected.npy)')
-
-    eq_positions = atoms.get_positions().copy()
-
-    mode_pol_derivs = []
-    for i,row in enumerate(eigendata['eigenvectors']):
-        mode_displacements = eigendata['atom_masses'][:, None] ** -0.5 * row.reshape(-1, 3)
-        mode_displacements /= np.linalg.norm(mode_displacements)
-
-        atoms.set_positions(eq_positions + mode_displacements * displacement_distance)
-        atoms.get_forces()
-        # FIXME: These seemingly redundant reads served a purpose at some point but I never documented it.
-        #        Now that LrTDDFT has this "redesigned API" they might not even do anything at all? Test this.
-        LrTDDFT(atoms.calc, **ex_kw).write(f'mode-raman-{i}+.ex.gz')
-        pol_plus = get_polarizability(LrTDDFT.read(f'mode-raman-{i}+.ex.gz', **ex_kw))
-
-        atoms.set_positions(eq_positions - mode_displacements * displacement_distance)
-        atoms.get_forces()
-        LrTDDFT(atoms.calc, **ex_kw).write(f'mode-raman-{i}-.ex.gz')
-        pol_minus = get_polarizability(LrTDDFT.read(f'mode-raman-{i}-.ex.gz', **ex_kw))
-
-        mode_pol_derivs.append((pol_plus - pol_minus)/(2*displacement_distance))
-
-    if world.rank == 0:
-        np.save('mode-raman-gamma-expected.npy', mode_pol_derivs)
-    world.barrier()
 
 #----------------
 
