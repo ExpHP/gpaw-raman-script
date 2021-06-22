@@ -78,10 +78,7 @@ def get_elph_elements(atoms, gpw_name, calc_fd, sc=(1, 1, 1), basename=None):
 
     if world.rank == 0:
         print("Saving the elctron-phonon coupling matrix")
-        if basename is None:
-            np.save("gqklnn.npy", np.array(g_qklnn))
-        else:
-            np.save("gqklnn_{}.npy".format(basename), np.array(g_qklnn))
+        np.save("gqklnn{}.npy".format(make_suffix(basename)), np.array(g_qklnn))
 
 def get_dipole_transitions(calc, momname=None, basename=None):
     """
@@ -177,10 +174,7 @@ def get_dipole_transitions(calc, momname=None, basename=None):
     world.sum(dip_vknm)
 
     if world.rank == 0:
-        if momname is None:
-            np.save('dip_vknm.npy', dip_vknm)
-        else:
-            np.save('dip_vknm_{}.npy'.format(momname), dip_vknm)
+        np.save('dip_vknm{}.npy'.format(make_suffix(momname)), dip_vknm)
 
 
 def L(w, gamma=10/8065.544):
@@ -191,7 +185,13 @@ def L(w, gamma=10/8065.544):
 def gaussian(w, sigma=3/8065.544):
     return (sigma * (2*pi)**0.5) ** -1 * np.exp(-w**2 / (2 * sigma**2))
 
-def calculate_raman(calc, w_ph, permutations=True, w_cm=None, ramanname=None, momname=None, basename=None, w_l=2.54066, gamma_l=0.2, d_i=0, d_o=0, shift_step=1, phonon_sigma=3):
+def make_suffix(s):
+    if s is None:
+        return ''
+    else:
+        return '_' + s
+
+def calculate_raman(calc, w_ph, permutations=True, w_cm=None, ramanname=None, momname=None, basename=None, w_l=2.54066, gamma_l=0.2, d_i=0, d_o=0, shift_step=1, phonon_sigma=3, write_mode_intensities=False):
     """
     Calculates the first order Raman spectre
 
@@ -226,14 +226,8 @@ def calculate_raman(calc, w_ph, permutations=True, w_cm=None, ramanname=None, mo
     kcomm = calc.wfs.kd.comm
     world = calc.wfs.world
     if kcomm.rank == 0:
-        if momname is None:
-            mom = np.load("dip_vknm.npy")  # [:,k,:,:]dim, k
-        else:
-            mom = np.load("dip_vknm_{}.npy".format(momname))  # [:,k,:,:]dim, k
-        if basename is None:
-            elph = np.load("gqklnn.npy")[0]  # [0,k,l,:,:]
-        else:
-            elph = np.load("gqklnn_{}.npy".format(basename))[0]  # [0,k,l,n,m]
+        mom = np.load("dip_vknm{}.npy".format(make_suffix(momname)))  # [:,k,:,:]dim, k
+        elph = np.load("gqklnn{}.npy".format(make_suffix(basename)))[0]  # [0,k,l,n,m]
 
     parprint("Distributing coupling terms")
     k_info = {}
@@ -285,6 +279,11 @@ def calculate_raman(calc, w_ph, permutations=True, w_cm=None, ramanname=None, mo
 
     kcomm.sum(raman_lw)
 
+    if write_mode_intensities:
+        # write values without the gaussian on shift
+        if world.rank == 0:
+            np.save("ModeI{}.npy".format(make_suffix(ramanname)), raman_lw[:, 0])
+
     RI = np.zeros(len(w))
     for l in range(nphonons):
         if w_ph[l].real >= 0:
@@ -295,10 +294,7 @@ def calculate_raman(calc, w_ph, permutations=True, w_cm=None, ramanname=None, mo
     raman = np.vstack((w_cm, RI))
 
     if world.rank == 0:
-        if ramanname is None:
-            np.save("RI.npy", raman)
-        else:
-            np.save("RI_{}.npy".format(ramanname), raman)
+        np.save("RI{}.npy".format(make_suffix(ramanname)), raman)
 
 def _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, w_s, mom, elph, f_n, E_el):
     # This is a refactoring of some code by Ulrik Leffers in https://gitlab.com/gpaw/gpaw/-/merge_requests/563,
@@ -375,56 +371,6 @@ def _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, 
                 raman_lw[l, w] += np.einsum('si,ij,js->', f1_elph, f2_out, f3_in)
                 raman_lw[l, w] += np.einsum('si,ij,js->', f1_out, f2_elph, f3_in)
 
-# Closer to the original code.
-def _old__add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, w_s, mom, elph, f_n, E_el):
-    w = w_l-w_s
-    raman_lw += np.einsum('si,lij,ljs->l',
-        f_n[:,None]*(1-f_n[None,:])*mom[d_i]
-            / (w_l-(E_el[None,:]-E_el[:,None]) + complex(0,gamma_l)),
-        elph,
-        (1-f_n[None,:,None])*mom[d_o,None,:,:]
-            / (w_l-w_ph[:,None,None]-(E_el[None,:,None]-E_el[None,None,:]) + complex(0,gamma_l)),
-    )[:,None]
-
-    # FIXME: GOOD GOD WHAT IS THIS
-    if permutations:
-        raman_lw += np.einsum('si,wljs,ij->lw',
-            f_n[:, None]*(1-f_n[None, :])*mom[d_i]
-                / (w_l-(E_el[None, :]-E_el[:, None]) + complex(0, gamma_l)),
-            (1-f_n[None, None, :, None])*elph[None, :, :, :]
-                / (w[:, None, None, None]-(E_el[None, None, :, None]-E_el[None, None, None, :]) + complex(0, gamma_l)),
-            mom[d_o],
-        )
-        raman_lw += np.einsum('wsi,lij,wljs->lw',
-            f_n[None,:,None]*(1-f_n[None,None,:])*mom[d_o,None,:,:]
-                / (-w_s[:,None,None]-(E_el[None,None,:]-E_el[None,:,None]) + complex(0,gamma_l)),
-            elph,
-            (1-f_n[None,None,:,None])*mom[d_i,None,None,:,:]
-                / (-w_s[:,None,None,None]-w_ph[None,:,None,None]-(E_el[None,None,:,None]-E_el[None,None,None,:]) + complex(0,gamma_l)),
-        )
-        raman_lw += np.einsum('wsi,ij,wljs->lw',
-            f_n[None,:,None]*(1-f_n[None,None,:])*mom[d_o,None,:,:]
-                / (-w_s[:,None,None]-(E_el[None,None,:]-E_el[None,:,None]) + complex(0,gamma_l)),
-            mom[d_i],
-            (1-f_n[None,None,:,None])*elph[None,:,:,:]
-                / (-w_s[:,None,None,None]+w_l-(E_el[None,None,:,None]-E_el[None,None,None,:]) + complex(0,gamma_l)),
-        )
-        raman_lw += np.einsum('lsi,ij,ljs->l',
-            f_n[None,:,None]*(1-f_n[None,None,:])*elph
-                / (-w_ph[:,None,None]-(E_el[None,None,:]-E_el[None,:,None]) + complex(0,gamma_l)),
-            mom[d_i],
-            (1-f_n[None,:,None])*mom[d_o,None,:,:]
-                / (-w_ph[:,None,None]+w_l-(E_el[None,:,None]-E_el[None,None,:]) + complex(0,gamma_l)),
-        )[:,None]
-        raman_lw += np.einsum('lsi,ij,wljs->lw',
-            f_n[None,:,None]*(1-f_n[None,None,:])*elph
-                / (-w_ph[:,None,None]-(E_el[None,None,:]-E_el[None,:,None]) + complex(0,gamma_l)),
-            mom[d_o],
-            (1-f_n[None,None,:,None])*mom[d_i,None,None,:,:]
-                / (-w_ph[None,:,None,None]-w_s[:,None,None,None]-(E_el[None,None,:,None]-E_el[None,None,None,:]) + complex(0, gamma_l)),
-        )
-
-
 def plot_raman(yscale="linear", figname="Raman.png", relative=False, w_min=None, w_max=None, ramanname=None):
     """
         Plots a given Raman spectrum
@@ -451,14 +397,12 @@ def plot_raman(yscale="linear", figname="Raman.png", relative=False, w_min=None,
     # Plotting function
 
     if world.rank == 0:
+        legend = isinstance(ramanname, [list, tuple])
         if ramanname is None:
-            legend = False
             RI_name = ["RI.npy"]
         elif type(ramanname) == list:
-            legend = True
             RI_name = ["RI_{}.npy".format(name) for name in ramanname]
         else:
-            legend = False
             RI_name = ["RI_{}.npy".format(ramanname)]
 
         ylabel = "Intensity (arb. units)"

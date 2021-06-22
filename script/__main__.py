@@ -60,6 +60,7 @@ def main():
     p.add_argument('--laser-broadening', type=float, default=0.2, help='broadening in eV (imaginary part added to light freqencies)')
     p.add_argument('--phonon-broadening', type=float, default=3, help='phonon gaussian variance in cm-1')
     p.add_argument('--polarizations', type=lambda s: list(s.split(',')), default=[i+o for i in 'xyz' for o in 'xyz'], help='comma-separated list of raman polarizations to do (e.g. xx,xy,xz)')
+    p.add_argument('--write-mode-intensities', action='store_true', help='write mode intensities to a file.  Requires --no-permutations.')
     p.add_argument('--no-permutations', dest='do_permutations', action='store_false', help='disable all but one of the raman terms. Can drastically improve performance of the raman computation')
     p.add_argument('--laser-freqs', type=lambda s: list(map(int, s.split(','))), default=[488,532,633], help='comma-separated list of laser wavelengths (nm)')
     p.add_argument('--shift-step', type=int, default=1, help='step for x axis of raman shift (cm-1)')
@@ -75,6 +76,7 @@ def main():
             polarizations=args.polarizations,
             laser_freqs=args.laser_freqs,
             shift_step=args.shift_step,
+            write_mode_intensities=args.write_mode_intensities,
         ),
     ))
 
@@ -132,6 +134,10 @@ def main__elph_phonopy(
         raman_settings):
     from gpaw.elph.electronphonon import ElectronPhononCoupling
     from gpaw import GPAW
+
+    if raman_settings['write_mode_intensities'] and raman_settings['do_permutations']:
+        parprint(f"--write-mode-intensities requires --no-permutations")
+        sys.exit(1)
 
     calc = GPAW(structure_path)
     if calc.wfs.kpt_u[0].C_nM is None:
@@ -215,7 +221,7 @@ def main__elph_phonopy(
     if not os.path.isfile("dip_vknm.npy"):
         leffers.get_dipole_transitions(calc)
 
-    elph_do_raman_spectra(calc, supercell, *raman_settings)
+    elph_do_raman_spectra(calc, supercell, **raman_settings)
 
 def elph_do_symmetry_expansion(supercell, calc, displacement_dist, phonon, disp_carts, disp_sites, supercell_atoms):
     from gpaw.elph.electronphonon import ElectronPhononCoupling
@@ -338,7 +344,7 @@ def elph_do_supercell_matrix(log, calc, supercell):
 
     world.barrier()
 
-def elph_do_raman_spectra(calc, supercell, laser_freqs, do_permutations, laser_broadening, phonon_broadening, shift_step, polarizations):
+def elph_do_raman_spectra(calc, supercell, laser_freqs, do_permutations, laser_broadening, phonon_broadening, shift_step, polarizations, write_mode_intensities):
     from ase.units import _hplanck, _c, J
 
     parprint('Computing phonons')
@@ -363,7 +369,7 @@ def elph_do_raman_spectra(calc, supercell, laser_freqs, do_permutations, laser_b
                     calc=calc, w_ph=w_ph, permutations=do_permutations,
                     w_l=w_l, ramanname=name, d_i=d_i, d_o=d_o,
                     gamma_l=laser_broadening, phonon_sigma=phonon_broadening,
-                    shift_step=shift_step,
+                    shift_step=shift_step, write_mode_intensities=write_mode_intensities,
                 )
 
             #And plotted
