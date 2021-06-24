@@ -4,7 +4,11 @@ Implements https://www.nature.com/articles/s41467-020-16529-6
 
 (Note: since starting development on this, gpaw now also has its own implementation of this method currently in development, but it doesn't allow symmetry-reduced displacements)
 
----
+## Guided example
+
+https://gist.github.com/ExpHP/dce34c5008a0a1dffaf2bf2a1dfe7db9
+
+## Notice
 
 Note: currently depends on this specific patched form of gpaw:
 
