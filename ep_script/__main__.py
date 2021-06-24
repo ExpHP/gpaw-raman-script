@@ -212,7 +212,7 @@ def main__elph_phonopy(
     elph_do_symmetry_expansion(supercell, calc, DISPLACEMENT_DIST, phonon, disp_carts, disp_sites, supercell_atoms)
 
     if not os.path.exists(f'elph.supercell_matrix.{calc.parameters["basis"]}.pckl'):
-        elph_do_supercell_matrix()
+        elph_do_supercell_matrix(log=log, calc=calc, supercell=supercell)
 
     if not os.path.exists('gqklnn.npy'):
         leffers.get_elph_elements(calc.atoms, gpw_name=structure_path, calc_fd=supercell_atoms.calc, sc=supercell)
