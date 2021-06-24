@@ -226,7 +226,7 @@ def main__elph_phonopy(
 def elph_do_symmetry_expansion(supercell, calc, displacement_dist, phonon, disp_carts, disp_sites, supercell_atoms):
     from gpaw.elph.electronphonon import ElectronPhononCoupling
 
-    natoms_prim = len(calc)
+    natoms_prim = len(calc.get_atoms())
     disp_values = [read_elph_input(f'sym-{index}') for index in range(len(disp_sites))]
 
     # NOTE: phonon.symmetry includes pure translational symmetries of the supercell

@@ -397,7 +397,7 @@ def plot_raman(yscale="linear", figname="Raman.png", relative=False, w_min=None,
     # Plotting function
 
     if world.rank == 0:
-        legend = isinstance(ramanname, [list, tuple])
+        legend = isinstance(ramanname, (list, tuple))
         if ramanname is None:
             RI_name = ["RI.npy"]
         elif type(ramanname) == list:
