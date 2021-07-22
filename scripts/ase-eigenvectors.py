@@ -25,7 +25,7 @@ def main():
     parser.add_argument('GPW', help="gpaw GPW file for atoms")
     parser.add_argument('--name', default='phonons', help="name for ASE force files (e.g. 'phonon')")
     parser.add_argument('--manual', action='store_true', help='use own code to diagonalize instead of ASE (for debugging)')
-    parser.add_argument('--method', default=DEFAULT_METHOD, help='set method for ASE (standard, fredriksen) (no effect for --manual)')
+    parser.add_argument('--method', default=DEFAULT_METHOD, help='set method for ASE (standard, frederiksen) (no effect for --manual)')
     parser.add_argument('--no-acoustic', action='store_false', dest='acoustic', help='enable acoustic sum rule option for ASE (no effect with --manual)')
     parser.add_argument('--symmetrize', type=int, default=DEFAULT_SYMMETRIZE, help='set force constant symmetrization iterations for ASE (no effect with --manual)')
     parser.add_argument('--eigensolver', choices=list(EIGENSOLVER_CHOICES), default='np-eig', help=f'choices: {", ".join(EIGENSOLVER_CHOICES)}')

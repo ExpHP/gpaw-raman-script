@@ -96,8 +96,8 @@ def write_ase_forces(prefix, phonon, eq_forces = 0):
     for atom in range(fcs.shape[0]):
         for axis in range(3):
             xyz = 'xyz'[axis]
-            save_array(f'{prefix}.{atom}{xyz}+.pckl', eq_forces + fcs[atom, axis] * amplitude)
-            save_array(f'{prefix}.{atom}{xyz}-.pckl', eq_forces - fcs[atom, axis] * amplitude)
+            save_array(f'{prefix}.{atom}{xyz}+.pckl', eq_forces - fcs[atom, :, axis, :] * amplitude)
+            save_array(f'{prefix}.{atom}{xyz}-.pckl', eq_forces + fcs[atom, :, axis, :] * amplitude)
 
 # ------------------------------------------------------
 
