@@ -62,7 +62,12 @@ def main():
     p.add_argument('--polarizations', type=lambda s: list(s.split(',')), default=[i+o for i in 'xyz' for o in 'xyz'], help='comma-separated list of raman polarizations to do (e.g. xx,xy,xz)')
     p.add_argument('--write-mode-intensities', action='store_true', help='write mode intensities to a file.  Requires --no-permutations.')
     p.add_argument('--no-permutations', dest='do_permutations', action='store_false', help='disable all but one of the raman terms. Can drastically improve performance of the raman computation')
-    p.add_argument('--laser-freqs', type=lambda s: list(map(int, s.split(','))), default=[488,532,633], help='comma-separated list of laser wavelengths (nm)')
+    DEFAULT_LASER_FREQS = '488,532,633nm'
+    p.add_argument('--laser-freqs',
+        type=parse_laser_freqs, default=parse_laser_freqs(DEFAULT_LASER_FREQS), help=
+        'comma-separated list of laser wavelengths, followed by an optional unit (else assumed nm). '
+        f'Default: {repr(DEFAULT_LASER_FREQS)}.  Available units: {", ".join(LASER_UNIT_CONVERSIONS)}')
+
     p.add_argument('--shift-step', type=int, default=1, help='step for x axis of raman shift (cm-1)')
     p.set_defaults(func=lambda args, log: main__elph_phonopy(
         structure_path=args.INPUT, supercell=args.supercell, params_fd_path=args.params_fd, log=log,
@@ -74,7 +79,7 @@ def main():
             phonon_broadening=args.phonon_broadening,
             do_permutations=args.do_permutations,
             polarizations=args.polarizations,
-            laser_freqs=args.laser_freqs,
+            lasers=args.laser_freqs,
             shift_step=args.shift_step,
             write_mode_intensities=args.write_mode_intensities,
         ),
@@ -104,6 +109,44 @@ def parse_disp_split(s):
     assert 0 <= idx < mod, "invalid --split-index (should satisfy 0 <= IDX < MOD)"
     return DispSplit(idx, mod)
 
+LASER_UNIT_CONVERSIONS = {
+    'nm': lambda x: x,
+    # constant = c / (ev / h) / nm
+    'eV': lambda x: 1239.84197386209 / x
+}
+def parse_laser_freqs(s):
+    from argparse import ArgumentTypeError
+    import re
+    unit_match = re.search('[a-zA-Z][a-zA-Z0-9_-]* *$', s)
+    if unit_match:
+        split = unit_match.start()
+        s, unit_str = s[:split].strip(), s[split:].strip()
+    else:
+        unit_str = 'nm'
+
+    def parse_float(s):
+        try:
+            return float(s)
+        except ValueError:
+            raise ArgumentTypeError(f'invalid float value: {s}')
+
+    value_strs = [word.strip() for word in s.split(',')]
+    value_floats = [parse_float(word) for word in value_strs]
+    value_texts = [f'{word}{unit_str}' for word in value_strs]
+    try:
+        to_nm = LASER_UNIT_CONVERSIONS[unit_str]
+    except KeyError:
+        raise ArgumentTypeError(f'unit {repr(unit_str)} is not implemented for lasers')
+
+    return [Laser(text, to_nm(x)) for (text, x) in zip(value_texts, value_floats)]
+
+class Laser:
+    wavelength_nm: float
+    text: str
+    def __init__(self, text, wavelength_nm):
+        self.text = text
+        self.wavelength_nm = wavelength_nm
+
 # ==============================================================================
 
 def main__brute_gpw(structure_path, supercell, log):
@@ -132,7 +175,6 @@ def main__elph_phonopy(
         disp_split,
         stop_after_displacements,
         raman_settings):
-    from gpaw.elph.electronphonon import ElectronPhononCoupling
     from gpaw import GPAW
 
     if raman_settings['write_mode_intensities'] and raman_settings['do_permutations']:
@@ -344,7 +386,7 @@ def elph_do_supercell_matrix(log, calc, supercell):
 
     world.barrier()
 
-def elph_do_raman_spectra(calc, supercell, laser_freqs, do_permutations, laser_broadening, phonon_broadening, shift_step, polarizations, write_mode_intensities):
+def elph_do_raman_spectra(calc, supercell, lasers, do_permutations, laser_broadening, phonon_broadening, shift_step, polarizations, write_mode_intensities):
     from ase.units import _hplanck, _c, J
 
     parprint('Computing phonons')
@@ -356,14 +398,14 @@ def elph_do_raman_spectra(calc, supercell, laser_freqs, do_permutations, laser_b
         np.save('frequencies.npy', w_ph * 8065.544)  # frequencies in cm-1
 
     # And the Raman spectra are calculated
-    for laser_nm in laser_freqs:
-        w_l = _hplanck*_c*J/(laser_nm*10**(-9))
+    for laser in lasers:
+        w_l = _hplanck*_c*J/(laser.wavelength_nm * 10**(-9))
         for polarization in polarizations:
             if len(polarization) != 2:
                 raise ValueError(f'invalid polarization "{polarization}", should be two characters like "xy"')
             d_i = 'xyz'.index(polarization[0])
             d_o = 'xyz'.index(polarization[1])
-            name = "{}nm-{}".format(laser_nm, polarization)
+            name = "{}-{}".format(laser.text, polarization)
             if not os.path.isfile(f"RI_{name}.npy"):
                 leffers.calculate_raman(
                     calc=calc, w_ph=w_ph, permutations=do_permutations,
@@ -372,7 +414,7 @@ def elph_do_raman_spectra(calc, supercell, laser_freqs, do_permutations, laser_b
                     shift_step=shift_step, write_mode_intensities=write_mode_intensities,
                 )
 
-            #And plotted
+            # And plotted
             leffers.plot_raman(relative = True, figname = f"Raman_{name}.png", ramanname = name)
 
 def elph_callbacks(wfs_with_symmetry: gpaw.wavefunctions.base.WaveFunctions, supercell):
