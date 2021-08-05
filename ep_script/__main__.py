@@ -30,6 +30,8 @@ yaml = YAML(typ='rt')
 import typing as tp
 T = tp.TypeVar("T")
 
+DISPLACEMENT_DIST = 1e-2  # FIXME supply as arg to gpaw
+
 def main():
     import argparse
 
@@ -38,43 +40,32 @@ def main():
 
     parser.set_defaults(func=lambda args, log: parser.error('missing test name'))
 
-    # Old script is still here so that we can maintain it and work towards
-    # factoring out commonalities with the new script.
-    p = subs.add_parser('raman')
-    p.set_defaults(structure='ch4')
-    p.add_argument('--mos2', action='store_const', dest='structure', const='mos2')
-    p.add_argument('--supercell', type=(lambda s: tuple(map(int, s))), dest='supercell', default=(1,1,1))
-    p.set_defaults(func=lambda args, log: main__raman_ch4(structure=args.structure, supercell=args.supercell, log=log))
-    p = subs.add_parser('ep')
-    p.add_argument('INPUT', help='.gpw file for unitcell, with structure and relevant parameters')
-    p.add_argument('--supercell', type=(lambda s: tuple(map(int, s))), dest='supercell', default=(1,1,1))
-    p.add_argument('--params-fd', help='json file with GPAW params to modify for finite displacement (supercell)')
-    p.add_argument('--symmetry-tol', type=float, default=1e-5, help=
-        'Symmetry tolerance for phonopy.  This needs to be provided on every run, even after displacements are done',
-    )
-    p.add_argument('--disp-split', metavar="IDX,MOD", type=parse_disp_split, default=None, help=
-        'Only compute displacements with index IDX modulo MOD.  '
-        'If provided, this process will stop after displacements.  '
-        'Use --disp-split=stop to run the script up to the point JUST BEFORE doing displacements. '
-        '(it is recommended to do one run with --disp-split=stop before starting multiple --disp-split runs, to avoid race conditions.)')
-    p.add_argument('--laser-broadening', type=float, default=0.2, help='broadening in eV (imaginary part added to light freqencies)')
-    p.add_argument('--phonon-broadening', type=float, default=3, help='phonon gaussian variance in cm-1')
-    p.add_argument('--polarizations', type=lambda s: list(s.split(',')), default=[i+o for i in 'xyz' for o in 'xyz'], help='comma-separated list of raman polarizations to do (e.g. xx,xy,xz)')
-    p.add_argument('--write-mode-intensities', action='store_true', help='write mode intensities to a file.  Requires --no-permutations.')
-    p.add_argument('--no-permutations', dest='do_permutations', action='store_false', help='disable all but one of the raman terms. Can drastically improve performance of the raman computation')
-    DEFAULT_LASER_FREQS = '488,532,633nm'
-    p.add_argument('--laser-freqs',
-        type=parse_laser_freqs, default=parse_laser_freqs(DEFAULT_LASER_FREQS), help=
-        'comma-separated list of laser wavelengths, followed by an optional unit (else assumed nm). '
-        f'Default: {repr(DEFAULT_LASER_FREQS)}.  Available units: {", ".join(LASER_UNIT_CONVERSIONS)}')
+    def add_standard_arguments(p):
+        p.add_argument('INPUT', help='.gpw file for unitcell, with structure and relevant parameters')
+        p.add_argument('--supercell', type=(lambda s: tuple(map(int, s))), dest='supercell', default=(1,1,1))
+        p.add_argument('--params-fd', help='json file with GPAW params to modify for finite displacement (supercell)')
+        p.add_argument('--symmetry-tol', type=float, default=1e-5, help=
+            'Symmetry tolerance for phonopy.  This needs to be provided on every run, even after displacements are done',
+        )
 
-    p.add_argument('--shift-step', type=int, default=1, help='step for x axis of raman shift (cm-1)')
-    p.set_defaults(func=lambda args, log: main__elph_phonopy(
-        structure_path=args.INPUT, supercell=args.supercell, params_fd_path=args.params_fd, log=log,
-        symmetry_tol=args.symmetry_tol,
-        disp_split=DispSplit(0, 1) if args.disp_split is None else args.disp_split,
-        stop_after_displacements=args.disp_split is not None,
-        raman_settings=dict(
+    def add_raman_arguments(p):
+        p.add_argument('--laser-broadening', type=float, default=0.2, help='broadening in eV (imaginary part added to light freqencies)')
+        p.add_argument('--phonon-broadening', type=float, default=3, help='phonon gaussian variance in cm-1')
+        p.add_argument('--polarizations', type=lambda s: list(s.split(',')), default=[i+o for i in 'xyz' for o in 'xyz'], help='comma-separated list of raman polarizations to do (e.g. xx,xy,xz)')
+        p.add_argument('--write-mode-intensities', action='store_true', help='write mode intensities to a file.  Requires --no-permutations.')
+        p.add_argument('--no-permutations', dest='do_permutations', action='store_false', help='disable all but one of the raman terms. Can drastically improve performance of the raman computation')
+        DEFAULT_LASER_FREQS = '488,532,633nm'
+        p.add_argument('--laser-freqs',
+            type=parse_laser_freqs, default=parse_laser_freqs(DEFAULT_LASER_FREQS), help=
+            'comma-separated list of laser wavelengths, followed by an optional unit (else assumed nm). '
+            f'Default: {repr(DEFAULT_LASER_FREQS)}.  Available units: {", ".join(LASER_UNIT_CONVERSIONS)}')
+
+        p.add_argument('--shift-step', type=int, default=1, help='step for x axis of raman shift (cm-1)')
+
+    def extract_raman_arguments(p, args):
+        if args.write_mode_intensities and args.do_permutations:
+            p.error(f"--write-mode-intensities requires --no-permutations")
+        return dict(
             laser_broadening=args.laser_broadening,
             phonon_broadening=args.phonon_broadening,
             do_permutations=args.do_permutations,
@@ -82,13 +73,37 @@ def main():
             lasers=args.laser_freqs,
             shift_step=args.shift_step,
             write_mode_intensities=args.write_mode_intensities,
-        ),
+        )
+
+    p = subs.add_parser('ep')
+    add_standard_arguments(p)
+    add_raman_arguments(p)
+    p.add_argument('--disp-split', metavar="IDX,MOD", type=parse_disp_split, default=None, help=
+        'Only compute displacements with index IDX modulo MOD.  '
+        'If provided, this process will stop after displacements.  '
+        'Use --disp-split=stop to run the script up to the point JUST BEFORE doing displacements. '
+        '(it is recommended to do one run with --disp-split=stop before starting multiple --disp-split runs, to avoid race conditions.)')
+
+    p.set_defaults(func=lambda args, log: main_elph(
+        structure_path=args.INPUT, supercell=args.supercell, params_fd_path=args.params_fd, log=log,
+        symmetry_tol=args.symmetry_tol,
+        disp_split=DispSplit(0, 1) if args.disp_split is None else args.disp_split,
+        stop_after_displacements=args.disp_split is not None,
+        raman_settings=extract_raman_arguments(p, args),
+    ))
+
+    p = subs.add_parser('ep-raman')
+    add_standard_arguments(p)
+    add_raman_arguments(p)
+    p.set_defaults(func=lambda args, log: main_elph__after_symmetry(
+        structure_path=args.INPUT, supercell=args.supercell, log=log,
+        raman_settings=extract_raman_arguments(p, args),
     ))
 
     p = subs.add_parser('brute-gpw')
     p.add_argument('INPUT', help='.gpw file for unitcell, with structure and relevant parameters')
     p.add_argument('--supercell', type=(lambda s: tuple(map(int, s))), dest='supercell', default=(1,1,1))
-    p.set_defaults(func=lambda args, log: main__brute_gpw(structure_path=args.INPUT, supercell=args.supercell, log=log))
+    p.set_defaults(func=lambda args, log: main_brute_gpw(structure_path=args.INPUT, supercell=args.supercell, log=log))
     args = parser.parse_args()
 
     with start_log_entry('gpaw.log') as log:
@@ -149,7 +164,7 @@ class Laser:
 
 # ==============================================================================
 
-def main__brute_gpw(structure_path, supercell, log):
+def main_brute_gpw(structure_path, supercell, log):
     from gpaw.elph.electronphonon import ElectronPhononCoupling
     from gpaw import GPAW
 
@@ -165,8 +180,56 @@ def main__brute_gpw(structure_path, supercell, log):
     elph.calculate_supercell_matrix(dump=1)
     return
 
+def main_elph(
+        structure_path,
+        params_fd_path,
+        supercell,
+        log,
+        symmetry_tol,
+        disp_split,
+        stop_after_displacements,
+        raman_settings):
 
-def main__elph_phonopy(
+    main_elph__init(
+        structure_path=structure_path,
+        params_fd_path=params_fd_path,
+        supercell=supercell,
+        log=log,
+        symmetry_tol=symmetry_tol,
+        disp_split=disp_split,
+        stop_after_displacements=stop_after_displacements,
+        raman_settings=raman_settings)
+
+    if disp_split == 'stop':
+        parprint('stopping. (--disp-split=stop)')
+        return
+
+    main_elph__run_displacements(
+        structure_path=structure_path,
+        supercell=supercell,
+        log=log,
+        symmetry_tol=symmetry_tol,
+        disp_split=disp_split)
+
+    if stop_after_displacements:
+        parprint('stopping here due to --disp-split.  Please resume without it.')
+        return
+
+    main_elph__symmetry_expansion(
+        structure_path=structure_path,
+        supercell=supercell,
+        log=log,
+        symmetry_tol=symmetry_tol,
+    )
+
+    main_elph__after_symmetry(
+        structure_path=structure_path,
+        supercell=supercell,
+        log=log,
+        raman_settings=raman_settings,
+    )
+
+def main_elph__init(
         structure_path,
         params_fd_path,
         supercell,
@@ -198,17 +261,46 @@ def main__elph_phonopy(
     # atoms.minimal_box(4)
     # atoms.pbc = True
 
-    DISPLACEMENT_DIST = 1e-2  # FIXME supply as arg to gpaw
+    if os.path.exists('phonopy_disp.yaml'):
+        parprint('using saved phonopy_disp.yaml')
+    else:
+        parprint('computing phonopy_disp.yaml')
+        world.barrier()  # avoid race condition where rank 0 creates file before others enter
+        phonon = get_minimum_displacements(
+            unitcell=ase_atoms_to_phonopy(calc.atoms),
+            supercell_matrix=np.diag(supercell),
+            displacement_distance=DISPLACEMENT_DIST,
+            phonopy_kw=dict(
+                symprec=symmetry_tol,
+            ),
+        )
+        if world.rank == 0:
+            phonon.save('phonopy_disp.yaml')
+        world.barrier()  # avoid race condition where rank 0 creates file before others enter
 
-    # FIXME: There's definitely a race condition here when using disp_split if the file doesn't already exist.
-    phonon = get_minimum_displacements(cachepath='phonopy_disp.yaml',
-        unitcell=ase_atoms_to_phonopy(calc.atoms),
-        supercell_matrix=np.diag(supercell),
-        displacement_distance=DISPLACEMENT_DIST,
-        phonopy_kw=dict(
-            symprec=symmetry_tol,
-        ),
-    )
+    # Structure with initial guess of wavefunctions for displacement calculations.
+    if os.path.exists('supercell.eq.gpw'):
+        parprint('using saved supercell.eq.gpw')
+    else:
+        parprint('computing supercell.eq.gpw')
+        supercell_atoms = make_gpaw_supercell(calc, supercell, **dict(params_fd, txt=log))
+        ensure_gpaw_setups_initialized(supercell_atoms.calc, supercell_atoms)
+        supercell_atoms.get_potential_energy()
+        supercell_atoms.calc.write('supercell.eq.gpw', mode='all')
+
+def main_elph__run_displacements(
+        structure_path,
+        supercell,
+        log,
+        symmetry_tol,
+        disp_split):
+
+    calc = GPAW(structure_path)
+    supercell_atoms = GPAW('supercell.eq.gpw', txt=log).get_atoms()
+
+    phonopy_kw = dict(symprec=symmetry_tol)
+    phonon = phonopy.load('phonopy_disp.yaml', produce_fc=False, **phonopy_kw)
+
     natoms_prim = len(calc.atoms)
     disp_phonopy_sites, disp_carts = get_phonopy_displacements(phonon)
     disp_sites = phonopy_sc_indices_to_ase_sc_indices(disp_phonopy_sites, natoms_prim, supercell)
@@ -223,19 +315,6 @@ def main__elph_phonopy(
             pickle.dump(forces, paropen(forces_path, 'wb'), protocol=2)
             pickle.dump(elph_data, paropen(elph_path, 'wb'), protocol=2)
 
-    # FIXME: There's definitely a race condition here when using disp_split if the file doesn't already exist.
-    if os.path.exists('supercell.eq.gpw'):
-        # calling .get_atoms() (instead of just accessing .atoms) is important to make sure it doesn't read cached forces
-        supercell_atoms = GPAW('supercell.eq.gpw', txt=log).get_atoms()
-    else:
-        supercell_atoms = make_gpaw_supercell(calc, supercell, **dict(params_fd, txt=log))
-        ensure_gpaw_setups_initialized(supercell_atoms.calc, supercell_atoms)
-        supercell_atoms.get_potential_energy()
-        supercell_atoms.calc.write('supercell.eq.gpw', mode='all')
-
-    if disp_split == 'stop':
-        return  # stop right before doing displacements
-
     if disp_split.index == 0:
         do_structure(supercell_atoms, 'eq')
 
@@ -244,22 +323,39 @@ def main__elph_phonopy(
         if (disp_index + 1) % disp_split.mod == disp_split.index:  # + 1 because equilibrium was zero
             do_structure(supercell_atoms, f'sym-{disp_index}')
 
-    if stop_after_displacements:
-        parprint("Stopping due to usage of --disp-split. Please resume without --disp-split once all other jobs finish.")
-        return
-
-    # Read back from file to avoid an unnecessary SCF computation later
+def main_elph__symmetry_expansion(
+        structure_path,
+        supercell,
+        log,
+        symmetry_tol,
+):
+    calc = GPAW(structure_path)
     supercell_atoms = GPAW('supercell.eq.gpw', txt=log).get_atoms()
+
+    phonopy_kw = dict(symprec=symmetry_tol)
+    phonon = phonopy.load('phonopy_disp.yaml', produce_fc=False, **phonopy_kw)
+
+    natoms_prim = len(calc.atoms)
+    disp_phonopy_sites, disp_carts = get_phonopy_displacements(phonon)
+    disp_sites = phonopy_sc_indices_to_ase_sc_indices(disp_phonopy_sites, natoms_prim, supercell)
 
     elph_do_symmetry_expansion(supercell, calc, DISPLACEMENT_DIST, phonon, disp_carts, disp_sites, supercell_atoms)
 
     if not os.path.exists(f'elph.supercell_matrix.{calc.parameters["basis"]}.pckl'):
         elph_do_supercell_matrix(log=log, calc=calc, supercell=supercell)
 
+def main_elph__after_symmetry(
+        structure_path,
+        supercell,
+        log,
+        raman_settings
+):
+    calc = GPAW(structure_path)
+
     if not os.path.exists('gqklnn.npy'):
+        supercell_atoms = GPAW('supercell.eq.gpw', txt=log).get_atoms()
         leffers.get_elph_elements(calc.atoms, gpw_name=structure_path, calc_fd=supercell_atoms.calc, sc=supercell)
 
-    # The dipole transition matrix elements are found
     if not os.path.isfile("dip_vknm.npy"):
         leffers.get_dipole_transitions(calc)
 
@@ -439,121 +535,6 @@ def ensure_gpaw_setups_initialized(calc, atoms):
     calc.initialize()
     calc.set_positions(atoms)  # FIXME: Apparently this breaks if there is domain parallelism? What?!?!?!
 
-# ==============================================================================
-
-def main__raman_ch4(structure, supercell, log):
-    import ase.build
-
-    from gpaw.lrtddft.spectrum import polarizability
-    from gpaw.cluster import Cluster
-    from gpaw import GPAW, FermiDirac
-
-    #=============================================
-    # Settings
-
-    # Input structure
-    relax_grid_sep = 0.22  # GPAW finite grid size
-    vacuum_sep = 3.5
-    pbc = False
-    if structure == 'ch4':
-        def get_unrelaxed_structure():
-            atoms = Cluster(ase.build.molecule('CH4'))
-            atoms.minimal_box(vacuum_sep, h=relax_grid_sep)
-            return atoms
-    elif structure == 'mos2':
-        def get_unrelaxed_structure():
-            atoms = Cluster(ase.build.mx2('MoS2'))
-            atoms.center(vacuum=vacuum_sep, axis=2)
-            return atoms
-
-    # Calculator (general settings)
-    make_calc = functools.partial(GPAW,
-            occupations=FermiDirac(width=0.1),
-            symmetry={'point_group': False},
-            txt=log,
-    )
-
-    # Relaxation settings
-    make_calc_relax = functools.partial(make_calc,
-            h=relax_grid_sep,
-    )
-
-    # Args for computations on displaced structures
-    raman_grid_sep = 0.25 # In the example, they use a larger spacing here than during relaxation.
-                          # (TODO: but why? On CH4 I observe that this to leads to equilibrium forces of
-                          #        0.067 ev/A, which seems to compromise our "energy minimum" state...)
-    num_converged_bands = 10
-    num_total_bands = 20
-    make_calc_raman = functools.partial(make_calc,
-            h=raman_grid_sep,
-            convergence={
-                'eigenstates': 1.e-5,
-                'bands': num_converged_bands,
-            },
-            eigensolver='cg',
-            nbands=num_total_bands,
-    )
-    supercell_matrix = [[supercell[0], 0, 0], [0, supercell[1], 0], [0, 0, supercell[2]]]
-    displacement_distance = 1e-2
-
-    # ----------
-    # Excitation settings (for polarizability)
-    ex_kw = {'restrict': {'jend':num_converged_bands-1}}
-    omega = 5.0 # eV
-    get_polarizability = functools.partial(polarizability, omega=omega, form='v', tensor=True)
-    subtract_equilibrium_polarizability = False
-
-    #=============================================
-    # Process
-
-    disp_filenames = {
-        'ex': {'eq': 'raman-eq.ex.gz', 'disp': 'raman-{:04}.ex.gz'},
-        'force': {'eq': 'force-set-eq.npy', 'disp': 'force-set-{:04}.npy'},
-    }
-
-    # Relax
-    unrelaxed_atoms = get_unrelaxed_structure()
-    unrelaxed_atoms.pbc = pbc
-    unrelaxed_atoms.calc = make_calc_relax()
-    relax_atoms(outpath='relaxed.vasp', atoms=unrelaxed_atoms)
-
-    # Phonopy displacements
-    phonon = get_minimum_displacements(cachepath='phonopy_disp.yaml',
-            unitcell=phonopy.interface.calculator.read_crystal_structure('relaxed.vasp', interface_mode='vasp')[0],
-            supercell_matrix=supercell_matrix,
-            displacement_distance=displacement_distance,
-    )
-
-    # Computing stuff at displacements
-    eq_atoms = Cluster(phonopy_atoms_to_ase(phonon.supercell))
-    eq_atoms.pbc = pbc
-    if raman_grid_sep != relax_grid_sep:
-        eq_atoms.minimal_box(vacuum_sep, h=raman_grid_sep)
-    eq_atoms.calc = make_calc_raman()
-
-    force_sets = make_force_sets_and_excitations(cachepath='force-sets.npy',
-            disp_filenames=disp_filenames, phonon=phonon,
-            atoms=eq_atoms, ex_kw=ex_kw,
-    )
-    phonon.set_forces(force_sets)
-
-    # Applying symmetry
-    cart_pol_derivs = expand_raman_by_symmetry(cachepath='raman-cart.npy',
-            phonon=phonon,
-            disp_filenames=disp_filenames, get_polarizability=get_polarizability, ex_kw=ex_kw,
-            subtract_equilibrium_polarizability=subtract_equilibrium_polarizability,
-    )
-
-    # Phonopy part 2
-    gamma_eigendata = get_eigensolutions_at_q(cachepath='eigensolutions-gamma.npz',
-            phonon=phonon, q=[0, 0, 0],
-    )
-
-    # Raman of modes
-    get_mode_raman(outpath='mode-raman-gamma.npy',
-            eigendata=gamma_eigendata, cart_pol_derivs=cart_pol_derivs,
-    )
-
 # ==================================
 # Steps of the procedure.  Each function caches their results, for restart purposes.
 
@@ -576,29 +557,16 @@ def relax_atoms(outpath, atoms):
 
 # Get displacements using phonopy
 def get_minimum_displacements(
-        cachepath: str,
         unitcell: phonopy.structure.atoms.PhonopyAtoms,
         supercell_matrix: np.ndarray,
         displacement_distance: float,
         phonopy_kw: dict = {},
         ):
     # note: applying phonopy_kw on load is necessary because phonopy will recompute symmetry
-    load = lambda: phonopy.load(cachepath, produce_fc=False, **phonopy_kw)
-    if os.path.exists(cachepath):
-        parprint(f'Found existing {cachepath}')
-        return load()
-    world.barrier()  # avoid race condition where rank 0 creates file before others enter
-    parprint(f'Getting displacements... ({cachepath})')
-
-    if world.rank == 0:
-        phonon = phonopy.Phonopy(unitcell, supercell_matrix, factor=phonopy.units.VaspToTHz, **phonopy_kw)
-        phonon.generate_displacements(distance=displacement_distance)
-        parprint(f'Saving displacements...')
-        phonon.save(cachepath)
-
-    world.barrier()
-    parprint(f'Loading displacements...')
-    return load()
+    parprint(f'Getting displacements... ()')
+    phonon = phonopy.Phonopy(unitcell, supercell_matrix, factor=phonopy.units.VaspToTHz, **phonopy_kw)
+    phonon.generate_displacements(distance=displacement_distance)
+    return phonon
 
 
 def make_force_sets_and_excitations(cachepath, disp_filenames, phonon, atoms, ex_kw):
