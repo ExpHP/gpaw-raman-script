@@ -12,7 +12,7 @@ from gpaw.fd_operators import Gradient
 from ase.phonons import Phonons
 from ase.parallel import parprint
 
-def get_elph_elements(atoms, gpw_name, calc_fd, sc=(1, 1, 1), basename=None):
+def get_elph_elements(atoms, gpw_name, calc_fd, sc=(1, 1, 1), basename=None, phononname='phonon'):
     """
         Evaluates the dipole transition matrix elements
 
@@ -44,7 +44,7 @@ def get_elph_elements(atoms, gpw_name, calc_fd, sc=(1, 1, 1), basename=None):
 
     # Phonon calculation, We'll read the forces from the elph.run function
     # This only looks at gamma point phonons
-    ph = Phonons(atoms=atoms, name="phonons", supercell=sc)
+    ph = Phonons(atoms=atoms, name=phononname, supercell=sc)
     ph.read()
     frequencies, modes = ph.band_structure(qpts, modes=True)
 

@@ -18,11 +18,12 @@ from ase.parallel import parprint, paropen, world
 import phonopy
 import ase.build
 import ase.phonons
+from ase.utils.filecache import MultiFileJSONCache
 import gpaw
 from gpaw import GPAW
 from gpaw.lrtddft import LrTDDFT
-import pickle
 import warnings
+from contextlib import contextmanager
 
 from ruamel.yaml import YAML
 yaml = YAML(typ='rt')
@@ -305,15 +306,19 @@ def main_elph__run_displacements(
     disp_phonopy_sites, disp_carts = get_phonopy_displacements(phonon)
     disp_sites = phonopy_sc_indices_to_ase_sc_indices(disp_phonopy_sites, natoms_prim, supercell)
 
+    cache = ElphCache('elph')
     def do_structure(supercell_atoms, name):
-        forces_path = f'phonons.{name}.pckl'
-        elph_path = f'elph.{name}.pckl'
-        if not os.path.exists(elph_path):
-            parprint(f'== computing  elph.{name}.pckl')
-            elph_data = get_elph_data(supercell_atoms)
-            forces = supercell_atoms.get_forces()
-            pickle.dump(forces, paropen(forces_path, 'wb'), protocol=2)
-            pickle.dump(elph_data, paropen(elph_path, 'wb'), protocol=2)
+        with cache.lock(name) as handle:
+            if handle is not None:
+                parprint(f'== computing  elph/cache.{name}.json')
+                Vt_sG, dH_all_asp = get_elph_data(supercell_atoms)
+                forces = supercell_atoms.get_forces()
+                if world.rank == 0:
+                    handle.write(ElphDataset(
+                        Vt_sG=Vt_sG,
+                        dH_all_asp=dH_all_asp,
+                        forces=forces,
+                    ))
 
     if disp_split.index == 0:
         do_structure(supercell_atoms, 'eq')
@@ -354,18 +359,19 @@ def main_elph__after_symmetry(
 
     if not os.path.exists('gqklnn.npy'):
         supercell_atoms = GPAW('supercell.eq.gpw', txt=log).get_atoms()
-        leffers.get_elph_elements(calc.atoms, gpw_name=structure_path, calc_fd=supercell_atoms.calc, sc=supercell)
+        leffers.get_elph_elements(calc.atoms, gpw_name=structure_path, calc_fd=supercell_atoms.calc, sc=supercell, phononname='elph')
 
     if not os.path.isfile("dip_vknm.npy"):
         leffers.get_dipole_transitions(calc)
 
-    elph_do_raman_spectra(calc, supercell, **raman_settings)
+    elph_do_raman_spectra(calc, supercell, **raman_settings, phononname='elph')
 
 def elph_do_symmetry_expansion(supercell, calc, displacement_dist, phonon, disp_carts, disp_sites, supercell_atoms):
     from gpaw.elph.electronphonon import ElectronPhononCoupling
 
+    cache = ElphCache('elph')
     natoms_prim = len(calc.get_atoms())
-    disp_values = [read_elph_input(f'sym-{index}') for index in range(len(disp_sites))]
+    disp_values = [cache.read(f'sym-{index}') for index in range(len(disp_sites))]
 
     # NOTE: phonon.symmetry includes pure translational symmetries of the supercell
     #       so we use an empty quotient group
@@ -406,20 +412,23 @@ def elph_do_symmetry_expansion(supercell, calc, displacement_dist, phonon, disp_
 
         # NOTE: confusingly, Elph wants primitive atoms, but a calc for the supercell
         elph = ElectronPhononCoupling(calc.atoms, calc=supercell_atoms.calc, supercell=supercell)
+        cache = ElphCache(elph.name)
         displaced_cell_index = elph.offset
         del elph  # that's all we needed it for
 
-        eq_Vt, eq_dH, eq_forces = read_elph_input('eq')
+        eq_Vt, eq_dH, eq_forces = cache.read('eq')
         for a in range(natoms_prim):
             for c in range(3):
                 delta_Vt, delta_dH, delta_forces = full_derivatives[natoms_prim * displaced_cell_index + a][c]
                 for sign in [-1, +1]:
                     disp = interop.AseDisplacement(atom=a, axis=c, sign=sign)
-                    disp_Vt = eq_Vt + sign * displacement_dist * delta_Vt
-                    disp_dH = {k: eq_dH[k] + sign * displacement_dist * delta_dH[k] for k in eq_dH}
-                    disp_forces = eq_forces + sign * displacement_dist * delta_forces
-                    pickle.dump(disp_forces, paropen(f'phonons.{disp}.pckl', 'wb'), protocol=2)
-                    pickle.dump((disp_Vt, disp_dH), paropen(f'elph.{disp}.pckl', 'wb'), protocol=2)
+                    with cache.lock(disp) as handle:
+                        if handle is not None and world.rank == 0:
+                            handle.write(ElphDataset(
+                                Vt_sG = eq_Vt + sign * displacement_dist * delta_Vt,
+                                dH_all_asp = {k: eq_dH[k] + sign * displacement_dist * delta_dH[k] for k in eq_dH},
+                                forces = eq_forces + sign * displacement_dist * delta_forces,
+                            ))
     world.barrier()
 
 def make_gpaw_supercell(calc: GPAW, supercell: tp.Tuple[int, int, int], **new_kw):
@@ -482,11 +491,11 @@ def elph_do_supercell_matrix(log, calc, supercell):
 
     world.barrier()
 
-def elph_do_raman_spectra(calc, supercell, lasers, do_permutations, laser_broadening, phonon_broadening, shift_step, polarizations, write_mode_intensities):
+def elph_do_raman_spectra(calc, supercell, lasers, do_permutations, laser_broadening, phonon_broadening, shift_step, polarizations, write_mode_intensities, phononname='phonons'):
     from ase.units import _hplanck, _c, J
 
     parprint('Computing phonons')
-    ph = ase.phonons.Phonons(atoms=calc.atoms, name="phonons", supercell=supercell)
+    ph = ase.phonons.Phonons(atoms=calc.atoms, name=phononname, supercell=supercell)
     ph.read()
     w_ph = np.array(ph.band_structure([[0, 0, 0]])[0])
 
@@ -524,10 +533,33 @@ def elph_callbacks_2(wfs: gpaw.wavefunctions.base.WaveFunctions, elphsym: symmet
     forces_part = symmetry.GeneralArrayCallbacks(['atom', 'cart'])
     return symmetry.TupleCallbacks(Vt_part, dH_part, forces_part)
 
-def read_elph_input(displacement: tp.Union[interop.AseDisplacement, str]) -> tp.Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    Vt_sG, dH_asp = pickle.load(open(f'elph.{displacement}.pckl', 'rb'))
-    forces = pickle.load(open(f'phonons.{displacement}.pckl', 'rb'))
-    return Vt_sG, dH_asp, forces
+# A namedtuple whose dict representation matches the data stored by ElectronPhononCoupling in its cache
+class ElphDataset(tp.NamedTuple):
+    Vt_sG: np.ndarray
+    dH_all_asp: np.ndarray
+    forces: np.ndarray
+
+class ElphCache:
+    def __init__(self, name):
+        self.cache = MultiFileJSONCache(name)
+
+    def read(self, displacement: tp.Union[interop.AseDisplacement, str]):
+        d = self.cache[str(displacement)]
+        return ElphDataset(**d)
+
+    @contextmanager
+    def lock(self, displacement: tp.Union[interop.AseDisplacement, str]):
+        class MyHandle:
+            def __init__(self, handle):
+                self._handle = handle
+            def write(self, data: ElphDataset):
+                self._handle.save(data._asdict())
+
+        with self.cache.lock(str(displacement)) as handle:
+            if handle is None:
+                yield None
+            else:
+                yield MyHandle(handle)
 
 def ensure_gpaw_setups_initialized(calc, atoms):
     """ Initializes the Setups of a GPAW instance without running a groundstate computation. """

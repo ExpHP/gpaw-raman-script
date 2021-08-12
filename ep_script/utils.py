@@ -36,6 +36,10 @@ class Tee :
         for fd in self.fds:
             fd.flush()
 
+    def close(self):
+        for fd in self.fds:
+            fd.close()
+
     def closed(self):
         return False
 
