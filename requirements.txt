@@ -1,0 +1,6 @@
+phonopy==2.11.0
+ruamel.yaml==0.17.10
+# bugfixes not yet in published releases
+git+https://gitlab.com/ase/ase.git@4b2426b1858c8fd2e69c13b6ef7645dab6671559
+git+https://gitlab.com/gpaw/gpaw.git@c7e3c3e0eb0570dd242150e0e71b2b23fb951fca
+

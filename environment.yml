@@ -1,11 +1,25 @@
 name: gpaw-raman-script
+channels:
+  - defaults
+  - anaconda
+  - conda-forge
 dependencies:
   - python=3.8
   - pip=21.1
+  - pillow=8.3
+  - matplotlib=3.4
+  - conda-forge::openmpi=4.1
+  - conda-forge::c-compiler=1.2
+  - conda-forge::compilers=1.2
+  - conda-forge::libblas=3.9=*openblas
+  - conda-forge::liblapack=3.9=*openblas
+  - conda-forge::libxc=5.1
+  # NOTE: Currently, the installation of the pip dependencies will probably fail with an error asking you to unset CC
+  #        during the installation of gpaw.
+  #       As a workaround, you must activate the environment and do the pip installs yourself.
+  #
+  #       conda activate gpaw-raman-script
+  #       (unset CC; python3 -m pip install -r requirements.txt)
   - pip:
-    # bugfixes not yet in published releases
-    - git+https://gitlab.com/ase/ase.git@4b2426b1858c8fd2e69c13b6ef7645dab6671559
-    - git+https://gitlab.com/gpaw/gpaw.git@c7e3c3e0eb0570dd242150e0e71b2b23fb951fca
-    - phonopy==2.11.0
-    - ruamel.yaml==0.17.10
+    - -r requirements.txt
 
