@@ -399,37 +399,34 @@ def elph_do_symmetry_expansion(supercell, calc, displacement_dist, phonon, disp_
         oper_deperms=oper_deperms,
         )
 
-    if world.rank == 0:
-        full_derivatives = symmetry.expand_derivs_by_symmetry(
-            disp_sites,       # disp -> atom
-            disp_carts,       # disp -> 3-vec
-            disp_values,      # disp -> T  (displaced value, optionally minus equilibrium value)
-            elph_callbacks_2(supercell_atoms.calc.wfs, elphsym, supercell=supercell),        # how to work with T
-            oper_cart_rots,   # oper -> 3x3
-            oper_perms=oper_deperms,       # oper -> atom' -> atom
-            quotient_perms=quotient_perms,
-        )
+    full_derivatives = symmetry.expand_derivs_by_symmetry(
+        disp_sites,       # disp -> atom
+        disp_carts,       # disp -> 3-vec
+        disp_values,      # disp -> T  (displaced value, optionally minus equilibrium value)
+        elph_callbacks_2(supercell_atoms.calc.wfs, elphsym, supercell=supercell),        # how to work with T
+        oper_cart_rots,   # oper -> 3x3
+        oper_perms=oper_deperms,       # oper -> atom' -> atom
+        quotient_perms=quotient_perms,
+    )
 
-        # NOTE: confusingly, Elph wants primitive atoms, but a calc for the supercell
-        elph = ElectronPhononCoupling(calc.atoms, calc=supercell_atoms.calc, supercell=supercell)
-        cache = ElphCache(elph.name)
-        displaced_cell_index = elph.offset
-        del elph  # that's all we needed it for
+    # NOTE: confusingly, Elph wants primitive atoms, but a calc for the supercell
+    elph = ElectronPhononCoupling(calc.atoms, calc=supercell_atoms.calc, supercell=supercell)
+    cache = ElphCache(elph.name)
+    displaced_cell_index = elph.offset
+    del elph  # that's all we needed it for
 
-        eq_Vt, eq_dH, eq_forces = cache.read('eq')
-        for a in range(natoms_prim):
-            for c in range(3):
-                delta_Vt, delta_dH, delta_forces = full_derivatives[natoms_prim * displaced_cell_index + a][c]
-                for sign in [-1, +1]:
-                    disp = interop.AseDisplacement(atom=a, axis=c, sign=sign)
-                    with cache.lock(disp) as handle:
-                        if handle is not None and world.rank == 0:
-                            handle.write(ElphDataset(
-                                Vt_sG = eq_Vt + sign * displacement_dist * delta_Vt,
-                                dH_all_asp = {k: eq_dH[k] + sign * displacement_dist * delta_dH[k] for k in eq_dH},
-                                forces = eq_forces + sign * displacement_dist * delta_forces,
-                            ))
-    world.barrier()
+    eq_Vt, eq_dH, eq_forces = cache.read('eq')
+    for a in range(natoms_prim):
+        for c in range(3):
+            delta_Vt, delta_dH, delta_forces = full_derivatives[natoms_prim * displaced_cell_index + a][c]
+            for sign in [-1, +1]:
+                disp = interop.AseDisplacement(atom=a, axis=c, sign=sign)
+                with cache.lock(disp) as handle:
+                    Vt_sG = eq_Vt + sign * displacement_dist * delta_Vt
+                    dH_all_asp = {k: eq_dH[k] + sign * displacement_dist * delta_dH[k] for k in eq_dH}
+                    forces = eq_forces + sign * displacement_dist * delta_forces
+                    if handle is not None:
+                        handle.write(ElphDataset(Vt_sG=Vt_sG, dH_all_asp=dH_all_asp, forces=forces))
 
 def make_gpaw_supercell(calc: GPAW, supercell: tp.Tuple[int, int, int], **new_kw):
     atoms = calc.atoms
