@@ -191,13 +191,13 @@ def make_suffix(s):
     else:
         return '_' + s
 
-def calculate_raman(calc, w_ph, permutations=True, w_cm=None, ramanname=None, momname=None, basename=None, w_l=2.54066, gamma_l=0.2, d_i=0, d_o=0, shift_step=1, phonon_sigma=3, write_mode_intensities=False):
+def calculate_raman(calc, w_ph, permutations='original', w_cm=None, ramanname=None, momname=None, basename=None, w_l=2.54066, gamma_l=0.2, d_i=0, d_o=0, shift_step=1, phonon_sigma=3, write_mode_intensities=False):
     """
     Calculates the first order Raman spectre
 
     Input:
         w_ph            Gamma phonon energies in eV.
-        permutations    Used all fermi terms (True) or only the resonant term (False)
+        permutations    Use only resonant term (None) or all terms ('original' or 'fast')
         ramanname       Suffix for the raman.npy file
         momname         Suffix for the momentumfile
         basename        Suffix for the gqklnn.npy files
@@ -207,6 +207,8 @@ def calculate_raman(calc, w_ph, permutations=True, w_cm=None, ramanname=None, mo
     Output:
         RI.npy          Numpy array containing the raman spectre
     """
+
+    assert permutations in [None, 'fast', 'original']
 
     parprint("Calculating the Raman spectra: Laser frequency = {}".format(w_l))
 
@@ -297,6 +299,8 @@ def calculate_raman(calc, w_ph, permutations=True, w_cm=None, ramanname=None, mo
         np.save("RI{}.npy".format(make_suffix(ramanname)), raman)
 
 def _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, w_s, mom, elph, f_n, E_el):
+    assert permutations in [None, 'fast', 'original']
+
     # This is a refactoring of some code by Ulrik Leffers in https://gitlab.com/gpaw/gpaw/-/merge_requests/563,
     # which appears to be an implementation of Equation 10 in https://www.nature.com/articles/s41467-020-16529-6
     # (though it most certainly does not map 1-1 to the symbols in that equation and I'm not sure
@@ -313,8 +317,21 @@ def _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, 
     #
     # But first: Some parts common to many of the tensors.
     Ediff_el = E_el[None,:]-E_el[:,None]  # antisymmetric tensor that shows up in all denominators
-    occu1 = f_n[:,None]*(1-f_n[None,:])  # occupation-based part that always appears in the 1st tensor
-    occu3 = (1-f_n[:, None]) * np.ones((1, len(f_n)))  # occupation-based part that always appears in the 3rd tensor
+    occu1 = f_n[:,None] * (1-f_n[None,:])  # occupation-based part that always appears in the 1st tensor
+    occu3 = (1-f_n[:,None]) * np.ones((1, len(f_n)))  # occupation-based part that always appears in the 3rd tensor
+
+    def cannot_compute(**_kw):
+        assert False, '(bug) a function was unexpectedly called with permutations=None'
+
+    # In the code by Leffers, some denominators had explicit dependence on the scattered frequency,
+    # making them significantly more expensive to compute.
+    #
+    # We suspect that this is unnecessary, allowing a much faster computation.
+    get_w_s = {
+        'original': lambda w: w_s[w],
+        'fast': lambda l: w_l - w_ph[l],
+        None: cannot_compute,
+    }[permutations]
 
     # There may be many bands that are fully occupied or unoccupied and therefore incapable of appearing
     # in one or more of the axes that we sum over.  Computing these elements is a waste of time.
@@ -328,18 +345,32 @@ def _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, 
 
     # And now, the 9 tensors.
     #
-    # Some of these tensors were VERY LARGE;  over 50 GB for 17-agnr.
+    # In the original code, some of these tensors were VERY LARGE;  over 50 GB for 17-agnr.
     # Thus, to reduce memory requirements, I have rewritten them to not include axes for the phonon mode or
     # raman shift;  Instead they are all lambdas that produce a matrix with two band axes, and we'll
     # evaluate them at a single phonon/raman shift at a time.
     f1_in_ = lambda: mask1(occu1) * mask1(mom[d_i]) / (w_l-mask1(Ediff_el) + 1j*gamma_l)
     f1_elph_ = lambda l: mask1(occu1) * mask1(elph[l]) / (-w_ph[l]-mask1(Ediff_el) + 1j*gamma_l)
-    f1_out_ = lambda w: mask1(occu1) * mask1(mom[d_o]) / (-w_s[w]-mask1(Ediff_el) + 1j*gamma_l)
+    f1_out_ = {
+        'original': lambda w: mask1(occu1) * mask1(mom[d_o]) / (-get_w_s(w=w)-mask1(Ediff_el) + 1j*gamma_l),
+        'fast': lambda l: mask1(occu1) * mask1(mom[d_o]) / (-get_w_s(l=l)-mask1(Ediff_el) + 1j*gamma_l),
+        None: cannot_compute,
+    }[permutations]
+
     f2_in_ = lambda: mask2(mom[d_i])
     f2_elph_ = lambda l: mask2(elph[l])
     f2_out_ = lambda: mask2(mom[d_o])
-    f3_in_ = lambda w, l: mask3(occu3) * mask3(mom[d_i]) / (-w_s[w]-w_ph[l]-mask3(Ediff_el.T) + 1j*gamma_l)
-    f3_elph_ = lambda w, l: mask3(occu3) * mask3(elph[l]) / (w_l-w_s[w]-mask3(Ediff_el.T) + 1j*gamma_l)
+
+    f3_in_ = {
+        'original': lambda w, l: mask3(occu3) * mask3(mom[d_i]) / (-get_w_s(w=w)-w_ph[l]-mask3(Ediff_el.T) + 1j*gamma_l),
+        'fast': lambda l: mask3(occu3) * mask3(mom[d_i]) / (-w_l-mask3(Ediff_el.T) + 1j*gamma_l),
+        None: cannot_compute,
+    }[permutations]
+    f3_elph_ = {
+        'original': lambda w, l: mask3(occu3) * mask3(elph[l]) / (w_l-get_w_s(w=w)-mask3(Ediff_el.T) + 1j*gamma_l),
+        'fast': lambda l: mask3(occu3) * mask3(elph[l]) / (w_ph[l]-mask3(Ediff_el.T) + 1j*gamma_l),
+        None: cannot_compute,
+    }[permutations]
     f3_out_ = lambda l: mask3(occu3) * mask3(mom[d_o]) / (w_l-w_ph[l]-mask3(Ediff_el.T) + 1j*gamma_l)
 
     # Some of these factors don't depend on anything and can be evaluated right now.
@@ -347,29 +378,44 @@ def _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, 
     f2_in = f2_in_()
     f2_out = f2_out_()
     for l in range(len(w_ph)):
-        print("    l = {} / {}".format(l, len(w_ph)))
         # Work with factors for a single phonon mode.
-        f1_elph = f1_elph_(l)
-        f2_elph = f2_elph_(l)
-        f3_out = f3_out_(l)
+        f1_elph = f1_elph_(l=l)
+        f2_elph = f2_elph_(l=l)
+        f3_out = f3_out_(l=l)
 
         # compared to gpaw!563, I have rearranged the order of the terms to group together
         # the two that don't depend on the shift.
         raman_lw[l, :] += np.einsum('si,ij,js->', f1_in, f2_elph, f3_out)
 
+        # Include non-resonant terms?
         if permutations:
             raman_lw[l, :] += np.einsum('si,ij,js->', f1_elph, f2_in, f3_out)
 
-            # The remaining four terms depend on the raman shift.
-            for w in range(len(w_s)):
-                f1_out = f1_out_(w)
-                f3_in = f3_in_(w, l)
-                f3_elph = f3_elph_(w, l)
+            # The remaining four terms depend on the raman shift in the original code.
+            if permutations == 'fast':
+                # For permutations == 'fast', they still only depend on the phonon
+                f1_out = f1_out_(l=l)
+                f3_in = f3_in_(l=l)
+                f3_elph = f3_elph_(l=l)
 
-                raman_lw[l, w] += np.einsum('si,ij,js->', f1_in, f2_out, f3_elph)
-                raman_lw[l, w] += np.einsum('si,ij,js->', f1_out, f2_in, f3_elph)
-                raman_lw[l, w] += np.einsum('si,ij,js->', f1_elph, f2_out, f3_in)
-                raman_lw[l, w] += np.einsum('si,ij,js->', f1_out, f2_elph, f3_in)
+                raman_lw[l, :] += np.einsum('si,ij,js->', f1_in, f2_out, f3_elph)
+                raman_lw[l, :] += np.einsum('si,ij,js->', f1_out, f2_in, f3_elph)
+                raman_lw[l, :] += np.einsum('si,ij,js->', f1_elph, f2_out, f3_in)
+                raman_lw[l, :] += np.einsum('si,ij,js->', f1_out, f2_elph, f3_in)
+
+            elif permutations == 'original':
+                for w in range(len(w_s)):
+                    f1_out = f1_out_(w=w)
+                    f3_in = f3_in_(w=w, l=l)
+                    f3_elph = f3_elph_(w=w, l=l)
+
+                    raman_lw[l, w] += np.einsum('si,ij,js->', f1_in, f2_out, f3_elph)
+                    raman_lw[l, w] += np.einsum('si,ij,js->', f1_out, f2_in, f3_elph)
+                    raman_lw[l, w] += np.einsum('si,ij,js->', f1_elph, f2_out, f3_in)
+                    raman_lw[l, w] += np.einsum('si,ij,js->', f1_out, f2_elph, f3_in)
+
+            else:
+                assert False, permutations
 
 def plot_raman(yscale="linear", figname="Raman.png", relative=False, w_min=None, w_max=None, ramanname=None):
     """

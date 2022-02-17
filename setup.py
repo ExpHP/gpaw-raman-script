@@ -4,7 +4,7 @@ from setuptools import setup
 
 try:
     import gpaw
-    assert gpaw.__version__ == '21.1.1b1'
+    assert gpaw.__version__ == '21.6.1b1'
 except:
     print('Due to a reliance on a custom version of gpaw that must be manually built,', file=sys.stderr)
     print('this setup.py doesn\'t automatically handle dependencies.', file=sys.stderr)

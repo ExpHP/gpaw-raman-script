@@ -54,7 +54,14 @@ def main():
         p.add_argument('--phonon-broadening', type=float, default=3, help='phonon gaussian variance in cm-1')
         p.add_argument('--polarizations', type=lambda s: list(s.split(',')), default=[i+o for i in 'xyz' for o in 'xyz'], help='comma-separated list of raman polarizations to do (e.g. xx,xy,xz)')
         p.add_argument('--write-mode-intensities', action='store_true', help='write mode intensities to a file.  Requires --no-permutations.')
-        p.add_argument('--no-permutations', dest='do_permutations', action='store_false', help='disable all but one of the raman terms. Can drastically improve performance of the raman computation')
+        p.add_argument('--write-spectrum-plots', action='store_true', help='write raman plots')
+        p.add_argument('--permutations', choices=['original', 'fast', 'none'], default='original', help=
+            'controls inclusion of nonresonant raman terms.'
+            " '--permutations=original' (default) will include all terms, which is expensive."
+            " '--permutations=none' only includes the resonant term."
+            " '--permutations=fast' is an experimental setting which includes all terms without performance loss,"
+            " by using a slightly different formulation.")
+        p.add_argument('--no-permutations', dest='permutations', action='store_const', const='none', help='alias for --permutations=none')
         DEFAULT_LASER_FREQS = '488,532,633nm'
         p.add_argument('--laser-freqs',
             type=parse_laser_freqs, default=parse_laser_freqs(DEFAULT_LASER_FREQS), help=
@@ -64,16 +71,19 @@ def main():
         p.add_argument('--shift-step', type=int, default=1, help='step for x axis of raman shift (cm-1)')
 
     def extract_raman_arguments(p, args):
-        if args.write_mode_intensities and args.do_permutations:
-            p.error(f"--write-mode-intensities requires --no-permutations")
+        permutations = None if args.permutations == 'none' else args.permutations
+        if args.write_mode_intensities and permutations == 'original':
+            # requires a mode where raman_lw does not depend on w index
+            p.error(f"--write-mode-intensities requires --no-permutations or --permutations=fast")
         return dict(
             laser_broadening=args.laser_broadening,
             phonon_broadening=args.phonon_broadening,
-            do_permutations=args.do_permutations,
+            permutations=permutations,
             polarizations=args.polarizations,
             lasers=args.laser_freqs,
             shift_step=args.shift_step,
             write_mode_intensities=args.write_mode_intensities,
+            write_plots=args.write_spectrum_plots,
         )
 
     p = subs.add_parser('ep')
@@ -241,8 +251,8 @@ def main_elph__init(
         raman_settings):
     from gpaw import GPAW
 
-    if raman_settings['write_mode_intensities'] and raman_settings['do_permutations']:
-        parprint(f"--write-mode-intensities requires --no-permutations")
+    if raman_settings['write_mode_intensities'] and raman_settings['permutations'] == 'original':
+        parprint(f"--write-mode-intensities requires --no-permutations or --permutations=fast")
         sys.exit(1)
 
     calc = GPAW(structure_path)
@@ -488,7 +498,7 @@ def elph_do_supercell_matrix(log, calc, supercell):
 
     world.barrier()
 
-def elph_do_raman_spectra(calc, supercell, lasers, do_permutations, laser_broadening, phonon_broadening, shift_step, polarizations, write_mode_intensities, phononname='phonons'):
+def elph_do_raman_spectra(calc, supercell, lasers, permutations, laser_broadening, phonon_broadening, shift_step, polarizations, write_mode_intensities, write_plots, phononname='phonons'):
     from ase.units import _hplanck, _c, J
 
     parprint('Computing phonons')
@@ -510,14 +520,15 @@ def elph_do_raman_spectra(calc, supercell, lasers, do_permutations, laser_broade
             name = "{}-{}".format(laser.text, polarization)
             if not os.path.isfile(f"RI_{name}.npy"):
                 leffers.calculate_raman(
-                    calc=calc, w_ph=w_ph, permutations=do_permutations,
+                    calc=calc, w_ph=w_ph, permutations=permutations,
                     w_l=w_l, ramanname=name, d_i=d_i, d_o=d_o,
                     gamma_l=laser_broadening, phonon_sigma=phonon_broadening,
                     shift_step=shift_step, write_mode_intensities=write_mode_intensities,
                 )
 
             # And plotted
-            leffers.plot_raman(relative = True, figname = f"Raman_{name}.png", ramanname = name)
+            if write_plots:
+                leffers.plot_raman(relative = True, figname = f"Raman_{name}.png", ramanname = name)
 
 def elph_callbacks(wfs_with_symmetry: gpaw.wavefunctions.base.WaveFunctions, supercell):
     elphsym = symmetry.ElphGpawSymmetrySource.from_wfs_with_symmetry(wfs_with_symmetry)
