@@ -1,15 +1,4 @@
-
-import sys
 from setuptools import setup
-
-try:
-    import gpaw
-    assert gpaw.__version__ == '21.6.1b1'
-except:
-    print('Due to a reliance on a custom version of gpaw that must be manually built,', file=sys.stderr)
-    print('this setup.py doesn\'t automatically handle dependencies.', file=sys.stderr)
-    print(r'Please see:  https://gist.github.com/ExpHP/dce34c5008a0a1dffaf2bf2a1dfe7db9', file=sys.stderr)
-    sys.exit(1)
 
 setup(
     name='ep_script',

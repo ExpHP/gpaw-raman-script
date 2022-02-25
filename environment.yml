@@ -6,20 +6,17 @@ channels:
 dependencies:
   - python=3.8
   - pip=21.1
-  - pillow=8.3
-  - matplotlib=3.4
+  - pillow=8.4
+  - matplotlib=3.5
+  - conda-forge::gpaw=22.1
+  - conda-forge::ase=3.22.1
+  - conda-forge::sparse=0.13
   - conda-forge::openmpi=4.1
-  - conda-forge::c-compiler=1.2
-  - conda-forge::compilers=1.2
-  - conda-forge::libblas=3.9=*openblas
-  - conda-forge::liblapack=3.9=*openblas
-  - conda-forge::libxc=5.1
-  # NOTE: Currently, the installation of the pip dependencies will probably fail with an error asking you to unset CC
-  #        during the installation of gpaw.
-  #       As a workaround, you must activate the environment and do the pip installs yourself.
-  #
-  #       conda activate gpaw-raman-script
-  #       (unset CC; python3 -m pip install -r requirements.txt)
+  - conda-forge::c-compiler=1.4
+  - conda-forge::compilers=1.4
+  - conda-forge::libblas=3.8=*openblas
+  - conda-forge::liblapack=3.8=*openblas
+  - conda-forge::libxc=5.2
   - pip:
-    - -r requirements.txt
-
+    - phonopy==2.11.0
+    - ruamel.yaml==0.17.10

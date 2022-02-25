@@ -188,7 +188,7 @@ def main_brute_gpw(structure_path, supercell, log):
     supercell_atoms.calc.wfs.gd.comm.barrier()
     elph = ElectronPhononCoupling(calc.atoms, calc=supercell_atoms.calc, supercell=supercell)
     elph.set_lcao_calculator(supercell_atoms.calc)
-    elph.calculate_supercell_matrix(dump=1)
+    elph.calculate_supercell_matrix()
     return
 
 def main_elph(
@@ -475,8 +475,6 @@ def get_elph_data(atoms):
     atoms.get_potential_energy()
 
     calc = atoms.calc
-    if not isinstance(calc, GPAW):
-        calc = calc.dft  # unwrap DFTD3 wrapper
 
     Vt_sG = calc.wfs.gd.collect(calc.hamiltonian.vt_sG, broadcast=True)
     dH_asp = interop.gpaw_broadcast_array_dict_to_dicts(calc.hamiltonian.dH_asp)
@@ -494,7 +492,7 @@ def elph_do_supercell_matrix(log, calc, supercell):
     elph.set_lcao_calculator(supercell_atoms.calc)
     # to initialize bfs.M_a
     ensure_gpaw_setups_initialized(supercell_atoms.calc, supercell_atoms)
-    elph.calculate_supercell_matrix(dump=1)
+    elph.calculate_supercell_matrix()
 
     world.barrier()
 

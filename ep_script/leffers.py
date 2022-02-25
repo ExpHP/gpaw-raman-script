@@ -55,7 +55,7 @@ def get_elph_elements(atoms, gpw_name, calc_fd, sc=(1, 1, 1), basename=None, pho
     elph = ElectronPhononCoupling(atoms, calc=None, supercell=sc)
 
     elph.set_lcao_calculator(calc_fd)
-    elph.load_supercell_matrix(basis="dzp", dump=1)
+    elph.load_supercell_matrix()
     if world.rank == 0:
         print("Supercell matrix is loaded")
 
