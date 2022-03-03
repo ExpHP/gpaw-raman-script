@@ -2,6 +2,9 @@
 
 # General
 import numpy as np
+import sparse
+import typing as tp
+from dataclasses import dataclass
 from scipy import signal
 from math import pi
 
@@ -191,7 +194,28 @@ def make_suffix(s):
     else:
         return '_' + s
 
-def calculate_raman(calc, w_ph, permutations='original', w_cm=None, ramanname=None, momname=None, basename=None, w_l=2.54066, gamma_l=0.2, d_i=0, d_o=0, shift_step=1, phonon_sigma=3, write_mode_intensities=False):
+@dataclass
+class RamanOutput:
+    raman_lw: np.ndarray
+    contributions_lknnn: tp.Optional[sparse.GCXS]
+
+def calculate_raman(
+    calc,
+    w_ph,
+    permutations='original',
+    w_cm=None,
+    ramanname=None,
+    momname=None,
+    basename=None,
+    w_l=2.54066,
+    gamma_l=0.2,
+    d_i=0,
+    d_o=0,
+    shift_step=1,
+    phonon_sigma=3,
+    write_mode_intensities=False,
+    write_contributions=False,
+):
     """
     Calculates the first order Raman spectre
 
@@ -225,81 +249,165 @@ def calculate_raman(calc, w_ph, permutations='original', w_cm=None, ramanname=No
 
     assert calc.wfs.gd.comm.size == 1, "domain parallelism not supported"  # not sure how to fix this, sorry
 
-    kcomm = calc.wfs.kd.comm
-    world = calc.wfs.world
-    if kcomm.rank == 0:
-        mom = np.load("dip_vknm{}.npy".format(make_suffix(momname)))  # [:,k,:,:]dim, k
-        elph = np.load("gqklnn{}.npy".format(make_suffix(basename)))[0]  # [0,k,l,n,m]
-
-    parprint("Distributing coupling terms")
-    k_info = {}
-    for k in range(nibzkpts):
-        weight = calc.wfs.collect_auxiliary("weight", k, 0)
-        f_n = calc.wfs.collect_occupations(k, 0)
-
-        if kcomm.rank == 0:
-            f_n = f_n/weight
-            if k % kcomm.size == kcomm.rank:
-                # WEIGHTED
-                k_info[k] = weight*elph[k], mom[:, k], f_n
-                #k_info[k] = elph[k], mom[:,k], f_n
-            else:
-                f_n = np.array(f_n, dtype=float)
-                # WEIGHTED
-                elph_k = weight*np.array(elph[k], dtype=complex)
-                #elph_k = np.array(elph[k],dtype = complex)
-                mom_k = np.array(mom[:, k], dtype=complex)
-
-                kcomm.send(elph_k, dest=k % kcomm.size, tag=k)
-                kcomm.send(mom_k, dest=k % kcomm.size, tag=nibzkpts + k)
-                kcomm.send(f_n, dest=k % kcomm.size, tag=2*nibzkpts + k)
-        else:
-            if k % kcomm.size == kcomm.rank:
-                elph_k = np.empty((nphonons, nbands, nbands), dtype=complex)
-                mom_k = np.empty((3, nbands, nbands), dtype=complex)
-                f_n = np.empty(nbands, dtype=float)
-
-                kcomm.receive(elph_k, src=0, tag=k)
-                kcomm.receive(mom_k, src=0, tag=nibzkpts + k)
-                kcomm.receive(f_n, src=0, tag=2*nibzkpts + k)
-
-                k_info[k] = elph_k, mom_k, f_n
-
     # ab is in and out polarization
     # l is the phonon mode and w is the raman shift
-    raman_lw = np.zeros((nphonons, len(w)), dtype=complex)
+    output = RamanOutput(
+        raman_lw = np.zeros((nphonons, len(w)), dtype=complex),
+        contributions_lknnn = (
+            sparse.zeros((nphonons, nibzkpts, nbands, nbands, nbands), dtype=complex)
+            if write_contributions else None
+        ),
+    )
 
     parprint("Evaluating Raman sum")
 
-    E_kn = calc.band_structure().todict()["energies"][0]
+    kcomm = calc.wfs.kd.comm
+    world = calc.wfs.world
+    if kcomm.rank == 0:
+        mom_vknn = np.load("dip_vknm{}.npy".format(make_suffix(momname)))  # [:,k,:,:]dim, k
+        elph_klnn = np.load("gqklnn{}.npy".format(make_suffix(basename)))[0]  # [0,k,l,n,m]
+    else:
+        mom_vknn = None
+        elph_klnn = None
 
-    for k, (elph, mom, f_n) in k_info.items():
-        print("For k = {}".format(k))
-        E_el = E_kn[k]
+    for info_at_k in _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons):
+        print("For k = {}".format(info_at_k.k_index))
+        _add_raman_terms_at_k(output, w_l, gamma_l, (d_i, d_o), w_ph, w_s, info_at_k, permutations)
 
-        _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, w_s, mom, elph, f_n, E_el)
-
-    kcomm.sum(raman_lw)
+    kcomm.sum(output.raman_lw)
+    if output.contributions_lknnn is not None:
+        _mpi_sum_sparse_coo(output.contributions_lknnn, kcomm)
 
     if write_mode_intensities:
         # write values without the gaussian on shift
         if world.rank == 0:
-            np.save("ModeI{}.npy".format(make_suffix(ramanname)), raman_lw[:, 0])
+            np.save("ModeI{}.npy".format(make_suffix(ramanname)), output.raman_lw[:, 0])
+
+    if output.contributions_lknnn is not None:
+        if world.rank == 0:
+            _write_raman_contributions(calc, output.contributions_lknnn, "Contrib{}.npz".format(make_suffix(ramanname)))
 
     RI = np.zeros(len(w))
     for l in range(nphonons):
         if w_ph[l].real >= 0:
             parprint(
                 "Phonon {} with energy = {} registered".format(l, w_ph[l]))
-            RI += (np.abs(raman_lw[l])**2)*np.array(gaussian(w-w_ph[l], sigma=phonon_sigma * cm))
+            RI += (np.abs(output.raman_lw[l])**2)*np.array(gaussian(w-w_ph[l], sigma=phonon_sigma * cm))
 
     raman = np.vstack((w_cm, RI))
-
     if world.rank == 0:
         np.save("RI{}.npy".format(make_suffix(ramanname)), raman)
 
-def _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, w_s, mom, elph, f_n, E_el):
+def _mpi_sum_sparse_coo(arr: sparse.COO, comm):
+    """ Sum a sparse.COO array onto rank 0 of an MPI communicator. """
+    if comm.rank == 0:
+        coords_parts = [arr.coords]
+        data_parts = [arr.data]
+        for rank in range(1, comm.size):
+            this_nnz = np.empty((0,), dtype=int)
+            comm.receive(this_nnz, src=rank, tag=rank)
+
+            this_coords = np.empty([arr.coords.shape[0], this_nnz], dtype=int)
+            comm.receive(this_coords, src=rank, tag=comm.size + rank)
+            coords_parts.append(this_coords)
+
+            this_data = np.empty([this_nnz], dtype=arr.dtype)
+            comm.receive(this_data, src=rank, tag=2*comm.size + rank)
+            data_parts.append(this_data)
+
+        all_coords = np.concatenate(coords_parts, axis=1)
+        all_data = np.concatenate(data_parts, axis=0)
+        return sparse.COO(all_coords, all_data, shape=arr.shape)
+
+    else:
+        comm.send(np.array(arr.data.shape[0], dtype=int), dest=0, tag=rank)
+        comm.send(np.array(arr.coords, dtype=int), dest=0, tag=comm.size + rank)
+        comm.send(np.array(arr.data, dtype=complex), dest=0, tag=2*comm.size + rank)
+
+def _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons):
+    nibzkpts = np.shape(calc.get_ibz_k_points())[0]
+    nbands = calc.wfs.bd.nbands
+    kcomm = calc.wfs.kd.comm
+    E_kn = calc.band_structure().todict()["energies"][0]
+
+    parprint("Distributing coupling terms")
+    for k in range(nibzkpts):
+        is_mine = k % kcomm.size == kcomm.rank
+        weight = calc.wfs.collect_auxiliary("weight", k, 0)
+        f_n = calc.wfs.collect_occupations(k, 0)
+
+        if kcomm.rank == 0:
+            # FIXME: why is this / weight?!  Is f_n not what it seems to be?
+            f_n = np.array(f_n / weight, dtype=float)
+            elph_lnn = weight * np.array(elph_klnn[k], dtype=complex)
+            mom_vnn = np.array(mom_vknn[:, k], dtype=complex)
+            if is_mine:
+                yield _InfoAtK(
+                    k_index=k,
+                    band_energy_n=E_kn[k],
+                    band_occupation_n=f_n,
+                    band_momentum_vnn=mom_vnn,
+                    band_elph_lnn=elph_lnn,
+                )
+            else:
+                kcomm.send(elph_lnn, dest=k % kcomm.size, tag=k)
+                kcomm.send(mom_vnn, dest=k % kcomm.size, tag=nibzkpts + k)
+                kcomm.send(f_n, dest=k % kcomm.size, tag=2*nibzkpts + k)
+        else:
+            if is_mine:
+                elph_lnn = np.empty((nphonons, nbands, nbands), dtype=complex)
+                mom_vnn = np.empty((3, nbands, nbands), dtype=complex)
+                f_n = np.empty(nbands, dtype=float)
+
+                kcomm.receive(elph_lnn, src=0, tag=k)
+                kcomm.receive(mom_vnn, src=0, tag=nibzkpts + k)
+                kcomm.receive(f_n, src=0, tag=2*nibzkpts + k)
+                yield _InfoAtK(
+                    k_index=k,
+                    band_energy_n=E_kn[k],
+                    band_occupation_n=f_n,
+                    band_momentum_vnn=mom_vnn,
+                    band_elph_lnn=elph_lnn,
+                )
+
+def _write_raman_contributions(calc, contributions_lknnn: sparse.COO, outpath):
+    np.savez_compressed(
+        outpath,
+        k_weight=calc.get_k_point_weights(),
+        k_coords=calc.get_ibz_k_points(),
+        contrib_phonon=contributions_lknnn.coords[0, :],
+        contrib_band_k=contributions_lknnn.coords[1, :],
+        contrib_band_1=contributions_lknnn.coords[2, :],
+        contrib_band_2=contributions_lknnn.coords[3, :],
+        contrib_band_3=contributions_lknnn.coords[4, :],
+        contrib_value=contributions_lknnn.data,
+    )
+
+@dataclass
+class _InfoAtK:
+    k_index: int
+    band_occupation_n: np.ndarray
+    band_energy_n: np.ndarray
+    band_momentum_vnn: np.ndarray
+    band_elph_lnn: np.ndarray
+
+def _add_raman_terms_at_k(
+    output: RamanOutput,
+    w_l,
+    gamma_l,
+    polarizations,
+    w_ph,
+    w_s,
+    info_at_k,
+    permutations: tp.Literal[None, 'fast', 'original'],
+):
     assert permutations in [None, 'fast', 'original']
+    d_i, d_o = polarizations
+    k = info_at_k.k_index
+    E_el = info_at_k.band_energy_n
+    f_n = info_at_k.band_occupation_n
+    mom = info_at_k.band_momentum_vnn
+    elph = info_at_k.band_elph_lnn
 
     # This is a refactoring of some code by Ulrik Leffers in https://gitlab.com/gpaw/gpaw/-/merge_requests/563,
     # which appears to be an implementation of Equation 10 in https://www.nature.com/articles/s41467-020-16529-6
@@ -318,6 +426,8 @@ def _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, 
     # But first: Some parts common to many of the tensors.
     Ediff_el = E_el[None,:]-E_el[:,None]  # antisymmetric tensor that shows up in all denominators
     occu1 = f_n[:,None] * (1-f_n[None,:])  # occupation-based part that always appears in the 1st tensor
+    # FIXME: didn't I conclude earler that this should have f_n[None,:]?
+    #        (NOTE: be careful!!!  f_n is divided by symmetry weight...)
     occu3 = (1-f_n[:,None]) * np.ones((1, len(f_n)))  # occupation-based part that always appears in the 3rd tensor
 
     def cannot_compute(**_kw):
@@ -342,6 +452,8 @@ def _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, 
     mask1 = lambda mat: mat[not0][:, not1]
     mask2 = lambda mat: mat[not1][:, not1]
     mask3 = lambda mat: mat[not1][:, not0]
+    valence_indices = np.nonzero(not0)[0]
+    conduction_indices = np.nonzero(not1)[0]
 
     # And now, the 9 tensors.
     #
@@ -373,6 +485,20 @@ def _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, 
     }[permutations]
     f3_out_ = lambda l: mask3(occu3) * mask3(mom[d_o]) / (w_l-w_ph[l]-mask3(Ediff_el.T) + 1j*gamma_l)
 
+    # When we add one of the 6 terms, we may be interested in the precise choices of electronic
+    # bands that contribute the most.
+    add_term = lambda fac1_VC, fac2_CC, fac3_CV, l, w: _add_single_raman_term_at_k(
+        output,
+        fac1_VC=fac1_VC,
+        fac2_CC=fac2_CC,
+        fac3_CV=fac3_CV,
+        k=k,
+        l=l,
+        w=w,
+        conduction_indices=conduction_indices,
+        valence_indices=valence_indices,
+    )
+
     # Some of these factors don't depend on anything and can be evaluated right now.
     f1_in = f1_in_()
     f2_in = f2_in_()
@@ -383,13 +509,16 @@ def _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, 
         f2_elph = f2_elph_(l=l)
         f3_out = f3_out_(l=l)
 
-        # compared to gpaw!563, I have rearranged the order of the terms to group together
-        # the two that don't depend on the shift.
-        raman_lw[l, :] += np.einsum('si,ij,js->', f1_in, f2_elph, f3_out)
+        # Resonant term.
+        add_term(f1_in, f2_elph, f3_out, l=l, w=None)
 
         # Include non-resonant terms?
         if permutations:
-            raman_lw[l, :] += np.einsum('si,ij,js->', f1_elph, f2_in, f3_out)
+            # compared to gpaw!563, I have rearranged the order of the terms to group together
+            # the two that don't depend on the shift.
+            #
+            # This is the second of those terms.
+            add_term(f1_elph, f2_in, f3_out, l=l, w=None)
 
             # The remaining four terms depend on the raman shift in the original code.
             if permutations == 'fast':
@@ -398,10 +527,10 @@ def _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, 
                 f3_in = f3_in_(l=l)
                 f3_elph = f3_elph_(l=l)
 
-                raman_lw[l, :] += np.einsum('si,ij,js->', f1_in, f2_out, f3_elph)
-                raman_lw[l, :] += np.einsum('si,ij,js->', f1_out, f2_in, f3_elph)
-                raman_lw[l, :] += np.einsum('si,ij,js->', f1_elph, f2_out, f3_in)
-                raman_lw[l, :] += np.einsum('si,ij,js->', f1_out, f2_elph, f3_in)
+                add_term(f1_in, f2_out, f3_elph, l=l, w=None)
+                add_term(f1_out, f2_in, f3_elph, l=l, w=None)
+                add_term(f1_elph, f2_out, f3_in, l=l, w=None)
+                add_term(f1_out, f2_elph, f3_in, l=l, w=None)
 
             elif permutations == 'original':
                 for w in range(len(w_s)):
@@ -409,13 +538,71 @@ def _add_raman_terms_at_k(raman_lw, permutations, w_l, gamma_l, d_i, d_o, w_ph, 
                     f3_in = f3_in_(w=w, l=l)
                     f3_elph = f3_elph_(w=w, l=l)
 
-                    raman_lw[l, w] += np.einsum('si,ij,js->', f1_in, f2_out, f3_elph)
-                    raman_lw[l, w] += np.einsum('si,ij,js->', f1_out, f2_in, f3_elph)
-                    raman_lw[l, w] += np.einsum('si,ij,js->', f1_elph, f2_out, f3_in)
-                    raman_lw[l, w] += np.einsum('si,ij,js->', f1_out, f2_elph, f3_in)
+                    add_term(f1_in, f2_out, f3_elph, l=l, w=w)
+                    add_term(f1_out, f2_in, f3_elph, l=l, w=w)
+                    add_term(f1_elph, f2_out, f3_in, l=l, w=w)
+                    add_term(f1_out, f2_elph, f3_in, l=l, w=w)
 
             else:
                 assert False, permutations
+
+def _add_single_raman_term_at_k(
+    output: RamanOutput,
+    # the three factors to be multiplied
+    fac1_VC,
+    fac2_CC,
+    fac3_CV,
+    # information about indices
+    k, l, w,
+    conduction_indices,
+    valence_indices,
+):
+    # For terms that don't depend on w, broadcast onto the w axis
+    w_eff = slice(None) if w is None else w
+
+    # Here's the main thing we care about.
+    output.raman_lw[l, w_eff] += np.einsum('si,ij,js->', fac1_VC, fac2_CC, fac3_CV)
+
+    # NOTE: This repeats the numerical work done by einsum but I'm not too concerned about
+    #       the performance of recording contributions...
+    if output.contributions_lknnn is not None:
+        assert w is None
+
+        nphonons, nibzkpts, nbands = output.contributions_lknnn.shape[:3]
+
+        # NOTE: It'd probably be more efficient to make the input masked arrays sparse rather
+        #       than sparsifying them here, but don't want to force the code to depend on the
+        #       sparse package unless necessary.
+        def sparsify_factor(data_XY, X_indices, Y_indices):
+            # convert our dense array on conduction/valance bands into a sparse array on all bands
+            data_nn = np.zeros((nbands, nbands))
+            data_nn[tuple(np.meshgrid(X_indices, Y_indices, indexing='ij'))] = data_XY
+            sparse_nn = sparse.GCXS.from_numpy(data_nn)
+
+            absdata = abs(sparse_nn.data)
+            bins = np.logspace(np.log10(absdata.min()*0.999), np.log10(absdata.max()*1.0001), 10)
+            print(np.histogram(absdata, bins))
+            return sparse_nn
+            #sparse.where(abs(sparse_nn) < intermediate_truncate_threshold, 0, sparse1_nn)
+
+        sparse1_nn = sparsify_factor(fac1_VC, valence_indices, conduction_indices)
+        sparse2_nn = sparsify_factor(fac2_CC, conduction_indices, conduction_indices)
+        sparse3_nn = sparsify_factor(fac3_CV, conduction_indices, valence_indices)
+        prod_nnn = sparse1_nn[:, :, None] * sparse2_nn[None, :, :] * sparse3_nn.T[:, None, :]
+        prod_nnn = prod_nnn.to_coo()
+
+        # Add in the remaining axes by prepending constant indices.
+        # This can be done using kron with an array that has a single nonzero element.
+        delta_lk = np.zeros((nphonons, nibzkpts))
+        delta_lk[l][k] = 1   # put our data at these fixed coordinates
+        output.contributions_lknnn += sparse.kron(
+            delta_lk[:, :, None, None, None],
+            prod_nnn[None, None, :, :, :],
+        )
+
+def _truncate_sparse(arr, threshold):
+    import sparse
+    return sparse.where(abs(arr) < threshold, 0, arr)
 
 def plot_raman(yscale="linear", figname="Raman.png", relative=False, w_min=None, w_max=None, ramanname=None):
     """

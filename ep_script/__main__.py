@@ -125,7 +125,11 @@ def start_log_entry(path):
     parprint(file=logfile)
     parprint('=====================================', file=logfile)
     parprint('===', datetime.now().isoformat(), file=logfile)
-    return utils.Tee(logfile, sys.stdout)
+
+    if world.rank == 0:
+        return utils.Tee(logfile, sys.stdout)
+    else:
+        return utils.Tee()
 
 DispSplit = namedtuple('DispSplit', ['index', 'mod'])
 def parse_disp_split(s):
