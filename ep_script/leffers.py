@@ -197,7 +197,10 @@ def make_suffix(s):
 @dataclass
 class RamanOutput:
     raman_lw: np.ndarray
-    contributions_lknnn: tp.Optional[sparse.GCXS]
+    contributions_lknnn_parts: tp.Optional[tp.List[sparse.GCXS]]
+    nphonons: int
+    nibzkpts: int
+    nbands: int
 
 def calculate_raman(
     calc,
@@ -253,10 +256,10 @@ def calculate_raman(
     # l is the phonon mode and w is the raman shift
     output = RamanOutput(
         raman_lw = np.zeros((nphonons, len(w)), dtype=complex),
-        contributions_lknnn = (
-            sparse.zeros((nphonons, nibzkpts, nbands, nbands, nbands), dtype=complex)
-            if write_contributions else None
-        ),
+        contributions_lknnn_parts = [] if write_contributions else None,
+        nphonons = nphonons,
+        nibzkpts = nibzkpts,
+        nbands = nbands,
     )
 
     parprint("Evaluating Raman sum")
@@ -275,17 +278,20 @@ def calculate_raman(
         _add_raman_terms_at_k(output, w_l, gamma_l, (d_i, d_o), w_ph, w_s, info_at_k, permutations)
 
     kcomm.sum(output.raman_lw)
-    if output.contributions_lknnn is not None:
-        _mpi_sum_sparse_coo(output.contributions_lknnn, kcomm)
+
+    contributions_lknnn = None
+    if output.contributions_lknnn_parts is not None:
+        contributions_lknnn = _sum_sparse_coo(output.contributions_lknnn_parts)
+        _mpi_sum_sparse_coo(contributions_lknnn, kcomm)
 
     if write_mode_intensities:
         # write values without the gaussian on shift
         if world.rank == 0:
             np.save("ModeI{}.npy".format(make_suffix(ramanname)), output.raman_lw[:, 0])
 
-    if output.contributions_lknnn is not None:
+    if contributions_lknnn is not None:
         if world.rank == 0:
-            _write_raman_contributions(calc, output.contributions_lknnn, "Contrib{}.npz".format(make_suffix(ramanname)))
+            _write_raman_contributions(calc, contributions_lknnn, "Contrib{}.npz".format(make_suffix(ramanname)))
 
     RI = np.zeros(len(w))
     for l in range(nphonons):
@@ -304,7 +310,7 @@ def _mpi_sum_sparse_coo(arr: sparse.COO, comm):
         coords_parts = [arr.coords]
         data_parts = [arr.data]
         for rank in range(1, comm.size):
-            this_nnz = np.empty((0,), dtype=int)
+            this_nnz = np.empty((), dtype=int)
             comm.receive(this_nnz, src=rank, tag=rank)
 
             this_coords = np.empty([arr.coords.shape[0], this_nnz], dtype=int)
@@ -315,14 +321,33 @@ def _mpi_sum_sparse_coo(arr: sparse.COO, comm):
             comm.receive(this_data, src=rank, tag=2*comm.size + rank)
             data_parts.append(this_data)
 
-        all_coords = np.concatenate(coords_parts, axis=1)
-        all_data = np.concatenate(data_parts, axis=0)
-        return sparse.COO(all_coords, all_data, shape=arr.shape)
+        return _sum_sparse_coo_impl(coords_parts, data_parts, shape=arr.shape)
 
     else:
+        rank = comm.rank
         comm.send(np.array(arr.data.shape[0], dtype=int), dest=0, tag=rank)
-        comm.send(np.array(arr.coords, dtype=int), dest=0, tag=comm.size + rank)
-        comm.send(np.array(arr.data, dtype=complex), dest=0, tag=2*comm.size + rank)
+        comm.send(np.array(arr.coords, dtype=int, order='C'), dest=0, tag=comm.size + rank)
+        comm.send(np.array(arr.data, dtype=complex, order='C'), dest=0, tag=2*comm.size + rank)
+
+def _sum_sparse_coo(arrs: tp.Iterable[sparse.COO]):
+    """ Efficiently sum a large number of sparse COO arrays.
+
+    This is faster than using the + operator, which would repeatedly sort the data. """
+    arrs = list(arrs)
+    if not arrs:
+        raise ValueError("cannot sum no arrays")  # can't infer shape from no arrays!
+    if not all(arr.shape == arrs[0].shape for arr in arrs):
+        raise ValueError("shapes do not match: {}".format(set(arr.shape for arr in arrs)))
+
+    coords_parts = [arr.coords for arr in arrs]
+    data_parts = [arr.data for arr in arrs]
+    return _sum_sparse_coo_impl(coords_parts, data_parts, shape=arrs[0].shape)
+
+def _sum_sparse_coo_impl(coords_parts: tp.Iterable[np.ndarray], data_parts: tp.Iterable[np.ndarray], shape: tuple):
+    """ Efficiently sum a large number of sparse COO arrays, given their parts. """
+    all_coords = np.concatenate(list(coords_parts), axis=1)
+    all_data = np.concatenate(list(data_parts), axis=0)
+    return sparse.COO(all_coords, all_data, shape=shape)
 
 def _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons):
     nibzkpts = np.shape(calc.get_ibz_k_points())[0]
@@ -485,8 +510,6 @@ def _add_raman_terms_at_k(
     }[permutations]
     f3_out_ = lambda l: mask3(occu3) * mask3(mom[d_o]) / (w_l-w_ph[l]-mask3(Ediff_el.T) + 1j*gamma_l)
 
-    # When we add one of the 6 terms, we may be interested in the precise choices of electronic
-    # bands that contribute the most.
     add_term = lambda fac1_VC, fac2_CC, fac3_CV, l, w: _add_single_raman_term_at_k(
         output,
         fac1_VC=fac1_VC,
@@ -565,44 +588,45 @@ def _add_single_raman_term_at_k(
 
     # NOTE: This repeats the numerical work done by einsum but I'm not too concerned about
     #       the performance of recording contributions...
-    if output.contributions_lknnn is not None:
+    if output.contributions_lknnn_parts is not None:
         assert w is None
 
-        nphonons, nibzkpts, nbands = output.contributions_lknnn.shape[:3]
+        intermediate_truncate_threshold = 1e-13
+
+        nphonons, nibzkpts, nbands = output.nphonons, output.nibzkpts, output.nbands
 
         # NOTE: It'd probably be more efficient to make the input masked arrays sparse rather
         #       than sparsifying them here, but don't want to force the code to depend on the
         #       sparse package unless necessary.
         def sparsify_factor(data_XY, X_indices, Y_indices):
             # convert our dense array on conduction/valance bands into a sparse array on all bands
-            data_nn = np.zeros((nbands, nbands))
+            data_nn = np.zeros((nbands, nbands), dtype=complex)
             data_nn[tuple(np.meshgrid(X_indices, Y_indices, indexing='ij'))] = data_XY
             sparse_nn = sparse.GCXS.from_numpy(data_nn)
 
-            absdata = abs(sparse_nn.data)
-            bins = np.logspace(np.log10(absdata.min()*0.999), np.log10(absdata.max()*1.0001), 10)
-            print(np.histogram(absdata, bins))
-            return sparse_nn
-            #sparse.where(abs(sparse_nn) < intermediate_truncate_threshold, 0, sparse1_nn)
+            return _truncate_sparse(sparse_nn, rel=intermediate_truncate_threshold)
 
         sparse1_nn = sparsify_factor(fac1_VC, valence_indices, conduction_indices)
         sparse2_nn = sparsify_factor(fac2_CC, conduction_indices, conduction_indices)
         sparse3_nn = sparsify_factor(fac3_CV, conduction_indices, valence_indices)
         prod_nnn = sparse1_nn[:, :, None] * sparse2_nn[None, :, :] * sparse3_nn.T[:, None, :]
-        prod_nnn = prod_nnn.to_coo()
+        prod_nnn = prod_nnn.tocoo()
+        prod_nnn = _truncate_sparse(prod_nnn, rel=intermediate_truncate_threshold)
 
         # Add in the remaining axes by prepending constant indices.
         # This can be done using kron with an array that has a single nonzero element.
         delta_lk = np.zeros((nphonons, nibzkpts))
         delta_lk[l][k] = 1   # put our data at these fixed coordinates
-        output.contributions_lknnn += sparse.kron(
+        output.contributions_lknnn_parts.append(sparse.kron(
             delta_lk[:, :, None, None, None],
             prod_nnn[None, None, :, :, :],
-        )
+        ))
 
-def _truncate_sparse(arr, threshold):
-    import sparse
-    return sparse.where(abs(arr) < threshold, 0, arr)
+def _truncate_sparse(arr, abs=None, rel=None):
+    assert (abs is not None) != (rel is not None)
+    abs_arr = np.absolute(arr)
+    cutoff = abs if abs is not None else rel * abs_arr.max()
+    return sparse.where(abs_arr < cutoff, 0, arr)
 
 def plot_raman(yscale="linear", figname="Raman.png", relative=False, w_min=None, w_max=None, ramanname=None):
     """

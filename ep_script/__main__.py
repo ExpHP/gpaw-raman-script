@@ -55,6 +55,7 @@ def main():
         p.add_argument('--polarizations', type=lambda s: list(s.split(',')), default=[i+o for i in 'xyz' for o in 'xyz'], help='comma-separated list of raman polarizations to do (e.g. xx,xy,xz)')
         p.add_argument('--write-mode-intensities', action='store_true', help='write mode intensities to a file.  Requires --no-permutations.')
         p.add_argument('--write-spectrum-plots', action='store_true', help='write raman plots')
+        p.add_argument('--write-contributions', action='store_true', help='write individual electronic state raman contributions to a NPZ file')
         p.add_argument('--permutations', choices=['original', 'fast', 'none'], default='original', help=
             'controls inclusion of nonresonant raman terms.'
             " '--permutations=original' (default) will include all terms, which is expensive."
@@ -84,6 +85,7 @@ def main():
             shift_step=args.shift_step,
             write_mode_intensities=args.write_mode_intensities,
             write_plots=args.write_spectrum_plots,
+            write_contributions=args.write_contributions,
         )
 
     p = subs.add_parser('ep')
@@ -500,7 +502,7 @@ def elph_do_supercell_matrix(log, calc, supercell):
 
     world.barrier()
 
-def elph_do_raman_spectra(calc, supercell, lasers, permutations, laser_broadening, phonon_broadening, shift_step, polarizations, write_mode_intensities, write_plots, phononname='phonons'):
+def elph_do_raman_spectra(calc, supercell, lasers, permutations, laser_broadening, phonon_broadening, shift_step, polarizations, write_mode_intensities, write_plots, write_contributions, phononname='phonons'):
     from ase.units import _hplanck, _c, J
 
     parprint('Computing phonons')
@@ -526,6 +528,7 @@ def elph_do_raman_spectra(calc, supercell, lasers, permutations, laser_broadenin
                     w_l=w_l, ramanname=name, d_i=d_i, d_o=d_o,
                     gamma_l=laser_broadening, phonon_sigma=phonon_broadening,
                     shift_step=shift_step, write_mode_intensities=write_mode_intensities,
+                    write_contributions=write_contributions,
                 )
 
             # And plotted
