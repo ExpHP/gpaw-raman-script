@@ -194,13 +194,19 @@ def make_suffix(s):
     else:
         return '_' + s
 
+TermId = tp.Literal['spl', 'slp', 'psl', 'pls', 'lsp', 'lps']
+
 @dataclass
 class RamanOutput:
     raman_lw: np.ndarray
-    contributions_lknnn_parts: tp.Optional[tp.List[sparse.GCXS]]
+    contributions_lktnnn_parts: tp.Optional[tp.List[sparse.GCXS]]
+    terms_t: tp.List[TermId]
     nphonons: int
     nibzkpts: int
     nbands: int
+
+    def term_index_from_str(self, term: str):
+        return self.terms_t.index(term)
 
 def calculate_raman(
     calc,
@@ -256,10 +262,12 @@ def calculate_raman(
     # l is the phonon mode and w is the raman shift
     output = RamanOutput(
         raman_lw = np.zeros((nphonons, len(w)), dtype=complex),
-        contributions_lknnn_parts = [] if write_contributions else None,
+        contributions_lktnnn_parts = [] if write_contributions else None,
         nphonons = nphonons,
         nibzkpts = nibzkpts,
         nbands = nbands,
+        # ordering found in Dresselhaus
+        terms_t = ['lps', 'lsp', 'spl', 'slp', 'pls', 'psl']
     )
 
     parprint("Evaluating Raman sum")
@@ -279,19 +287,19 @@ def calculate_raman(
 
     kcomm.sum(output.raman_lw)
 
-    contributions_lknnn = None
-    if output.contributions_lknnn_parts is not None:
-        contributions_lknnn = _sum_sparse_coo(output.contributions_lknnn_parts)
-        _mpi_sum_sparse_coo(contributions_lknnn, kcomm)
+    contributions_lktnnn = None
+    if output.contributions_lktnnn_parts is not None:
+        contributions_lktnnn = _sum_sparse_coo(output.contributions_lktnnn_parts)
+        _mpi_sum_sparse_coo(contributions_lktnnn, kcomm)
 
     if write_mode_intensities:
         # write values without the gaussian on shift
         if world.rank == 0:
             np.save("ModeI{}.npy".format(make_suffix(ramanname)), output.raman_lw[:, 0])
 
-    if contributions_lknnn is not None:
+    if contributions_lktnnn is not None:
         if world.rank == 0:
-            _write_raman_contributions(calc, contributions_lknnn, "Contrib{}.npz".format(make_suffix(ramanname)))
+            _write_raman_contributions(calc, contributions_lktnnn, output.terms_t, "Contrib{}.npz".format(make_suffix(ramanname)))
 
     RI = np.zeros(len(w))
     for l in range(nphonons):
@@ -355,6 +363,7 @@ def _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons):
     kcomm = calc.wfs.kd.comm
     E_kn = calc.band_structure().todict()["energies"][0]
 
+    out = []
     parprint("Distributing coupling terms")
     for k in range(nibzkpts):
         is_mine = k % kcomm.size == kcomm.rank
@@ -367,13 +376,13 @@ def _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons):
             elph_lnn = weight * np.array(elph_klnn[k], dtype=complex)
             mom_vnn = np.array(mom_vknn[:, k], dtype=complex)
             if is_mine:
-                yield _InfoAtK(
+                out.append(_InfoAtK(
                     k_index=k,
                     band_energy_n=E_kn[k],
                     band_occupation_n=f_n,
                     band_momentum_vnn=mom_vnn,
                     band_elph_lnn=elph_lnn,
-                )
+                ))
             else:
                 kcomm.send(elph_lnn, dest=k % kcomm.size, tag=k)
                 kcomm.send(mom_vnn, dest=k % kcomm.size, tag=nibzkpts + k)
@@ -387,28 +396,32 @@ def _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons):
                 kcomm.receive(elph_lnn, src=0, tag=k)
                 kcomm.receive(mom_vnn, src=0, tag=nibzkpts + k)
                 kcomm.receive(f_n, src=0, tag=2*nibzkpts + k)
-                yield _InfoAtK(
+                out.append(_InfoAtK(
                     k_index=k,
                     band_energy_n=E_kn[k],
                     band_occupation_n=f_n,
                     band_momentum_vnn=mom_vnn,
                     band_elph_lnn=elph_lnn,
-                )
+                ))
+    return out
 
-def _write_raman_contributions(calc, contributions_lknnn: sparse.COO, outpath):
+def _write_raman_contributions(calc, contributions_lktnnn: sparse.COO, terms_t: tp.List[TermId], outpath):
     np.savez_compressed(
         outpath,
         k_weight=calc.get_k_point_weights(),
         k_coords=calc.get_ibz_k_points(),
-        num_phonons=contributions_lknnn.shape[0],
-        num_ibzkpoints=contributions_lknnn.shape[1],
-        num_bands=contributions_lknnn.shape[2],
-        contrib_phonon=contributions_lknnn.coords[0, :],
-        contrib_band_k=contributions_lknnn.coords[1, :],
-        contrib_band_1=contributions_lknnn.coords[2, :],
-        contrib_band_2=contributions_lknnn.coords[3, :],
-        contrib_band_3=contributions_lknnn.coords[4, :],
-        contrib_value=contributions_lknnn.data,
+        num_phonons=contributions_lktnnn.shape[0],
+        num_ibzkpoints=contributions_lktnnn.shape[1],
+        num_terms=contributions_lktnnn.shape[2],
+        num_bands=contributions_lktnnn.shape[3],
+        contrib_phonon=contributions_lktnnn.coords[0, :],
+        contrib_band_k=contributions_lktnnn.coords[1, :],
+        contrib_term=contributions_lktnnn.coords[2, :],
+        contrib_band_1=contributions_lktnnn.coords[3, :],
+        contrib_band_2=contributions_lktnnn.coords[4, :],
+        contrib_band_3=contributions_lktnnn.coords[5, :],
+        contrib_value=contributions_lktnnn.data,
+        term_str=terms_t,
     )
 
 @dataclass
@@ -513,7 +526,7 @@ def _add_raman_terms_at_k(
     }[permutations]
     f3_out_ = lambda l: mask3(occu3) * mask3(mom[d_o]) / (w_l-w_ph[l]-mask3(Ediff_el.T) + 1j*gamma_l)
 
-    add_term = lambda fac1_VC, fac2_CC, fac3_CV, l, w: _add_single_raman_term_at_k(
+    add_term = lambda fac1_VC, fac2_CC, fac3_CV, l, w, id: _do_sum_over_bands_for_single_term(
         output,
         fac1_VC=fac1_VC,
         fac2_CC=fac2_CC,
@@ -521,6 +534,7 @@ def _add_raman_terms_at_k(
         k=k,
         l=l,
         w=w,
+        term_id=id,
         conduction_indices=conduction_indices,
         valence_indices=valence_indices,
     )
@@ -536,7 +550,7 @@ def _add_raman_terms_at_k(
         f3_out = f3_out_(l=l)
 
         # Resonant term.
-        add_term(f1_in, f2_elph, f3_out, l=l, w=None)
+        add_term(f1_in, f2_elph, f3_out, l=l, w=None, id='lps')
 
         # Include non-resonant terms?
         if permutations:
@@ -544,7 +558,7 @@ def _add_raman_terms_at_k(
             # the two that don't depend on the shift.
             #
             # This is the second of those terms.
-            add_term(f1_elph, f2_in, f3_out, l=l, w=None)
+            add_term(f1_elph, f2_in, f3_out, l=l, w=None, id='pls')
 
             # The remaining four terms depend on the raman shift in the original code.
             if permutations == 'fast':
@@ -553,10 +567,10 @@ def _add_raman_terms_at_k(
                 f3_in = f3_in_(l=l)
                 f3_elph = f3_elph_(l=l)
 
-                add_term(f1_in, f2_out, f3_elph, l=l, w=None)
-                add_term(f1_out, f2_in, f3_elph, l=l, w=None)
-                add_term(f1_elph, f2_out, f3_in, l=l, w=None)
-                add_term(f1_out, f2_elph, f3_in, l=l, w=None)
+                add_term(f1_in, f2_out, f3_elph, l=l, w=None, id='lsp')
+                add_term(f1_out, f2_in, f3_elph, l=l, w=None, id='slp')
+                add_term(f1_elph, f2_out, f3_in, l=l, w=None, id='psl')
+                add_term(f1_out, f2_elph, f3_in, l=l, w=None, id='spl')
 
             elif permutations == 'original':
                 for w in range(len(w_s)):
@@ -564,15 +578,16 @@ def _add_raman_terms_at_k(
                     f3_in = f3_in_(w=w, l=l)
                     f3_elph = f3_elph_(w=w, l=l)
 
-                    add_term(f1_in, f2_out, f3_elph, l=l, w=w)
-                    add_term(f1_out, f2_in, f3_elph, l=l, w=w)
-                    add_term(f1_elph, f2_out, f3_in, l=l, w=w)
-                    add_term(f1_out, f2_elph, f3_in, l=l, w=w)
+                    add_term(f1_in, f2_out, f3_elph, l=l, w=w, id='lsp')
+                    add_term(f1_out, f2_in, f3_elph, l=l, w=w, id='slp')
+                    add_term(f1_elph, f2_out, f3_in, l=l, w=w, id='psl')
+                    add_term(f1_out, f2_elph, f3_in, l=l, w=w, id='spl')
 
             else:
                 assert False, permutations
 
-def _add_single_raman_term_at_k(
+# Function for adding a single one of the six raman terms.
+def _do_sum_over_bands_for_single_term(
     output: RamanOutput,
     # the three factors to be multiplied
     fac1_VC,
@@ -580,6 +595,7 @@ def _add_single_raman_term_at_k(
     fac3_CV,
     # information about indices
     k, l, w,
+    term_id: TermId,
     conduction_indices,
     valence_indices,
 ):
@@ -591,12 +607,13 @@ def _add_single_raman_term_at_k(
 
     # NOTE: This repeats the numerical work done by einsum but I'm not too concerned about
     #       the performance of recording contributions...
-    if output.contributions_lknnn_parts is not None:
+    if output.contributions_lktnnn_parts is not None:
         assert w is None
 
         intermediate_truncate_threshold = 1e-13
 
         nphonons, nibzkpts, nbands = output.nphonons, output.nibzkpts, output.nbands
+        nterms = len(output.terms_t)
 
         # NOTE: It'd probably be more efficient to make the input masked arrays sparse rather
         #       than sparsifying them here, but don't want to force the code to depend on the
@@ -618,11 +635,12 @@ def _add_single_raman_term_at_k(
 
         # Add in the remaining axes by prepending constant indices.
         # This can be done using kron with an array that has a single nonzero element.
-        delta_lk = np.zeros((nphonons, nibzkpts))
-        delta_lk[l][k] = 1   # put our data at these fixed coordinates
-        output.contributions_lknnn_parts.append(sparse.kron(
-            delta_lk[:, :, None, None, None],
-            prod_nnn[None, None, :, :, :],
+        t = output.terms_t.index(term_id)
+        delta_lkt = np.zeros((nphonons, nibzkpts, nterms))
+        delta_lkt[l][k][t] = 1   # put our data at these fixed coordinates
+        output.contributions_lktnnn_parts.append(sparse.kron(
+            delta_lkt[:, :, :, None, None, None],
+            prod_nnn[None, None, None, :, :, :],
         ))
 
 def _truncate_sparse(arr, abs=None, rel=None):
