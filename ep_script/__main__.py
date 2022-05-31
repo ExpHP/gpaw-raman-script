@@ -56,6 +56,12 @@ def main():
         p.add_argument('--write-mode-intensities', action='store_true', help='write mode intensities to a file.  Requires --no-permutations.')
         p.add_argument('--write-spectrum-plots', action='store_true', help='write raman plots')
         p.add_argument('--write-contributions', action='store_true', help='write individual electronic state raman contributions to a NPZ file')
+        p.add_argument('--shift-type', choices=['stokes', 'anti-stokes'], default='stokes', help=
+            'selects sign of the phonon frequency in the energy conservation equation.'
+            " IMPORTANT: results of --shift-type 'anti-stokes' are not physical as they do not account"
+            ' for the occupation of the phonon states (there is no temperature dependence).  Currently the purpose of'
+            ' this flag is to demonstrate a relation between this sign factor and differences between off-diagonal'
+            ' raman tensor elements. (stokes XY is similar to anti-stokes YX, and etc.)')
         p.add_argument('--permutations', choices=['original', 'fast', 'none'], default='original', help=
             'controls inclusion of nonresonant raman terms.'
             " '--permutations=original' (default) will include all terms, which is expensive."
@@ -86,6 +92,7 @@ def main():
             write_mode_intensities=args.write_mode_intensities,
             write_plots=args.write_spectrum_plots,
             write_contributions=args.write_contributions,
+            shift_type=args.shift_type,
         )
 
     p = subs.add_parser('ep')
@@ -502,7 +509,20 @@ def elph_do_supercell_matrix(log, calc, supercell):
 
     world.barrier()
 
-def elph_do_raman_spectra(calc, supercell, lasers, permutations, laser_broadening, phonon_broadening, shift_step, polarizations, write_mode_intensities, write_plots, write_contributions, phononname='phonons'):
+def elph_do_raman_spectra(
+        calc,
+        supercell,
+        lasers,
+        permutations,
+        laser_broadening,
+        phonon_broadening,
+        shift_step,
+        shift_type,
+        polarizations,
+        write_mode_intensities,
+        write_plots,
+        write_contributions,
+        phononname='phonons'):
     from ase.units import _hplanck, _c, J
 
     parprint('Computing phonons')
@@ -521,13 +541,16 @@ def elph_do_raman_spectra(calc, supercell, lasers, permutations, laser_broadenin
                 raise ValueError(f'invalid polarization "{polarization}", should be two characters like "xy"')
             d_i = 'xyz'.index(polarization[0])
             d_o = 'xyz'.index(polarization[1])
-            name = "{}-{}".format(laser.text, polarization)
+            name = f"{laser.text}-{polarization}"
+            if shift_type == 'anti-stokes':
+                name = f"{name}-antistokes"
             if not os.path.isfile(f"RI_{name}.npy"):
                 leffers.calculate_raman(
                     calc=calc, w_ph=w_ph, permutations=permutations,
                     w_l=w_l, ramanname=name, d_i=d_i, d_o=d_o,
                     gamma_l=laser_broadening, phonon_sigma=phonon_broadening,
-                    shift_step=shift_step, write_mode_intensities=write_mode_intensities,
+                    shift_step=shift_step, shift_type=shift_type,
+                    write_mode_intensities=write_mode_intensities,
                     write_contributions=write_contributions,
                 )
 

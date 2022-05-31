@@ -221,6 +221,7 @@ def calculate_raman(
     d_i=0,
     d_o=0,
     shift_step=1,
+    shift_type='stokes',
     phonon_sigma=3,
     write_mode_intensities=False,
     write_contributions=False,
@@ -242,6 +243,7 @@ def calculate_raman(
     """
 
     assert permutations in [None, 'fast', 'original']
+    assert shift_type in ['stokes', 'anti-stokes']
 
     parprint("Calculating the Raman spectra: Laser frequency = {}".format(w_l))
 
@@ -252,8 +254,12 @@ def calculate_raman(
 
     if w_cm is None:
         w_cm = np.arange(0, int(w_ph.max()/cm) + 201, shift_step) * 1.0  # Defined in cm^-1
-    w = w_cm*cm
-    w_s = w_l-w
+    w_shift = w_cm*cm
+
+    if shift_type == 'stokes':
+        w_scatter = w_l - w_shift
+    elif shift_type == 'anti-stokes':
+        w_scatter = w_l + w_shift
     nphonons = len(w_ph)
 
     assert calc.wfs.gd.comm.size == 1, "domain parallelism not supported"  # not sure how to fix this, sorry
@@ -261,7 +267,7 @@ def calculate_raman(
     # ab is in and out polarization
     # l is the phonon mode and w is the raman shift
     output = RamanOutput(
-        raman_lw = np.zeros((nphonons, len(w)), dtype=complex),
+        raman_lw = np.zeros((nphonons, len(w_shift)), dtype=complex),
         contributions_lktnnn_parts = [] if write_contributions else None,
         nphonons = nphonons,
         nibzkpts = nibzkpts,
@@ -283,7 +289,7 @@ def calculate_raman(
 
     for info_at_k in _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons):
         print("For k = {}".format(info_at_k.k_index))
-        _add_raman_terms_at_k(output, w_l, gamma_l, (d_i, d_o), w_ph, w_s, info_at_k, permutations)
+        _add_raman_terms_at_k(output, w_l, gamma_l, (d_i, d_o), w_ph, w_scatter, info_at_k, shift_type, permutations)
 
     kcomm.sum(output.raman_lw)
 
@@ -301,12 +307,12 @@ def calculate_raman(
         if world.rank == 0:
             _write_raman_contributions(calc, contributions_lktnnn, output.terms_t, "Contrib{}.npz".format(make_suffix(ramanname)))
 
-    RI = np.zeros(len(w))
+    RI = np.zeros(len(w_shift))
     for l in range(nphonons):
         if w_ph[l].real >= 0:
             parprint(
                 "Phonon {} with energy = {} registered".format(l, w_ph[l]))
-            RI += (np.abs(output.raman_lw[l])**2)*np.array(gaussian(w-w_ph[l], sigma=phonon_sigma * cm))
+            RI += (np.abs(output.raman_lw[l])**2)*np.array(gaussian(w_shift-w_ph[l], sigma=phonon_sigma * cm))
 
     raman = np.vstack((w_cm, RI))
     if world.rank == 0:
@@ -440,6 +446,7 @@ def _add_raman_terms_at_k(
     w_ph,
     w_s,
     info_at_k,
+    shift_type: tp.Literal['stokes', 'anti-stokes'],
     permutations: tp.Literal[None, 'fast', 'original'],
 ):
     assert permutations in [None, 'fast', 'original']
@@ -452,8 +459,7 @@ def _add_raman_terms_at_k(
 
     # This is a refactoring of some code by Ulrik Leffers in https://gitlab.com/gpaw/gpaw/-/merge_requests/563,
     # which appears to be an implementation of Equation 10 in https://www.nature.com/articles/s41467-020-16529-6
-    # (though it most certainly does not map 1-1 to the symbols in that equation and I'm not sure
-    #  how to derive the formulas that are ultimately used in the code).
+    # (though it most certainly does not map 1-1 to the symbols in that equation).
     #
     # Third-order perturbation theory produces six terms based on the ordering of three events:
     # light absorption, phonon creation, light emission.
@@ -474,13 +480,20 @@ def _add_raman_terms_at_k(
     def cannot_compute(**_kw):
         assert False, '(bug) a function was unexpectedly called with permutations=None'
 
+    # Anti-stokes simply flips the sign of w_ph wherever it appears in the denominators.
+    # We can represent this with an "effective" w_ph.
+    w_ph_eff = {
+        'stokes': w_ph,
+        'anti-stokes': -w_ph,
+    }[shift_type]
+
     # In the code by Leffers, some denominators had explicit dependence on the scattered frequency,
     # making them significantly more expensive to compute.
     #
     # We suspect that this is unnecessary, allowing a much faster computation.
     get_w_s = {
         'original': lambda w: w_s[w],
-        'fast': lambda l: w_l - w_ph[l],
+        'fast': lambda l: w_l - w_ph_eff[l],
         None: cannot_compute,
     }[permutations]
 
@@ -503,7 +516,7 @@ def _add_raman_terms_at_k(
     # raman shift;  Instead they are all lambdas that produce a matrix with two band axes, and we'll
     # evaluate them at a single phonon/raman shift at a time.
     f1_in_ = lambda: mask1(occu1) * mask1(mom[d_i]) / (w_l-mask1(Ediff_el) + 1j*gamma_l)
-    f1_elph_ = lambda l: mask1(occu1) * mask1(elph[l]) / (-w_ph[l]-mask1(Ediff_el) + 1j*gamma_l)
+    f1_elph_ = lambda l: mask1(occu1) * mask1(elph[l]) / (-w_ph_eff[l]-mask1(Ediff_el) + 1j*gamma_l)
     f1_out_ = {
         'original': lambda w: mask1(occu1) * mask1(mom[d_o]) / (-get_w_s(w=w)-mask1(Ediff_el) + 1j*gamma_l),
         'fast': lambda l: mask1(occu1) * mask1(mom[d_o]) / (-get_w_s(l=l)-mask1(Ediff_el) + 1j*gamma_l),
@@ -515,16 +528,16 @@ def _add_raman_terms_at_k(
     f2_out_ = lambda: mask2(mom[d_o])
 
     f3_in_ = {
-        'original': lambda w, l: mask3(occu3) * mask3(mom[d_i]) / (-get_w_s(w=w)-w_ph[l]-mask3(Ediff_el.T) + 1j*gamma_l),
+        'original': lambda w, l: mask3(occu3) * mask3(mom[d_i]) / (-get_w_s(w=w)-w_ph_eff[l]-mask3(Ediff_el.T) + 1j*gamma_l),
         'fast': lambda l: mask3(occu3) * mask3(mom[d_i]) / (-w_l-mask3(Ediff_el.T) + 1j*gamma_l),
         None: cannot_compute,
     }[permutations]
     f3_elph_ = {
         'original': lambda w, l: mask3(occu3) * mask3(elph[l]) / (w_l-get_w_s(w=w)-mask3(Ediff_el.T) + 1j*gamma_l),
-        'fast': lambda l: mask3(occu3) * mask3(elph[l]) / (w_ph[l]-mask3(Ediff_el.T) + 1j*gamma_l),
+        'fast': lambda l: mask3(occu3) * mask3(elph[l]) / (w_ph_eff[l]-mask3(Ediff_el.T) + 1j*gamma_l),
         None: cannot_compute,
     }[permutations]
-    f3_out_ = lambda l: mask3(occu3) * mask3(mom[d_o]) / (w_l-w_ph[l]-mask3(Ediff_el.T) + 1j*gamma_l)
+    f3_out_ = lambda l: mask3(occu3) * mask3(mom[d_o]) / (w_l-w_ph_eff[l]-mask3(Ediff_el.T) + 1j*gamma_l)
 
     add_term = lambda fac1_VC, fac2_CC, fac3_CV, l, w, id: _do_sum_over_bands_for_single_term(
         output,
