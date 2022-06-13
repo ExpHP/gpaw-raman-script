@@ -296,7 +296,7 @@ def calculate_raman(
     contributions_lktnnn = None
     if output.contributions_lktnnn_parts is not None:
         contributions_lktnnn = _sum_sparse_coo(output.contributions_lktnnn_parts)
-        _mpi_sum_sparse_coo(contributions_lktnnn, kcomm)
+        contributions_lktnnn = _mpi_sum_sparse_coo(contributions_lktnnn, kcomm)
 
     if write_mode_intensities:
         # write values without the gaussian on shift
@@ -631,6 +631,8 @@ def _do_sum_over_bands_for_single_term(
         # NOTE: It'd probably be more efficient to make the input masked arrays sparse rather
         #       than sparsifying them here, but don't want to force the code to depend on the
         #       sparse package unless necessary.
+        # FIXME: The 'sparse' import has since been moved to the top of the file, does that mean
+        #        avoiding the dependency is no longer a concern?  (presumably thanks to conda?)
         def sparsify_factor(data_XY, X_indices, Y_indices):
             # convert our dense array on conduction/valance bands into a sparse array on all bands
             data_nn = np.zeros((nbands, nbands), dtype=complex)
