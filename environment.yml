@@ -10,8 +10,10 @@ dependencies:
   - matplotlib=3.5
   - conda-forge::gpaw=22.1
   - conda-forge::ase=3.22.1
+  - conda-forge::scipy=1.8
   - conda-forge::sparse=0.13
   - conda-forge::openmpi=4.1
+  - conda-forge::libstdcxx-ng=12.1
   - conda-forge::c-compiler=1.4
   - conda-forge::compilers=1.4
   - conda-forge::libblas=3.8=*openblas
