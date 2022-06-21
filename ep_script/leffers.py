@@ -377,10 +377,26 @@ def _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons):
         f_n = calc.wfs.collect_occupations(k, 0)
 
         if kcomm.rank == 0:
-            # FIXME: why is this / weight?!  Is f_n not what it seems to be?
+            # NOTE: The reason for this '/ weight' is because the occupancies returned by collect_occupations() for any given 'k'
+            #       lie in the interval '[0, weight]', while we want values in the interval [0, 1].
+            #
+            #       Why does gpaw scale them like this?  Well, as far as I can tell:
+            #
+            #       - The kpoint weights are chosen to sum to 2.0 when summed over symmetry-reduced kpoints.
+            #       - The 'weight' of a given ibzkpoint k is  2 x (size of k's symmetry star) / (total number of kpoints).
+            #
+            #       The purpose of the scaling by gpaw thus appears to be in order to make is so that, when the occupancies are summed
+            #       over all symmetry-reduced kpoints and all bands, the total is equal to the number of valence electrons.
             f_n = np.array(f_n / weight, dtype=float)
+            # FIXME: This usage of 'weight' right here seems evil.
+            #        ISTM the purpose is to scale the contributions by the symmetry multiplicity of k, but incorporating them
+            #        directly into the ELPH factors is insiduous and surprising!
+            #        (for a while now I've been planning to write a fix for an apparent 'missing symmetry weight' bug, until I
+            #         finally noticed the code was doing this!)
+            #               - ML
             elph_lnn = weight * np.array(elph_klnn[k], dtype=complex)
             mom_vnn = np.array(mom_vknn[:, k], dtype=complex)
+
             if is_mine:
                 out.append(_InfoAtK(
                     k_index=k,
@@ -474,7 +490,6 @@ def _add_raman_terms_at_k(
     Ediff_el = E_el[None,:]-E_el[:,None]  # antisymmetric tensor that shows up in all denominators
     occu1 = f_n[:,None] * (1-f_n[None,:])  # occupation-based part that always appears in the 1st tensor
     # FIXME: didn't I conclude earler that this should have f_n[None,:]?
-    #        (NOTE: be careful!!!  f_n is divided by symmetry weight...)
     occu3 = (1-f_n[:,None]) * np.ones((1, len(f_n)))  # occupation-based part that always appears in the 3rd tensor
 
     def cannot_compute(**_kw):
@@ -614,6 +629,9 @@ def _do_sum_over_bands_for_single_term(
 ):
     # For terms that don't depend on w, broadcast onto the w axis
     w_eff = slice(None) if w is None else w
+
+    # NOTE: in case you're wondering where the symmetry weight of 'k' is accounted for,
+    #       go look at how the elph array is obtained for InfoAtK
 
     # Here's the main thing we care about.
     output.raman_lw[l, w_eff] += np.einsum('si,ij,js->', fac1_VC, fac2_CC, fac3_CV)
