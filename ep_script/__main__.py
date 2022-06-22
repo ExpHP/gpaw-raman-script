@@ -53,7 +53,7 @@ def main():
         p.add_argument('--laser-broadening', type=float, default=0.2, help='broadening in eV (imaginary part added to light freqencies)')
         p.add_argument('--phonon-broadening', type=float, default=3, help='phonon gaussian variance in cm-1')
         p.add_argument('--polarizations', type=lambda s: list(s.split(',')), default=[i+o for i in 'xyz' for o in 'xyz'], help='comma-separated list of raman polarizations to do (e.g. xx,xy,xz)')
-        p.add_argument('--write-mode-intensities', action='store_true', help='write mode intensities to a file.  Requires --no-permutations.')
+        p.add_argument('--write-mode-intensities', action='store_true', help='write mode intensities to a file.  Incompatible with --permutations=original.')
         p.add_argument('--write-spectrum-plots', action='store_true', help='write raman plots')
         p.add_argument('--write-contributions', action='store_true', help='write individual electronic state raman contributions to a NPZ file')
         p.add_argument('--shift-type', choices=['stokes', 'anti-stokes'], default='stokes', help=
@@ -62,12 +62,15 @@ def main():
             ' for the occupation of the phonon states (there is no temperature dependence).  Currently the purpose of'
             ' this flag is to demonstrate a relation between this sign factor and differences between off-diagonal'
             ' raman tensor elements. (stokes XY is similar to anti-stokes YX, and etc.)')
-        p.add_argument('--permutations', choices=['original', 'fast', 'none'], default='original', help=
-            'controls inclusion of nonresonant raman terms.'
-            " '--permutations=original' (default) will include all terms, which is expensive."
-            " '--permutations=none' only includes the resonant term."
-            " '--permutations=fast' is an experimental setting which includes all terms without performance loss,"
-            " by using a slightly different formulation.")
+        p.add_argument('--permutations', choices=['original', 'default', 'fast', 'none'], default='default', help=
+            'controls inclusion of nonresonant raman terms in the raman spectral intensity'
+            " (i.e. event orderings other than light absorption, phonon emission, light emission)."
+            " '--permutations=default' will include all six orderings."
+            " '--permutations=none' only includes the resonant ordering."
+            " '--permutations=fast' is equivalent to --permutations=default."
+            " '--permutations=original' faithfully replicates Ulrik Leffer's original code; it includes all"
+            " nonresonant terms but is SIGNIFICANTLY slower than the default setting as it expresses some terms"
+            " as a function of the raman shift.")
         p.add_argument('--no-permutations', dest='permutations', action='store_const', const='none', help='alias for --permutations=none')
         DEFAULT_LASER_FREQS = '488,532,633nm'
         p.add_argument('--laser-freqs',
@@ -79,9 +82,13 @@ def main():
 
     def extract_raman_arguments(p, args):
         permutations = None if args.permutations == 'none' else args.permutations
+        if permutations == 'default':
+            permutations = 'fast'
+
         if args.write_mode_intensities and permutations == 'original':
             # requires a mode where raman_lw does not depend on w index
-            p.error(f"--write-mode-intensities requires --no-permutations or --permutations=fast")
+            p.error(f"--write-mode-intensities is incompatible with --permutations=original")
+
         return dict(
             laser_broadening=args.laser_broadening,
             phonon_broadening=args.phonon_broadening,
