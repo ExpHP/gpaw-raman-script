@@ -6,7 +6,7 @@ Implements https://www.nature.com/articles/s41467-020-16529-6
 
 ## Guided example
 
-https://gist.github.com/ExpHP/dce34c5008a0a1dffaf2bf2a1dfe7db9
+https://gist.github.com/ExpHP/49c1cdd3d34a24aa7414ac9d724e13a3
 
 ## Notice
 
