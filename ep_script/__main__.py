@@ -4,6 +4,7 @@ from . import symmetry
 from . import interop
 from . import utils
 from . import leffers
+from .leffers import _GPAW_without_domain_parallel
 
 import functools
 import os
@@ -530,9 +531,7 @@ def get_elph_data(atoms):
 def elph_do_supercell_matrix(log, calc, supercell):
     from gpaw.elph.electronphonon import ElectronPhononCoupling
 
-    # calculate_supercell_matrix breaks if parallelized over domains so parallelize over kpt instead
-    # (note: it prints messages from all processes but it DOES run faster with more processes)
-    supercell_atoms = GPAW('supercell.eq.gpw', txt=log, parallel={'domain': (1,1,1), 'band': 1, 'kpt': world.size}).get_atoms()
+    supercell_atoms = _GPAW_without_domain_parallel('supercell.eq.gpw', txt=log).get_atoms()
 
     elph = ElectronPhononCoupling(calc.atoms, supercell=supercell, calc=supercell_atoms.calc)
     elph.set_lcao_calculator(supercell_atoms.calc)

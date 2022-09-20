@@ -32,7 +32,7 @@ def get_elph_elements(atoms, gpw_name, calc_fd, sc=(1, 1, 1), basename=None, pho
     from ase.phonons import Phonons
     from gpaw.elph.electronphonon import ElectronPhononCoupling
 
-    calc_gs = GPAW(gpw_name)
+    calc_gs = _GPAW_without_domain_parallel(gpw_name)
     world = calc_gs.wfs.world
 
     #calc_fd = GPAW(**params_fd)
@@ -760,3 +760,10 @@ def plot_raman(yscale="linear", figname="Raman.png", relative=False, w_min=None,
             plt.yticks([])
         plt.savefig(figname, dpi=300)
         plt.clf()
+
+# calculate_supercell_matrix breaks if parallelized over domains so parallelize over kpt instead
+# (note: it prints messages from all processes but it DOES run faster with more processes)
+def _GPAW_without_domain_parallel(*args, **kw):
+    from ase.parallel import world
+    kw['parallel'] = {'domain': (1,1,1), 'band': 1, 'kpt': world.size}
+    return GPAW(*args, **kw)
