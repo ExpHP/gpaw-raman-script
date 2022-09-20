@@ -33,6 +33,8 @@ T = tp.TypeVar("T")
 
 DISPLACEMENT_DIST = 1e-2  # FIXME supply as arg to gpaw
 
+PROG = 'ep_script'
+
 def main():
     import argparse
 
@@ -134,7 +136,16 @@ def main():
     args = parser.parse_args()
 
     with start_log_entry('gpaw.log') as log:
-        args.func(args, log)
+        try:
+            args.func(args, log)
+        except UserError as e:
+            parprint(f'{PROG}: error: {e}', file=log)
+            raise
+
+class UserError(RuntimeError):
+    def __init__(self, message):
+        lines = message.split('\n')
+        super().__init__('\n' + ''.join(f'    {line}\n' for line in lines))
 
 def start_log_entry(path):
     logfile = paropen(path, 'a')
@@ -338,9 +349,18 @@ def main_elph__run_displacements(
 
     cache = ElphCache('elph')
     def do_structure(supercell_atoms, name):
+        filename = f'elph/cache.{name}.json'
         with cache.lock(name) as handle:
+            if handle is None:
+                if cache.read(name) is None:
+                    raise UserError(
+                        f"Detected lockfile (empty file) at  {filename}\n"
+                        "If the previous job for this file has terminated, please delete the file."
+                    )
+                else:
+                    parprint(f'== skipping  {filename}  (already computed)')
             if handle is not None:
-                parprint(f'== computing  elph/cache.{name}.json')
+                parprint(f'== computing  {filename}')
                 Vt_sG, dH_all_asp = get_elph_data(supercell_atoms)
                 forces = supercell_atoms.get_forces()
                 if world.rank == 0:
@@ -402,6 +422,12 @@ def elph_do_symmetry_expansion(supercell, calc, displacement_dist, phonon, disp_
     cache = ElphCache('elph')
     natoms_prim = len(calc.get_atoms())
     disp_values = [cache.read(f'sym-{index}') for index in range(len(disp_sites))]
+
+    if any(x is None for x in disp_values):
+        raise UserError(
+            "Detected unfinished computations in elph/ cache.\n"
+            "Please delete any empty files in elph/ and rerun the displacements step."
+        )
 
     # NOTE: phonon.symmetry includes pure translational symmetries of the supercell
     #       so we use an empty quotient group
@@ -588,7 +614,12 @@ class ElphCache:
 
     def read(self, displacement: tp.Union[interop.AseDisplacement, str]):
         d = self.cache[str(displacement)]
+        if d is None:
+            return None
         return ElphDataset(**d)
+
+    def is_empty_file(self, displacement: tp.Union[interop.AseDisplacement, str]):
+        return self.cache[str(displacement)] is None
 
     @contextmanager
     def lock(self, displacement: tp.Union[interop.AseDisplacement, str]):
