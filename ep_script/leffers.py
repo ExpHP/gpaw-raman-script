@@ -100,6 +100,9 @@ def get_dipole_transitions(calc, momname=None, basename=None):
     # par = MPI4PY()  # FIXME: use a comm from gpaw
     #calc = atoms.calc
 
+    # Non-root processes on GD comm seem to be missing kpoint data.
+    assert calc.wfs.gd.comm.size == 1, "domain parallelism not supported"  # not sure how to fix this, sorry
+
     bzk_kc = calc.get_ibz_k_points()
     n = calc.wfs.bd.nbands
     nk = np.shape(bzk_kc)[0]
