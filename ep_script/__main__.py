@@ -406,16 +406,16 @@ def main_elph__after_symmetry(
         log,
         raman_settings
 ):
+    # gqklnn, dip_vknm, and raman all don't support domain parallelism currently
+    calc = _GPAW_without_domain_parallel(structure_path)
+
     if not os.path.exists('gqklnn.npy'):
-        atoms = GPAW(structure_path).atoms
         supercell_atoms = GPAW('supercell.eq.gpw', txt=log).get_atoms()
-        leffers.get_elph_elements(atoms, gpw_name=structure_path, calc_fd=supercell_atoms.calc, sc=supercell, phononname='elph')
+        leffers.get_elph_elements(calc.atoms, gpw_name=structure_path, calc_fd=supercell_atoms.calc, sc=supercell, phononname='elph')
 
     if not os.path.isfile("dip_vknm.npy"):
-        calc = _GPAW_without_domain_parallel(structure_path)
         leffers.get_dipole_transitions(calc)
 
-    calc = GPAW(structure_path)
     elph_do_raman_spectra(calc, supercell, **raman_settings, phononname='elph')
 
 def elph_do_symmetry_expansion(supercell, calc, displacement_dist, phonon, disp_carts, disp_sites, supercell_atoms):
