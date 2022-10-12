@@ -29,7 +29,7 @@ def main():
     parser.add_argument('--fc-symmetry', action='store_true', help='make force constants symmetric and apply acoustic sum rule')
     parser.add_argument('-o', '--output', help='output npy file.  Each row will be a column eigenvector.  (this is the transpose of the eigenvector matrix)')
     parser.add_argument('--write-ase-forces', metavar='PREFIX', help='output forces in $PREFIX/cache.0x+.json and etc.')
-    parser.add_argument('--write-force-constants', help='output npy file for force constants')
+    parser.add_argument('--write-force-constants', action='append', help="output file for force constants. May have .npy or .hdf5 extension, otherwise will output phonopy's FORCE_CONSTANTS text format.")
     parser.add_argument('--write-frequencies', help='output npy file for frequencies')
     args = parser.parse_args()
 
@@ -49,8 +49,8 @@ def main():
     phonon.produce_force_constants()
     if args.fc_symmetry:
         phonon.symmetrize_force_constants()
-    if args.write_force_constants:
-        np.save(args.write_force_constants, phonon.get_force_constants())
+    for force_constants_filename in args.write_force_constants:
+        write_phonopy_force_constants(force_constants_filename, phonon)
     if args.write_ase_forces:
         write_ase_forces(args.write_ase_forces, phonon)
 
@@ -84,6 +84,29 @@ def get_displacement_amplitude(phonon):
     disp_norms = np.linalg.norm(disps, axis=1)
     np.testing.assert_allclose(disp_norms.min(), disp_norms.max())  # all should be approximately the same value
     return disp_norms.mean()
+
+def write_phonopy_force_constants(path: str, phonon: phonopy.Phonopy):
+    if path.lower().endswith('.npy'):
+        np.save(path, phonon.get_force_constants())
+
+    else:
+        from phonopy.interface.calculator import get_default_physical_units
+        from phonopy.file_IO import write_force_constants_to_hdf5, write_FORCE_CONSTANTS
+
+        p2s_map = phonon.primitive.p2s_map
+
+        if path.lower().endswith('.hdf5'):
+            physical_units = get_default_physical_units('vasp')
+            fc_unit = physical_units['force_constants_unit']
+            write_force_constants_to_hdf5(
+                phonon.get_force_constants(),
+                filename=path,
+                p2s_map=p2s_map,
+                physical_unit=fc_unit)
+        else:
+            fc = phonon.force_constants
+            write_FORCE_CONSTANTS(fc, p2s_map=p2s_map)
+
 
 def write_ase_forces(prefix, phonon, eq_forces = 0):
     if abs(np.linalg.det(phonon.get_supercell_matrix())) != 1:
