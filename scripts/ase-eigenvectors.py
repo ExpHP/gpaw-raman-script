@@ -3,10 +3,10 @@
 import argparse
 import os
 import sys
-import phonopy
-import itertools
 import pickle
 import numpy as np
+
+import ase.io.jsonio
 
 PROG = os.path.basename(sys.argv[0])
 
@@ -23,7 +23,10 @@ def main():
         description='',
     )
     parser.add_argument('GPW', help="gpaw GPW file for atoms")
-    parser.add_argument('--name', default='phonons', help="name for ASE force files (e.g. 'phonon')")
+    parser.add_argument('--name', default='elph', help=
+        "name of ASE JSON cache (e.g. 'phonon').  Must already have 'cache.0x+.json' and etc."
+        " The default of 'elph' is suitable for gpaw-raman-script's output."
+    )
     parser.add_argument('--manual', action='store_true', help='use own code to diagonalize instead of ASE (for debugging)')
     parser.add_argument('--method', default=DEFAULT_METHOD, help='set method for ASE (standard, frederiksen) (no effect for --manual)')
     parser.add_argument('--no-acoustic', action='store_false', dest='acoustic', help='enable acoustic sum rule option for ASE (no effect with --manual)')
@@ -73,7 +76,7 @@ def manual_dynmat(args):
     masses = GPAW(args.GPW).get_atoms().get_masses()
     natoms = len(masses)
 
-    read_force = lambda s: pickle.load(open(f'{args.name}.{s}.pckl', 'rb'))
+    read_force = lambda s: load_json_forces(f'{args.name}/cache.{s}.json')
     plus_forces = np.array([[read_force(f'{i}{xyz}+') for xyz in 'xyz'] for i in range(len(masses))])
     minus_forces = np.array([[read_force(f'{i}{xyz}-') for xyz in 'xyz'] for i in range(len(masses))])
 
@@ -84,18 +87,14 @@ def manual_dynmat(args):
 def ase_dynmat(args):
     from gpaw import GPAW
     from ase.phonons import Phonons
-    from ase.dft.kpoints import BandPath
 
     calc = GPAW(args.GPW)
     phonon = Phonons(calc.get_atoms(), name=args.name, delta=args.displacement)
     phonon.read(acoustic=args.acoustic, symmetrize=args.symmetrize, method=args.method)
     return phonon.compute_dynamical_matrix([0, 0, 0], phonon.D_N)
 
-def load_array(path):
-    if path.lower().endswith('.npy'):
-        return np.load(path)
-    else:
-        return pickle.load(open(path, 'rb'))
+def load_json_forces(path):
+    return ase.io.jsonio.read_json(path)['forces']
 
 # ------------------------------------------------------
 
