@@ -226,6 +226,7 @@ def calculate_raman(
     shift_step=1,
     shift_type='stokes',
     phonon_sigma=3,
+    kpoint_symmetry_bug=False,
     write_mode_intensities=False,
     write_contributions=False,
 ):
@@ -290,7 +291,7 @@ def calculate_raman(
         mom_vknn = None
         elph_klnn = None
 
-    for info_at_k in _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons):
+    for info_at_k in _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons, kpoint_symmetry_bug):
         print("For k = {}".format(info_at_k.k_index))
         _add_raman_terms_at_k(output, w_l, gamma_l, (d_i, d_o), w_ph, w_scatter, info_at_k, shift_type, permutations)
 
@@ -366,11 +367,26 @@ def _sum_sparse_coo_impl(coords_parts: tp.Iterable[np.ndarray], data_parts: tp.I
     all_data = np.concatenate(list(data_parts), axis=0)
     return sparse.COO(all_coords, all_data, shape=shape)
 
-def _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons):
+def _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons, kpoint_symmetry_bug: bool):
     nibzkpts = np.shape(calc.get_ibz_k_points())[0]
     nbands = calc.wfs.bd.nbands
     kcomm = calc.wfs.kd.comm
     E_kn = calc.band_structure().todict()["energies"][0]
+
+    def get_symmetry_applying_function(k, naive_weight):
+        if kpoint_symmetry_bug:
+            # naively account for multiplicity
+            return lambda value: value * naive_weight
+        else:
+            # elph and moment matrix elements are both conjugated under time inversion
+            assert not calc.symmetry.point_group, "general point group K-symmetry not supported"
+            if (
+                calc.symmetry.time_reversal
+                and not np.allclose(calc.wfs.kd.ibzk_kc[k], [0, 0, 0])
+            ):
+                return lambda tensor: 2 * tensor.real
+            else:
+                return lambda tensor: tensor
 
     out = []
     parprint("Distributing coupling terms")
@@ -391,18 +407,16 @@ def _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons):
             #       The purpose of the scaling by gpaw thus appears to be in order to make is so that, when the occupancies are summed
             #       over all symmetry-reduced kpoints and all bands, the total is equal to the number of valence electrons.
             f_n = np.array(f_n / weight, dtype=float)
-            # FIXME: This usage of 'weight' right here seems evil.
-            #        ISTM the purpose is to scale the contributions by the symmetry multiplicity of k, but incorporating them
-            #        directly into the ELPH factors is insiduous and surprising!
-            #        (for a while now I've been planning to write a fix for an apparent 'missing symmetry weight' bug, until I
-            #         finally noticed the code was doing this!)
-            #               - ML
-            elph_lnn = weight * np.array(elph_klnn[k], dtype=complex)
+            # NOTE: the original script accounted for symmetry multiplicity in elph
+            #       by multiplying in weight here, but we handle this after computing raman
+            #       to correctly handle matrix element conjugation
+            elph_lnn = np.array(elph_klnn[k], dtype=complex)
             mom_vnn = np.array(mom_vknn[:, k], dtype=complex)
 
             if is_mine:
                 out.append(_InfoAtK(
                     k_index=k,
+                    apply_sum_over_equivalent_k=get_symmetry_applying_function(k, weight),
                     band_energy_n=E_kn[k],
                     band_occupation_n=f_n,
                     band_momentum_vnn=mom_vnn,
@@ -412,23 +426,30 @@ def _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons):
                 kcomm.send(elph_lnn, dest=k % kcomm.size, tag=k)
                 kcomm.send(mom_vnn, dest=k % kcomm.size, tag=nibzkpts + k)
                 kcomm.send(f_n, dest=k % kcomm.size, tag=2*nibzkpts + k)
+                kcomm.send(weight, dest=k % kcomm.size, tag=3*nibzkpts + k)
         else:
             if is_mine:
                 elph_lnn = np.empty((nphonons, nbands, nbands), dtype=complex)
                 mom_vnn = np.empty((3, nbands, nbands), dtype=complex)
                 f_n = np.empty(nbands, dtype=float)
+                weight = np.empty((), dtype=float)
 
                 kcomm.receive(elph_lnn, src=0, tag=k)
                 kcomm.receive(mom_vnn, src=0, tag=nibzkpts + k)
                 kcomm.receive(f_n, src=0, tag=2*nibzkpts + k)
+                kcomm.receive(weight, src=0, tag=3*nibzkpts + k)
                 out.append(_InfoAtK(
                     k_index=k,
+                    apply_sum_over_equivalent_k=get_symmetry_applying_function(k, weight),
                     band_energy_n=E_kn[k],
                     band_occupation_n=f_n,
                     band_momentum_vnn=mom_vnn,
                     band_elph_lnn=elph_lnn,
                 ))
     return out
+
+def _get_kpoint_weight(calc, k):
+    weight_on_root = calc.wfs.collect_auxiliary("weight", k, 0)
 
 def _write_raman_contributions(calc, contributions_lktnnn: sparse.COO, terms_t: tp.List[TermId], outpath):
     np.savez_compressed(
@@ -452,6 +473,7 @@ def _write_raman_contributions(calc, contributions_lktnnn: sparse.COO, terms_t: 
 @dataclass
 class _InfoAtK:
     k_index: int
+    apply_sum_over_equivalent_k: tp.Callable[[np.ndarray], np.ndarray]
     band_occupation_n: np.ndarray
     band_energy_n: np.ndarray
     band_momentum_vnn: np.ndarray
@@ -495,9 +517,6 @@ def _add_raman_terms_at_k(
     # FIXME: didn't I conclude earler that this should have f_n[None,:]?
     occu3 = (1-f_n[:,None]) * np.ones((1, len(f_n)))  # occupation-based part that always appears in the 3rd tensor
 
-    def cannot_compute(**_kw):
-        assert False, '(bug) a function was unexpectedly called with permutations=None'
-
     # Anti-stokes simply flips the sign of w_ph wherever it appears in the denominators.
     # We can represent this with an "effective" w_ph.
     w_ph_eff = {
@@ -509,6 +528,8 @@ def _add_raman_terms_at_k(
     # making them significantly more expensive to compute.
     #
     # We suspect that this is unnecessary, allowing a much faster computation.
+    def cannot_compute(**_kw):
+        assert False, '(bug) a function was unexpectedly called with permutations=None'
     get_w_s = {
         'original': lambda w: w_s[w],
         'fast': lambda l: w_l - w_ph_eff[l],
@@ -568,6 +589,7 @@ def _add_raman_terms_at_k(
         term_id=id,
         conduction_indices=conduction_indices,
         valence_indices=valence_indices,
+        apply_sum_over_equivalent_k=info_at_k.apply_sum_over_equivalent_k,
     )
 
     # Some of these factors don't depend on anything and can be evaluated right now.
@@ -629,6 +651,7 @@ def _do_sum_over_bands_for_single_term(
     term_id: TermId,
     conduction_indices,
     valence_indices,
+    apply_sum_over_equivalent_k: tp.Callable[[np.ndarray], np.ndarray]
 ):
     # For terms that don't depend on w, broadcast onto the w axis
     w_eff = slice(None) if w is None else w
@@ -637,7 +660,9 @@ def _do_sum_over_bands_for_single_term(
     #       go look at how the elph array is obtained for InfoAtK
 
     # Here's the main thing we care about.
-    output.raman_lw[l, w_eff] += np.einsum('si,ij,js->', fac1_VC, fac2_CC, fac3_CV)
+    output.raman_lw[l, w_eff] += apply_sum_over_equivalent_k(
+        np.einsum('si,ij,js->', fac1_VC, fac2_CC, fac3_CV)
+    )
 
     # NOTE: This repeats the numerical work done by einsum but I'm not too concerned about
     #       the performance of recording contributions...
@@ -668,6 +693,7 @@ def _do_sum_over_bands_for_single_term(
         prod_nnn = sparse1_nn[:, :, None] * sparse2_nn[None, :, :] * sparse3_nn.T[:, None, :]
         prod_nnn = prod_nnn.tocoo()
         prod_nnn = _truncate_sparse(prod_nnn, rel=intermediate_truncate_threshold)
+        prod_nnn = apply_sum_over_equivalent_k(prod_nnn)
 
         # Add in the remaining axes by prepending constant indices.
         # This can be done using kron with an array that has a single nonzero element.

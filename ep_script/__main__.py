@@ -46,7 +46,7 @@ def main():
 
     def add_standard_arguments(p):
         p.add_argument('INPUT', help='.gpw file for unitcell, with structure and relevant parameters')
-        p.add_argument('--supercell', type=(lambda s: tuple(map(int, s))), dest='supercell', default=(1,1,1))
+        p.add_argument('--supercell', type=(lambda s: tuple(map(int, s.split()))), dest='supercell', default=(1,1,1), help='space-separated list of 3 integers with number of repeats along each cell vector')
         p.add_argument('--params-fd', help='json file with GPAW params to modify for finite displacement (supercell)')
         p.add_argument('--symmetry-tol', type=float, default=1e-5, help=
             'Symmetry tolerance for phonopy.  This needs to be provided on every run, even after displacements are done',
@@ -75,6 +75,11 @@ def main():
             " nonresonant terms but is SIGNIFICANTLY slower than the default setting as it expresses some terms"
             " as a function of the raman shift.")
         p.add_argument('--no-permutations', dest='permutations', action='store_const', const='none', help='alias for --permutations=none')
+        p.add_argument('--kpoint-symmetry-bug', action='store_true', help=
+            "Simulate a bug in old versions of the script that did not correctly "
+            "account for complex conjugation of matrix elements under time-inversion symmetry "
+            "when computing raman intensities. "
+            "The new behavior is consistent with the implementation in GPAW.")
         DEFAULT_LASER_FREQS = '488,532,633nm'
         p.add_argument('--laser-freqs',
             type=parse_laser_freqs, default=parse_laser_freqs(DEFAULT_LASER_FREQS), help=
@@ -103,6 +108,7 @@ def main():
             write_plots=args.write_spectrum_plots,
             write_contributions=args.write_contributions,
             shift_type=args.shift_type,
+            kpoint_symmetry_bug=args.kpoint_symmetry_bug,
         )
 
     p = subs.add_parser('ep')
@@ -231,7 +237,12 @@ def main_elph(
         symmetry_tol,
         disp_split,
         stop_after_displacements,
-        raman_settings):
+        raman_settings,
+):
+
+    if raman_settings['write_mode_intensities'] and raman_settings['permutations'] == 'original':
+        parprint(f"--write-mode-intensities requires --no-permutations or --permutations=fast")
+        sys.exit(1)
 
     main_elph__init(
         structure_path=structure_path,
@@ -239,9 +250,7 @@ def main_elph(
         supercell=supercell,
         log=log,
         symmetry_tol=symmetry_tol,
-        disp_split=disp_split,
-        stop_after_displacements=stop_after_displacements,
-        raman_settings=raman_settings)
+    )
 
     if disp_split == 'stop':
         parprint('stopping. (--disp-split=stop)')
@@ -278,14 +287,8 @@ def main_elph__init(
         supercell,
         log,
         symmetry_tol,
-        disp_split,
-        stop_after_displacements,
-        raman_settings):
+):
     from gpaw import GPAW
-
-    if raman_settings['write_mode_intensities'] and raman_settings['permutations'] == 'original':
-        parprint(f"--write-mode-intensities requires --no-permutations or --permutations=fast")
-        sys.exit(1)
 
     calc = GPAW(structure_path)
     if calc.wfs.kpt_u[0].C_nM is None:
@@ -336,7 +339,8 @@ def main_elph__run_displacements(
         supercell,
         log,
         symmetry_tol,
-        disp_split):
+        disp_split,
+):
 
     calc = GPAW(structure_path)
     supercell_atoms = GPAW('supercell.eq.gpw', txt=log).get_atoms()
@@ -418,7 +422,15 @@ def main_elph__after_symmetry(
 
     elph_do_raman_spectra(calc, supercell, **raman_settings, phononname='elph')
 
-def elph_do_symmetry_expansion(supercell, calc, displacement_dist, phonon, disp_carts, disp_sites, supercell_atoms):
+def elph_do_symmetry_expansion(
+        supercell,
+        calc,
+        displacement_dist,
+        phonon,
+        disp_carts,
+        disp_sites,
+        supercell_atoms,
+):
     from gpaw.elph.electronphonon import ElectronPhononCoupling
 
     cache = ElphCache('elph')
@@ -455,7 +467,7 @@ def elph_do_symmetry_expansion(supercell, calc, displacement_dist, phonon, disp_
         oper_cart_rots=oper_cart_rots,
         oper_cart_trans=oper_cart_trans,
         oper_deperms=oper_deperms,
-        )
+    )
 
     full_derivatives = symmetry.expand_derivs_by_symmetry(
         disp_sites,       # disp -> atom
@@ -555,7 +567,9 @@ def elph_do_raman_spectra(
         write_mode_intensities,
         write_plots,
         write_contributions,
-        phononname='phonons'):
+        kpoint_symmetry_bug,
+        phononname='phonons',
+):
     from ase.units import _hplanck, _c, J
 
     parprint('Computing phonons')
@@ -585,6 +599,7 @@ def elph_do_raman_spectra(
                     shift_step=shift_step, shift_type=shift_type,
                     write_mode_intensities=write_mode_intensities,
                     write_contributions=write_contributions,
+                    kpoint_symmetry_bug=kpoint_symmetry_bug,
                 )
 
             # And plotted
@@ -667,7 +682,7 @@ def get_minimum_displacements(
         supercell_matrix: np.ndarray,
         displacement_distance: float,
         phonopy_kw: dict = {},
-        ):
+):
     # note: applying phonopy_kw on load is necessary because phonopy will recompute symmetry
     parprint(f'Getting displacements... ()')
     phonon = phonopy.Phonopy(unitcell, supercell_matrix, factor=phonopy.units.VaspToTHz, **phonopy_kw)
@@ -722,12 +737,14 @@ def make_force_sets_and_excitations(cachepath, disp_filenames, phonon, atoms, ex
     return force_sets
 
 
-def expand_raman_by_symmetry(cachepath,
-                             phonon,
-                             disp_filenames,
-                             get_polarizability,
-                             ex_kw,
-                             subtract_equilibrium_polarizability):
+def expand_raman_by_symmetry(
+        cachepath,
+        phonon,
+        disp_filenames,
+        get_polarizability,
+        ex_kw,
+        subtract_equilibrium_polarizability,
+):
     if os.path.exists(cachepath):
         parprint(f'Found existing {cachepath}')
         return np.load(cachepath)

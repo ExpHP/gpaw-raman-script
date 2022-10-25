@@ -99,7 +99,7 @@ def write_phonopy_force_constants(path: str, phonon: phonopy.Phonopy):
             physical_units = get_default_physical_units('vasp')
             fc_unit = physical_units['force_constants_unit']
             write_force_constants_to_hdf5(
-                phonon.get_force_constants(),
+                phonon.force_constants,
                 filename=path,
                 p2s_map=p2s_map,
                 physical_unit=fc_unit)
