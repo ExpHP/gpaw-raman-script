@@ -227,7 +227,7 @@ def calculate_raman(
     shift_type='stokes',
     phonon_sigma=3,
     kpoint_symmetry_bug=False,
-    write_mode_intensities=False,
+    write_mode_amplitudes=False,
     write_contributions=False,
 ):
     """
@@ -302,10 +302,19 @@ def calculate_raman(
         contributions_lktnnn = _sum_sparse_coo(output.contributions_lktnnn_parts)
         contributions_lktnnn = _mpi_sum_sparse_coo(contributions_lktnnn, kcomm)
 
-    if write_mode_intensities:
+    if write_mode_amplitudes:
         # write values without the gaussian on shift
         if world.rank == 0:
-            np.save("ModeI{}.npy".format(make_suffix(ramanname)), output.raman_lw[:, 0])
+            if permutations == 'original':
+                np.save(
+                    "ModeA_lw{}.npy".format(make_suffix(ramanname)),
+                    np.vstack([[w_cm], output.raman_lw[:, :]]),
+                )
+            else:
+                np.save(
+                    "ModeA_l{}.npy".format(make_suffix(ramanname)),
+                    output.raman_lw[:, 0],
+                )
 
     if contributions_lktnnn is not None:
         if world.rank == 0:

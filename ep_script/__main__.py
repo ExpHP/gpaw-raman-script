@@ -56,7 +56,10 @@ def main():
         p.add_argument('--laser-broadening', type=float, default=0.2, help='broadening in eV (imaginary part added to light freqencies)')
         p.add_argument('--phonon-broadening', type=float, default=3, help='phonon gaussian variance in cm-1')
         p.add_argument('--polarizations', type=lambda s: list(s.split(',')), default=[i+o for i in 'xyz' for o in 'xyz'], help='comma-separated list of raman polarizations to do (e.g. xx,xy,xz)')
-        p.add_argument('--write-mode-intensities', action='store_true', help='write mode intensities to a file.  Incompatible with --permutations=original.')
+        p.add_argument('--write-mode-intensities', action='store_true', help='deprecated alias for --write-mode-amplitudes.')
+        p.add_argument('--write-mode-amplitudes', action='store_true', help=
+            'write mode amplitudes to files.  For --permutations=original, these will contain a second axis for the'
+            ' raman shift. (this dependence arises from the form of the matrix elements, and does not account for broadening)')
         p.add_argument('--write-spectrum-plots', action='store_true', help='write raman plots')
         p.add_argument('--write-contributions', action='store_true', help='write individual electronic state raman contributions to a NPZ file')
         p.add_argument('--shift-type', choices=['stokes', 'anti-stokes'], default='stokes', help=
@@ -93,9 +96,9 @@ def main():
         if permutations == 'default':
             permutations = 'fast'
 
-        if args.write_mode_intensities and permutations == 'original':
-            # requires a mode where raman_lw does not depend on w index
-            p.error(f"--write-mode-intensities is incompatible with --permutations=original")
+        write_mode_amplitudes = args.write_mode_intensities
+        if args.write_mode_intensities:
+            warnings.warn(f"--write-mode-intensities has been renamed to --write-mode-amplitudes")
 
         return dict(
             laser_broadening=args.laser_broadening,
@@ -104,7 +107,7 @@ def main():
             polarizations=args.polarizations,
             lasers=args.laser_freqs,
             shift_step=args.shift_step,
-            write_mode_intensities=args.write_mode_intensities,
+            write_mode_amplitudes=write_mode_amplitudes,
             write_plots=args.write_spectrum_plots,
             write_contributions=args.write_contributions,
             shift_type=args.shift_type,
@@ -239,11 +242,6 @@ def main_elph(
         stop_after_displacements,
         raman_settings,
 ):
-
-    if raman_settings['write_mode_intensities'] and raman_settings['permutations'] == 'original':
-        parprint(f"--write-mode-intensities requires --no-permutations or --permutations=fast")
-        sys.exit(1)
-
     main_elph__init(
         structure_path=structure_path,
         params_fd_path=params_fd_path,
@@ -564,7 +562,7 @@ def elph_do_raman_spectra(
         shift_step,
         shift_type,
         polarizations,
-        write_mode_intensities,
+        write_mode_amplitudes,
         write_plots,
         write_contributions,
         kpoint_symmetry_bug,
@@ -597,7 +595,7 @@ def elph_do_raman_spectra(
                     w_l=w_l, ramanname=name, d_i=d_i, d_o=d_o,
                     gamma_l=laser_broadening, phonon_sigma=phonon_broadening,
                     shift_step=shift_step, shift_type=shift_type,
-                    write_mode_intensities=write_mode_intensities,
+                    write_mode_amplitudes=write_mode_amplitudes,
                     write_contributions=write_contributions,
                     kpoint_symmetry_bug=kpoint_symmetry_bug,
                 )
