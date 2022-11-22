@@ -36,6 +36,9 @@ DISPLACEMENT_DIST = 1e-2  # FIXME supply as arg to gpaw
 
 PROG = 'ep_script'
 
+class EarlySuccessfulTermination(BaseException):
+    pass
+
 def main():
     import argparse
 
@@ -56,6 +59,9 @@ def main():
         p.add_argument('--laser-broadening', type=float, default=0.2, help='broadening in eV (imaginary part added to light freqencies)')
         p.add_argument('--phonon-broadening', type=float, default=3, help='phonon gaussian variance in cm-1')
         p.add_argument('--polarizations', type=lambda s: list(s.split(',')), default=[i+o for i in 'xyz' for o in 'xyz'], help='comma-separated list of raman polarizations to do (e.g. xx,xy,xz)')
+        p.add_argument('--no-displacement-symmetry',
+            dest='displacement_set', default='symmetry', const='6n', action='store_const', help=
+            'explicitly compute data at all 6N cartesian displacements, rather than using symmetry.')
         p.add_argument('--write-mode-intensities', action='store_true', help='deprecated alias for --write-mode-amplitudes.')
         p.add_argument('--write-mode-amplitudes', action='store_true', help=
             'write mode amplitudes to files.  For --permutations=original, these will contain a second axis for the'
@@ -128,6 +134,7 @@ def main():
         symmetry_tol=args.symmetry_tol,
         disp_split=DispSplit(0, 1) if args.disp_split is None else args.disp_split,
         stop_after_displacements=args.disp_split is not None,
+        displacement_set=args.displacement_set,
         raman_settings=extract_raman_arguments(p, args),
     ))
 
@@ -148,6 +155,8 @@ def main():
     with start_log_entry('gpaw.log') as log:
         try:
             args.func(args, log)
+        except EarlySuccessfulTermination:
+            pass
         except UserError as e:
             parprint(f'{PROG}: error: {e}', file=log)
             raise
@@ -241,6 +250,7 @@ def main_elph(
         disp_split,
         stop_after_displacements,
         raman_settings,
+        displacement_set,
 ):
     main_elph__init(
         structure_path=structure_path,
@@ -248,28 +258,23 @@ def main_elph(
         supercell=supercell,
         log=log,
         symmetry_tol=symmetry_tol,
+        displacement_set=displacement_set,
     )
-
-    if disp_split == 'stop':
-        parprint('stopping. (--disp-split=stop)')
-        return
 
     main_elph__run_displacements(
         structure_path=structure_path,
         supercell=supercell,
         log=log,
         symmetry_tol=symmetry_tol,
-        disp_split=disp_split)
+        disp_split=disp_split,
+        stop_after_displacements=stop_after_displacements,
+        displacement_set=displacement_set,
+    )
 
-    if stop_after_displacements:
-        parprint('stopping here due to --disp-split.  Please resume without it.')
-        return
-
-    main_elph__symmetry_expansion(
+    main_elph__do_supercell_matrix(
         structure_path=structure_path,
-        supercell=supercell,
         log=log,
-        symmetry_tol=symmetry_tol,
+        supercell=supercell,
     )
 
     main_elph__after_symmetry(
@@ -285,6 +290,7 @@ def main_elph__init(
         supercell,
         log,
         symmetry_tol,
+        displacement_set,
 ):
     from gpaw import GPAW
 
@@ -303,24 +309,25 @@ def main_elph__init(
 
     # atoms = Cluster(ase.build.molecule('CH4'))
     # atoms.minimal_box(4)
-    # atoms.pbc = True
-
-    if os.path.exists('phonopy_disp.yaml'):
-        parprint('using saved phonopy_disp.yaml')
-    else:
-        parprint('computing phonopy_disp.yaml')
-        world.barrier()  # avoid race condition where rank 0 creates file before others enter
-        phonon = get_minimum_displacements(
-            unitcell=ase_atoms_to_phonopy(calc.atoms),
-            supercell_matrix=np.diag(supercell),
-            displacement_distance=DISPLACEMENT_DIST,
-            phonopy_kw=dict(
-                symprec=symmetry_tol,
-            ),
-        )
-        if world.rank == 0:
-            phonon.save('phonopy_disp.yaml')
-        world.barrier()  # avoid race condition where rank 0 creates file before others enter
+    # atoms.pbc = Tr
+    
+    if displacement_set == 'symmetry':
+        if os.path.exists('phonopy_disp.yaml'):
+            parprint('using saved phonopy_disp.yaml')
+        else:
+            parprint('computing phonopy_disp.yaml')
+            world.barrier()  # avoid race condition where rank 0 creates file before others enter
+            phonon = get_minimum_displacements(
+                unitcell=ase_atoms_to_phonopy(calc.atoms),
+                supercell_matrix=np.diag(supercell),
+                displacement_distance=DISPLACEMENT_DIST,
+                phonopy_kw=dict(
+                    symprec=symmetry_tol,
+                ),
+            )
+            if world.rank == 0:
+                phonon.save('phonopy_disp.yaml')
+            world.barrier()  # avoid race condition where rank 0 creates file before others enter
 
     # Structure with initial guess of wavefunctions for displacement calculations.
     if os.path.exists('supercell.eq.gpw'):
@@ -338,19 +345,55 @@ def main_elph__run_displacements(
         log,
         symmetry_tol,
         disp_split,
+        stop_after_displacements,
+        displacement_set,
 ):
+    if disp_split == 'stop':
+        parprint('stopping. (--disp-split=stop)')
+        raise EarlySuccessfulTermination
 
+    main_elph__run_split_displacements(
+        structure_path=structure_path,
+        supercell=supercell,
+        log=log,
+        symmetry_tol=symmetry_tol,
+        disp_split=disp_split,
+        displacement_set=displacement_set,
+    )
+
+    if stop_after_displacements:
+        parprint('stopping here due to --disp-split.  Please resume without it.')
+        raise EarlySuccessfulTermination
+
+    main_elph__symmetry_expansion(
+        structure_path=structure_path,
+        supercell=supercell,
+        log=log,
+        symmetry_tol=symmetry_tol,
+        displacement_set=displacement_set,
+    )
+
+
+def main_elph__run_split_displacements(
+        structure_path,
+        supercell,
+        log,
+        symmetry_tol,
+        disp_split,
+        displacement_set,
+):
     calc = GPAW(structure_path)
     supercell_atoms = GPAW('supercell.eq.gpw', txt=log).get_atoms()
-
-    phonopy_kw = dict(symprec=symmetry_tol)
-    phonon = phonopy.load('phonopy_disp.yaml', produce_fc=False, **phonopy_kw)
-
     natoms_prim = len(calc.atoms)
-    disp_phonopy_sites, disp_carts = get_phonopy_displacements(phonon)
-    disp_sites = phonopy_sc_indices_to_ase_sc_indices(disp_phonopy_sites, natoms_prim, supercell)
 
     cache = ElphCache('elph')
+
+    if cache.has_all_cartesian_data(natoms=natoms_prim):
+        parprint('== skipping all displacement computations (found cached cartesian data)')
+        return
+
+    parprint('checking for any missing data at displacements')
+
     def do_structure(supercell_atoms, name):
         filename = f'elph/cache.{name}.json'
         with cache.lock(name) as handle:
@@ -373,10 +416,27 @@ def main_elph__run_displacements(
                         forces=forces,
                     ))
 
+    if displacement_set == 'symmetry':
+        phonopy_kw = dict(symprec=symmetry_tol)
+        phonon = phonopy.load('phonopy_disp.yaml', produce_fc=False, **phonopy_kw)
+        disp_phonopy_sites, disp_carts = get_phonopy_displacements(phonon)
+        disp_sites = phonopy_sc_indices_to_ase_sc_indices(disp_phonopy_sites, natoms_prim, supercell)
+        disp_keys = [f'sym-{disp_index}' for disp_index in range(len(disp_carts))]
+
+    elif displacement_set == '6n':
+        all_displacements = list(interop.AseDisplacement.iter(natoms_prim))
+        disp_sites = [disp.atom for disp in all_displacements]
+        disp_carts = [disp.cart_displacement(DISPLACEMENT_DIST) for disp in all_displacements]
+        disp_keys = all_displacements
+
+    else:
+        assert False, displacement_set
+
     if disp_split.index == 0:
         do_structure(supercell_atoms, 'eq')
 
-    for disp_index, displaced_atoms in enumerate(iter_displaced_structures(supercell_atoms, disp_sites, disp_carts)):
+    all_displaced_structures = iter_displaced_structures(supercell_atoms, disp_sites, disp_carts)
+    for disp_index, (disp_keys, displaced_atoms) in enumerate(zip(disp_keys, all_displaced_structures)):
         supercell_atoms.set_positions(displaced_atoms.get_positions())
         if (disp_index + 1) % disp_split.mod == disp_split.index:  # + 1 because equilibrium was zero
             do_structure(supercell_atoms, f'sym-{disp_index}')
@@ -386,21 +446,26 @@ def main_elph__symmetry_expansion(
         supercell,
         log,
         symmetry_tol,
+        displacement_set,
 ):
     calc = GPAW(structure_path)
     supercell_atoms = GPAW('supercell.eq.gpw', txt=log).get_atoms()
+    natoms_prim = len(calc.atoms)
+
+    if ElphCache('elph').has_all_cartesian_data(natoms_prim):
+        # no expansion necessary, either it was computed this run or is already cached
+        return
+
+    assert displacement_set == 'symmetry', displacement_set
+    parprint('generating data at cartesian displacements by expanding symmetry-reduced data.')
 
     phonopy_kw = dict(symprec=symmetry_tol)
     phonon = phonopy.load('phonopy_disp.yaml', produce_fc=False, **phonopy_kw)
 
-    natoms_prim = len(calc.atoms)
     disp_phonopy_sites, disp_carts = get_phonopy_displacements(phonon)
     disp_sites = phonopy_sc_indices_to_ase_sc_indices(disp_phonopy_sites, natoms_prim, supercell)
 
     elph_do_symmetry_expansion(supercell, calc, DISPLACEMENT_DIST, phonon, disp_carts, disp_sites, supercell_atoms)
-
-    if not os.path.exists(f'elph.supercell_matrix.{calc.parameters["basis"]}.pckl'):
-        elph_do_supercell_matrix(log=log, calc=calc, supercell=supercell)
 
 def main_elph__after_symmetry(
         structure_path,
@@ -538,9 +603,10 @@ def get_elph_data(atoms):
     dH_asp = interop.gpaw_broadcast_array_dict_to_dicts(calc.hamiltonian.dH_asp)
     return Vt_sG, dH_asp
 
-# function to scope variables
-def elph_do_supercell_matrix(log, calc, supercell):
+def main_elph__do_supercell_matrix(structure_path, log, supercell):
     from gpaw.elph.electronphonon import ElectronPhononCoupling
+
+    calc = GPAW(structure_path)
 
     supercell_atoms = _GPAW_without_domain_parallel('supercell.eq.gpw', txt=log).get_atoms()
 
@@ -626,13 +692,26 @@ class ElphCache:
         self.cache = MultiFileJSONCache(name)
 
     def read(self, displacement: tp.Union[interop.AseDisplacement, str]):
+        """ Reads entry if it exists. Throws if it does not. Returns None on empty JSON. """
         d = self.cache[str(displacement)]
         if d is None:
             return None
         return ElphDataset(**d)
 
+    def has_data(self, displacement: tp.Union[interop.AseDisplacement, str]):
+        try:
+            return self.cache[str(displacement)] is not None
+        except KeyError:
+            return False
+
+    def has_all_cartesian_data(self, natoms: int):
+        return all(self.has_data(disp) for disp in interop.AseDisplacement.iter(natoms))
+
     def is_empty_file(self, displacement: tp.Union[interop.AseDisplacement, str]):
-        return self.cache[str(displacement)] is None
+        try:
+            return self.cache[str(displacement)] is None
+        except KeyError:
+            return False
 
     @contextmanager
     def lock(self, displacement: tp.Union[interop.AseDisplacement, str]):

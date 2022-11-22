@@ -33,6 +33,7 @@ def main():
     parser.add_argument('--symmetrize', type=int, default=DEFAULT_SYMMETRIZE, help='set force constant symmetrization iterations for ASE (no effect with --manual)')
     parser.add_argument('--eigensolver', choices=list(EIGENSOLVER_CHOICES), default='np-eig', help=f'choices: {", ".join(EIGENSOLVER_CHOICES)}')
     parser.add_argument('--displacement', type=float, required=True, help='displacement distance that was used for forces')
+    parser.add_argument('--supercell', type=(lambda s: tuple(int(x) for x in s.split())), default=(1, 1, 1), help='supercell as space-separated string of 3 ints')
     parser.add_argument('-o', '--output', help='output npy file.  Each row will be a column eigenvector.  (this is the transpose of the eigenvector matrix)')
     parser.add_argument('--write-frequencies', help='output npy file for frequencies')
     args = parser.parse_args()
@@ -68,6 +69,8 @@ EIGENSOLVER_CHOICES = {
 
 def manual_dynmat(args):
     from gpaw import GPAW
+    if args.supercell != (1, 1, 1):
+        die('supercell not implemented for --manual')
     if args.acoustic is not True:
         warn('--no-acoustic has no effect for --manual')
     if args.symmetrize != DEFAULT_SYMMETRIZE:
@@ -89,7 +92,7 @@ def ase_dynmat(args):
     from ase.phonons import Phonons
 
     calc = GPAW(args.GPW)
-    phonon = Phonons(calc.get_atoms(), name=args.name, delta=args.displacement)
+    phonon = Phonons(calc.get_atoms(), name=args.name, delta=args.displacement, supercell=args.supercell)
     phonon.read(acoustic=args.acoustic, symmetrize=args.symmetrize, method=args.method)
     return phonon.compute_dynamical_matrix([0, 0, 0], phonon.D_N)
 
