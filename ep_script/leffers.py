@@ -201,17 +201,32 @@ def make_suffix(s):
 
 TermId = tp.Literal['spl', 'slp', 'psl', 'pls', 'lsp', 'lps']
 
+PARTICLE_TYPES = ['electron', 'hole']
+ParticleType = tp.Literal.__getitem__(tuple(PARTICLE_TYPES))
 @dataclass
 class RamanOutput:
     raman_lw: np.ndarray
-    contributions_lktnnn_parts: tp.Optional[tp.List[sparse.GCXS]]
-    terms_t: tp.List[TermId]
+    contributions_lkptnnn_parts: tp.Optional[tp.List[sparse.GCXS]]
     nphonons: int
     nibzkpts: int
     nbands: int
+    # ordering of the term and particle axes
+    terms_t: tp.List[TermId]
+    particles_p: tp.List[ParticleType]
 
-    def term_index_from_str(self, term: str):
+    def term_index_from_str(self, term: TermId):
         return self.terms_t.index(term)
+
+    def particle_index_from_str(self, particle_type: ParticleType):
+        return self.particles_p.index(particle_type)
+
+    @property
+    def nterms(self):
+        return len(self.terms_t)
+
+    @property
+    def nparticles(self):
+        return len(self.particles_p)
 
 def calculate_raman(
     calc,
@@ -228,6 +243,7 @@ def calculate_raman(
     shift_step=1,
     shift_type='stokes',
     phonon_sigma=3,
+    particle_types=PARTICLE_TYPES,
     kpoint_symmetry_bug=False,
     write_mode_amplitudes=False,
     write_contributions=False,
@@ -274,12 +290,13 @@ def calculate_raman(
     # l is the phonon mode and w is the raman shift
     output = RamanOutput(
         raman_lw = np.zeros((nphonons, len(w_shift)), dtype=complex),
-        contributions_lktnnn_parts = [] if write_contributions else None,
+        contributions_lkptnnn_parts = [] if write_contributions else None,
         nphonons = nphonons,
         nibzkpts = nibzkpts,
         nbands = nbands,
         # ordering found in Dresselhaus
-        terms_t = ['lps', 'lsp', 'spl', 'slp', 'pls', 'psl']
+        terms_t = ['lps', 'lsp', 'spl', 'slp', 'pls', 'psl'],
+        particles_p = ['electron', 'hole'],
     )
 
     parprint("Reading matrix elements")
@@ -297,14 +314,14 @@ def calculate_raman(
 
     for info_at_k in _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons, kpoint_symmetry_bug):
         print("For k = {}".format(info_at_k.k_index))
-        _add_raman_terms_at_k(output, w_l, gamma_l, (d_i, d_o), w_ph, w_scatter, info_at_k, shift_type, permutations)
+        _add_raman_terms_at_k(output, w_l, gamma_l, (d_i, d_o), w_ph, w_scatter, info_at_k, shift_type, permutations, particle_types)
 
     kcomm.sum(output.raman_lw)
 
-    contributions_lktnnn = None
-    if output.contributions_lktnnn_parts is not None:
-        contributions_lktnnn = _sum_sparse_coo(output.contributions_lktnnn_parts)
-        contributions_lktnnn = _mpi_sum_sparse_coo(contributions_lktnnn, kcomm)
+    contributions_lkptnnn = None
+    if output.contributions_lkptnnn_parts is not None:
+        contributions_lkptnnn = _sum_sparse_coo(output.contributions_lkptnnn_parts)
+        contributions_lkptnnn = _mpi_sum_sparse_coo(contributions_lkptnnn, kcomm)
 
     if write_mode_amplitudes:
         # write values without the gaussian on shift
@@ -321,9 +338,15 @@ def calculate_raman(
                 )
         world.barrier()
 
-    if contributions_lktnnn is not None:
+    if contributions_lkptnnn is not None:
         if world.rank == 0:
-            _write_raman_contributions(calc, contributions_lktnnn, output.terms_t, "Contrib{}.npz".format(make_suffix(ramanname)))
+            _write_raman_contributions(
+                "Contrib{}.npz".format(make_suffix(ramanname)),
+                calc,
+                contributions_lkptnnn,
+                output.terms_t,
+                particles_p=output.particles_p,
+            )
         world.barrier()
 
     RI = np.zeros(len(w_shift))
@@ -400,6 +423,9 @@ def _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons, kpoint_symmetry_
                 calc.symmetry.time_reversal
                 and not np.allclose(calc.wfs.kd.ibzk_kc[k], [0, 0, 0])
             ):
+                # FIXME: This is still not technically correct!  In the denominators there is a `+ i gamma`
+                #        which does not get conjugated at -K.  So rather than  `2 * Re(numer / denom)`
+                #        we should be doing `2 * Re(numer) / denom`.
                 return lambda tensor: 2 * tensor.real
             else:
                 return lambda tensor: tensor
@@ -464,22 +490,25 @@ def _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons, kpoint_symmetry_
                 ))
     return out
 
-def _write_raman_contributions(calc, contributions_lktnnn: sparse.COO, terms_t: tp.List[TermId], outpath):
+def _write_raman_contributions(outpath, calc, contributions_lkptnnn: sparse.COO, terms_t: tp.List[TermId], particles_p: tp.List[ParticleType]):
     np.savez_compressed(
         outpath,
         k_weight=calc.get_k_point_weights(),
         k_coords=calc.get_ibz_k_points(),
-        num_phonons=contributions_lktnnn.shape[0],
-        num_ibzkpoints=contributions_lktnnn.shape[1],
-        num_terms=contributions_lktnnn.shape[2],
-        num_bands=contributions_lktnnn.shape[3],
-        contrib_phonon=contributions_lktnnn.coords[0, :],
-        contrib_band_k=contributions_lktnnn.coords[1, :],
-        contrib_term=contributions_lktnnn.coords[2, :],
-        contrib_band_1=contributions_lktnnn.coords[3, :],
-        contrib_band_2=contributions_lktnnn.coords[4, :],
-        contrib_band_3=contributions_lktnnn.coords[5, :],
-        contrib_value=contributions_lktnnn.data,
+        num_phonons=contributions_lkptnnn.shape[0],
+        num_ibzkpoints=contributions_lkptnnn.shape[1],
+        num_terms=contributions_lkptnnn.shape[2],
+        num_particles=contributions_lkptnnn.shape[3],
+        num_bands=contributions_lkptnnn.shape[4],
+        contrib_phonon=contributions_lkptnnn.coords[0, :],
+        contrib_band_k=contributions_lkptnnn.coords[1, :],
+        contrib_particle=contributions_lkptnnn.coords[2, :],
+        contrib_term=contributions_lkptnnn.coords[3, :],
+        contrib_band_1=contributions_lkptnnn.coords[4, :],
+        contrib_band_2=contributions_lkptnnn.coords[5, :],
+        contrib_band_3=contributions_lkptnnn.coords[6, :],
+        contrib_value=contributions_lkptnnn.data,
+        particle_str=particles_p,
         term_str=terms_t,
     )
 
@@ -499,11 +528,14 @@ def _add_raman_terms_at_k(
     polarizations,
     w_ph,
     w_s,
-    info_at_k,
+    info_at_k: _InfoAtK,
     shift_type: tp.Literal['stokes', 'anti-stokes'],
     permutations: tp.Literal[None, 'fast', 'original'],
+    particle_types: tp.List[ParticleType],
 ):
     assert permutations in [None, 'fast', 'original']
+    assert len(set(particle_types)) == len(particle_types), "duplicate particle type"
+    assert not (set(particle_types) - set(PARTICLE_TYPES)), "bad particle type"
     d_i, d_o = polarizations
     k = info_at_k.k_index
     E_el = info_at_k.band_energy_n
@@ -553,13 +585,12 @@ def _add_raman_terms_at_k(
     # in one or more of the axes that we sum over.  Computing these elements is a waste of time.
     #
     # Define three lambdas that each mask a (nbands,nbands) matrix to only have bands appropriate in that position.
-    not0 = abs(f_n) > 1e-20
-    not1 = f_n != 1
-    mask1 = lambda mat: mat[not0][:, not1]
-    mask2 = lambda mat: mat[not1][:, not1]
-    mask3 = lambda mat: mat[not1][:, not0]
-    valence_indices = np.nonzero(not0)[0]
-    conduction_indices = np.nonzero(not1)[0]
+    isV_n = abs(f_n) > 1e-20
+    isC_n = f_n != 1
+    mask1 = lambda mat: mat[isV_n][:, isC_n]
+    mask3 = lambda mat: mat[isC_n][:, isV_n]
+    valence_indices = np.nonzero(isV_n)[0]
+    conduction_indices = np.nonzero(isC_n)[0]
 
     # And now, the 9 tensors.
     #
@@ -567,6 +598,8 @@ def _add_raman_terms_at_k(
     # Thus, to reduce memory requirements, I have rewritten them to not include axes for the phonon mode or
     # raman shift;  Instead they are all lambdas that produce a matrix with two band axes, and we'll
     # evaluate them at a single phonon/raman shift at a time.
+    #
+    # First event tensors
     f1_in_ = lambda: mask1(occu1) * mask1(mom[d_i]) / (w_l-mask1(Ediff_el) + 1j*gamma_l)
     f1_elph_ = lambda l: mask1(occu1) * mask1(elph[l]) / (-w_ph_eff[l]-mask1(Ediff_el) + 1j*gamma_l)
     f1_out_ = {
@@ -575,10 +608,7 @@ def _add_raman_terms_at_k(
         None: cannot_compute,
     }[permutations]
 
-    f2_in_ = lambda: mask2(mom[d_i])
-    f2_elph_ = lambda l: mask2(elph[l])
-    f2_out_ = lambda: mask2(mom[d_o])
-
+    # Third event tensors
     f3_in_ = {
         'original': lambda w, l: mask3(occu3) * mask3(mom[d_i]) / (-get_w_s(w=w)-w_ph_eff[l]-mask3(Ediff_el.T) + 1j*gamma_l),
         'fast': lambda l: mask3(occu3) * mask3(mom[d_i]) / (-w_l-mask3(Ediff_el.T) + 1j*gamma_l),
@@ -591,19 +621,30 @@ def _add_raman_terms_at_k(
     }[permutations]
     f3_out_ = lambda l: mask3(occu3) * mask3(mom[d_o]) / (w_l-w_ph_eff[l]-mask3(Ediff_el.T) + 1j*gamma_l)
 
-    add_term = lambda fac1_VC, fac2_CC, fac3_CV, l, w, id: _do_sum_over_bands_for_single_term(
-        output,
-        fac1_VC=fac1_VC,
-        fac2_CC=fac2_CC,
-        fac3_CV=fac3_CV,
-        k=k,
-        l=l,
-        w=w,
-        term_id=id,
-        conduction_indices=conduction_indices,
-        valence_indices=valence_indices,
-        apply_sum_over_equivalent_k=info_at_k.apply_sum_over_equivalent_k,
-    )
+    # Second event tensors
+    #
+    # Unlike the others, we don't mask these ahead of time because the masking
+    # is different for electron-electron transitions versus hole-hole transitions.
+    f2_in_ = lambda: mom[d_i]
+    f2_elph_ = lambda l: elph[l]
+    f2_out_ = lambda: mom[d_o]
+
+    def add_term(fac1_VC, fac2_nn, fac3_CV, l, w, id):
+        for particle_type in particle_types:
+            _do_sum_over_bands_for_single_term(
+                output,
+                fac1_VC=fac1_VC,
+                fac2_nn=fac2_nn,
+                fac3_CV=fac3_CV,
+                k=k,
+                l=l,
+                w=w,
+                particle_type=particle_type,
+                term_id=id,
+                conduction_indices=conduction_indices,
+                valence_indices=valence_indices,
+                apply_sum_over_equivalent_k=info_at_k.apply_sum_over_equivalent_k,
+            )
 
     # Some of these factors don't depend on anything and can be evaluated right now.
     f1_in = f1_in_()
@@ -656,11 +697,12 @@ def _add_raman_terms_at_k(
 def _do_sum_over_bands_for_single_term(
     output: RamanOutput,
     # the three factors to be multiplied
-    fac1_VC,
-    fac2_CC,
-    fac3_CV,
+    fac1_VC,   # already masked to [valence, conduction]
+    fac2_nn,   # not masked
+    fac3_CV,   # already masked to [conduction, valence]
     # information about indices
     k, l, w,
+    particle_type: ParticleType,
     term_id: TermId,
     conduction_indices,
     valence_indices,
@@ -673,19 +715,25 @@ def _do_sum_over_bands_for_single_term(
     #       go look at how the elph array is obtained for InfoAtK
 
     # Here's the main thing we care about.
-    output.raman_lw[l, w_eff] += apply_sum_over_equivalent_k(
-        np.einsum('si,ij,js->', fac1_VC, fac2_CC, fac3_CV)
-    )
+    if particle_type == 'electron':
+        fac2_CC = fac2_nn[conduction_indices][:, conduction_indices]
+        output.raman_lw[l, w_eff] += apply_sum_over_equivalent_k(
+            np.einsum('si,ij,js->', fac1_VC, fac2_CC, fac3_CV)
+        )
+    elif particle_type == 'hole':
+        fac2_VV = fac2_nn[valence_indices][:, valence_indices]
+        output.raman_lw[l, w_eff] -= apply_sum_over_equivalent_k(
+            np.einsum('si,ts,it->', fac1_VC, fac2_VV, fac3_CV)
+        )
+    else:
+        assert False, particle_type
 
     # NOTE: This repeats the numerical work done by einsum but I'm not too concerned about
     #       the performance of recording contributions...
-    if output.contributions_lktnnn_parts is not None:
+    if output.contributions_lkptnnn_parts is not None:
         assert w is None
 
         intermediate_truncate_threshold = 1e-13
-
-        nphonons, nibzkpts, nbands = output.nphonons, output.nibzkpts, output.nbands
-        nterms = len(output.terms_t)
 
         # NOTE: It'd probably be more efficient to make the input masked arrays sparse rather
         #       than sparsifying them here, but don't want to force the code to depend on the
@@ -694,28 +742,39 @@ def _do_sum_over_bands_for_single_term(
         #        avoiding the dependency is no longer a concern?  (presumably thanks to conda?)
         def sparsify_factor(data_XY, X_indices, Y_indices):
             # convert our dense array on conduction/valance bands into a sparse array on all bands
-            data_nn = np.zeros((nbands, nbands), dtype=complex)
+            data_nn = np.zeros((output.nbands, output.nbands), dtype=complex)
             data_nn[tuple(np.meshgrid(X_indices, Y_indices, indexing='ij'))] = data_XY
             sparse_nn = sparse.GCXS.from_numpy(data_nn)
 
             return _truncate_sparse(sparse_nn, rel=intermediate_truncate_threshold)
 
-        sparse1_nn = sparsify_factor(fac1_VC, valence_indices, conduction_indices)
-        sparse2_nn = sparsify_factor(fac2_CC, conduction_indices, conduction_indices)
-        sparse3_nn = sparsify_factor(fac3_CV, conduction_indices, valence_indices)
-        prod_nnn = sparse1_nn[:, :, None] * sparse2_nn[None, :, :] * sparse3_nn.T[:, None, :]
+        if particle_type == 'electron':
+            # make product whose indices are:   valence conduction1 conduction2
+            sparse1_nn = sparsify_factor(fac1_VC, valence_indices, conduction_indices)
+            sparse2_nn = sparsify_factor(fac2_CC, conduction_indices, conduction_indices)
+            sparse3_nn = sparsify_factor(fac3_CV, conduction_indices, valence_indices)
+            prod_nnn = sparse1_nn[:, :, None] * sparse2_nn[None, :, :] * sparse3_nn.T[:, None, :]
+        elif particle_type == 'hole':
+            # make product whose indices are:   valence1 conduction valence2
+            sparse1_nn = sparsify_factor(fac1_VC, valence_indices, conduction_indices)
+            sparse2_nn = sparsify_factor(fac2_VV, valence_indices, valence_indices)
+            sparse3_nn = sparsify_factor(fac3_CV, conduction_indices, valence_indices)
+            prod_nnn = -1 * sparse1_nn[:, :, None] * sparse2_nn.T[:, None, :] * sparse3_nn[None, :, :]
+        else:
+            assert False, particle_type
         prod_nnn = prod_nnn.tocoo()
         prod_nnn = _truncate_sparse(prod_nnn, rel=intermediate_truncate_threshold)
         prod_nnn = apply_sum_over_equivalent_k(prod_nnn)
 
         # Add in the remaining axes by prepending constant indices.
         # This can be done using kron with an array that has a single nonzero element.
-        t = output.terms_t.index(term_id)
-        delta_lkt = np.zeros((nphonons, nibzkpts, nterms))
-        delta_lkt[l][k][t] = 1   # put our data at these fixed coordinates
-        output.contributions_lktnnn_parts.append(sparse.kron(
-            delta_lkt[:, :, :, None, None, None],
-            prod_nnn[None, None, None, :, :, :],
+        t = output.term_index_from_str(term_id)
+        p = output.particle_index_from_str(particle_type)
+        delta_lkpt = np.zeros((output.nphonons, output.nibzkpts, output.nparticles, output.nterms))
+        delta_lkpt[l][k][p][t] = 1   # put our data at these fixed coordinates
+        output.contributions_lkptnnn_parts.append(sparse.kron(
+            delta_lkpt[:, :, :, :, None, None, None],
+            prod_nnn[None, None, None, None, :, :, :],
         ))
 
 def _truncate_sparse(arr, abs=None, rel=None):

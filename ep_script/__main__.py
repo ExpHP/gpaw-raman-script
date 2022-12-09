@@ -85,6 +85,9 @@ def main():
             ' for the occupation of the phonon states (there is no temperature dependence).  Currently the purpose of'
             ' this flag is to demonstrate a relation between this sign factor and differences between off-diagonal'
             ' raman tensor elements. (stokes XY is similar to anti-stokes YX, and etc.)')
+        g.add_argument('--particles', type=parse_particles, default=parse_particles('eh'), help=
+            'Specify which particle can transition during the second event.'
+            " 'e' for electron, 'h' for hole, 'eh' (the default) for both.")
         g.add_argument('--permutations', choices=['original', 'default', 'fast', 'none'], default='default', help=
             'controls inclusion of nonresonant raman terms in the raman spectral intensity'
             " (i.e. event orderings other than light absorption, phonon emission, light emission)."
@@ -233,6 +236,20 @@ class Laser:
     def __init__(self, text, wavelength_nm):
         self.text = text
         self.wavelength_nm = wavelength_nm
+
+def parse_particles(s) -> tp.List[leffers.ParticleType]:
+    from argparse import ArgumentTypeError
+
+    assert len(s) == len(set(s)), 'double character'
+    if s not in ['e', 'h', 'eh']:
+        raise ArgumentTypeError(f'particles must be e, h, or eh')
+
+    output = []
+    for c in s:
+        if c == 'e': output.append('electron')
+        elif c == 'h': output.append('hole')
+        else: assert False
+    return output
 
 # ==============================================================================
 
