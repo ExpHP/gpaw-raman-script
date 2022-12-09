@@ -436,10 +436,10 @@ def main_elph__run_split_displacements(
         do_structure(supercell_atoms, 'eq')
 
     all_displaced_structures = iter_displaced_structures(supercell_atoms, disp_sites, disp_carts)
-    for disp_index, (disp_keys, displaced_atoms) in enumerate(zip(disp_keys, all_displaced_structures)):
+    for disp_index, (disp_key, displaced_atoms) in enumerate(zip(disp_keys, all_displaced_structures)):
         supercell_atoms.set_positions(displaced_atoms.get_positions())
         if (disp_index + 1) % disp_split.mod == disp_split.index:  # + 1 because equilibrium was zero
-            do_structure(supercell_atoms, f'sym-{disp_index}')
+            do_structure(supercell_atoms, disp_key)
 
 def main_elph__symmetry_expansion(
         structure_path,
