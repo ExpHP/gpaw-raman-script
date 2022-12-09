@@ -82,6 +82,7 @@ def get_elph_elements(atoms, gpw_name, calc_fd, sc=(1, 1, 1), basename=None, pho
     if world.rank == 0:
         print("Saving the elctron-phonon coupling matrix")
         np.save("gqklnn{}.npy".format(make_suffix(basename)), np.array(g_qklnn))
+    world.barrier()
 
 def get_dipole_transitions(calc, momname=None, basename=None):
     """
@@ -181,6 +182,7 @@ def get_dipole_transitions(calc, momname=None, basename=None):
 
     if world.rank == 0:
         np.save('dip_vknm{}.npy'.format(make_suffix(momname)), dip_vknm)
+    world.barrier()
 
 
 def L(w, gamma=10/8065.544):
@@ -240,7 +242,7 @@ def calculate_raman(
         momname         Suffix for the momentumfile
         basename        Suffix for the gqklnn.npy files
         w_cm            Raman shift frequencies to compute at.
-        w_l, gamma_l    Laser energy, broadening factor for the electron energies
+        w_l, gamma_l    Laser energy, broadening factor for the electron energies (eV)
         d_i, d_o        Laser polarization in, out (0, 1, 2 for x, y, z respectively)
     Output:
         RI.npy          Numpy array containing the raman spectre
@@ -280,7 +282,7 @@ def calculate_raman(
         terms_t = ['lps', 'lsp', 'spl', 'slp', 'pls', 'psl']
     )
 
-    parprint("Evaluating Raman sum")
+    parprint("Reading matrix elements")
 
     kcomm = calc.wfs.kd.comm
     world = calc.wfs.world
@@ -290,6 +292,8 @@ def calculate_raman(
     else:
         mom_vknn = None
         elph_klnn = None
+
+    parprint("Evaluating Raman sum")
 
     for info_at_k in _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons, kpoint_symmetry_bug):
         print("For k = {}".format(info_at_k.k_index))
@@ -315,10 +319,12 @@ def calculate_raman(
                     "ModeA_l{}.npy".format(make_suffix(ramanname)),
                     output.raman_lw[:, 0],
                 )
+        world.barrier()
 
     if contributions_lktnnn is not None:
         if world.rank == 0:
             _write_raman_contributions(calc, contributions_lktnnn, output.terms_t, "Contrib{}.npz".format(make_suffix(ramanname)))
+        world.barrier()
 
     RI = np.zeros(len(w_shift))
     for l in range(nphonons):
@@ -330,6 +336,7 @@ def calculate_raman(
     raman = np.vstack((w_cm, RI))
     if world.rank == 0:
         np.save("RI{}.npy".format(make_suffix(ramanname)), raman)
+    world.barrier()
 
 def _mpi_sum_sparse_coo(arr: sparse.COO, comm):
     """ Sum a sparse.COO array onto rank 0 of an MPI communicator. """
@@ -456,9 +463,6 @@ def _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons, kpoint_symmetry_
                     band_elph_lnn=elph_lnn,
                 ))
     return out
-
-def _get_kpoint_weight(calc, k):
-    weight_on_root = calc.wfs.collect_auxiliary("weight", k, 0)
 
 def _write_raman_contributions(calc, contributions_lktnnn: sparse.COO, terms_t: tp.List[TermId], outpath):
     np.savez_compressed(
@@ -798,6 +802,7 @@ def plot_raman(yscale="linear", figname="Raman.png", relative=False, w_min=None,
             plt.yticks([])
         plt.savefig(figname, dpi=300)
         plt.clf()
+    world.barrier()
 
 # calculate_supercell_matrix breaks if parallelized over domains so parallelize over kpt instead
 # (note: it prints messages from all processes but it DOES run faster with more processes)

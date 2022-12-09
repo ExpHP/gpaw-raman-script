@@ -55,26 +55,37 @@ def main():
             'Symmetry tolerance for phonopy.  This needs to be provided on every run, even after displacements are done',
         )
 
-    def add_raman_arguments(p):
-        p.add_argument('--laser-broadening', type=float, default=0.2, help='broadening in eV (imaginary part added to light freqencies)')
-        p.add_argument('--phonon-broadening', type=float, default=3, help='phonon gaussian variance in cm-1')
-        p.add_argument('--polarizations', type=lambda s: list(s.split(',')), default=[i+o for i in 'xyz' for o in 'xyz'], help='comma-separated list of raman polarizations to do (e.g. xx,xy,xz)')
-        p.add_argument('--no-displacement-symmetry',
-            dest='displacement_set', default='symmetry', const='6n', action='store_const', help=
-            'explicitly compute data at all 6N cartesian displacements, rather than using symmetry.')
-        p.add_argument('--write-mode-intensities', action='store_true', help='deprecated alias for --write-mode-amplitudes.')
-        p.add_argument('--write-mode-amplitudes', action='store_true', help=
+    def add_raman_arguments(parser):
+        g = parser.add_argument_group('Raman Arguments', description=
+            'These arguments only affect the final raman computation and do not need to be'
+            ' provided when using --disp-split.'
+        )
+        g.add_argument('--laser-broadening', type=float, default=0.2, help='broadening in eV (imaginary part added to light freqencies)')
+        g.add_argument('--phonon-broadening', type=float, default=3, help='phonon gaussian variance in cm-1')
+        g.add_argument(
+            '--polarizations',
+            type=lambda s: list(s.split(',')),
+            default=[i+o for i in 'xyz' for o in 'xyz'],
+            help='comma-separated list of raman polarizations to do (e.g. xx,xy,xz)',
+        )
+        g.add_argument(
+            '--no-displacement-symmetry',
+            dest='displacement_set', default='symmetry', const='6n', action='store_const',
+            help='explicitly compute data at all 6N cartesian displacements, rather than using symmetry.',
+        )
+        g.add_argument('--write-mode-intensities', action='store_true', help='deprecated alias for --write-mode-amplitudes.')
+        g.add_argument('--write-mode-amplitudes', action='store_true', help=
             'write mode amplitudes to files.  For --permutations=original, these will contain a second axis for the'
             ' raman shift. (this dependence arises from the form of the matrix elements, and does not account for broadening)')
-        p.add_argument('--write-spectrum-plots', action='store_true', help='write raman plots')
-        p.add_argument('--write-contributions', action='store_true', help='write individual electronic state raman contributions to a NPZ file')
-        p.add_argument('--shift-type', choices=['stokes', 'anti-stokes'], default='stokes', help=
+        g.add_argument('--write-spectrum-plots', action='store_true', help='write raman plots')
+        g.add_argument('--write-contributions', action='store_true', help='write individual electronic state raman contributions to a NPZ file')
+        g.add_argument('--shift-type', choices=['stokes', 'anti-stokes'], default='stokes', help=
             'selects sign of the phonon frequency in the energy conservation equation.'
             " IMPORTANT: results of --shift-type 'anti-stokes' are not physical as they do not account"
             ' for the occupation of the phonon states (there is no temperature dependence).  Currently the purpose of'
             ' this flag is to demonstrate a relation between this sign factor and differences between off-diagonal'
             ' raman tensor elements. (stokes XY is similar to anti-stokes YX, and etc.)')
-        p.add_argument('--permutations', choices=['original', 'default', 'fast', 'none'], default='default', help=
+        g.add_argument('--permutations', choices=['original', 'default', 'fast', 'none'], default='default', help=
             'controls inclusion of nonresonant raman terms in the raman spectral intensity'
             " (i.e. event orderings other than light absorption, phonon emission, light emission)."
             " '--permutations=default' will include all six orderings."
@@ -83,19 +94,19 @@ def main():
             " '--permutations=original' faithfully replicates Ulrik Leffer's original code; it includes all"
             " nonresonant terms but is SIGNIFICANTLY slower than the default setting as it expresses some terms"
             " as a function of the raman shift.")
-        p.add_argument('--no-permutations', dest='permutations', action='store_const', const='none', help='alias for --permutations=none')
-        p.add_argument('--kpoint-symmetry-bug', action='store_true', help=
+        g.add_argument('--no-permutations', dest='permutations', action='store_const', const='none', help='alias for --permutations=none')
+        g.add_argument('--kpoint-symmetry-bug', action='store_true', help=
             "Simulate a bug in old versions of the script that did not correctly "
             "account for complex conjugation of matrix elements under time-inversion symmetry "
             "when computing raman intensities. "
             "The new behavior is consistent with the implementation in GPAW.")
         DEFAULT_LASER_FREQS = '488,532,633nm'
-        p.add_argument('--laser-freqs',
+        g.add_argument('--laser-freqs',
             type=parse_laser_freqs, default=parse_laser_freqs(DEFAULT_LASER_FREQS), help=
             'comma-separated list of laser wavelengths, followed by an optional unit (else assumed nm). '
             f'Default: {repr(DEFAULT_LASER_FREQS)}.  Available units: {", ".join(LASER_UNIT_CONVERSIONS)}')
 
-        p.add_argument('--shift-step', type=int, default=1, help='step for x axis of raman shift (cm-1)')
+        g.add_argument('--shift-step', type=int, default=1, help='step for x axis of raman shift (cm-1)')
 
     def extract_raman_arguments(p, args):
         permutations = None if args.permutations == 'none' else args.permutations
@@ -415,6 +426,7 @@ def main_elph__run_split_displacements(
                         dH_all_asp=dH_all_asp,
                         forces=forces,
                     ))
+                world.barrier()
 
     if displacement_set == 'symmetry':
         phonopy_kw = dict(symprec=symmetry_tol)
@@ -643,6 +655,7 @@ def elph_do_raman_spectra(
 
     if calc.world.rank == 0:
         np.save('frequencies.npy', w_ph * 8065.544)  # frequencies in cm-1
+    calc.world.barrier()
 
     # And the Raman spectra are calculated
     for laser in lasers:
@@ -801,6 +814,7 @@ def make_force_sets_and_excitations(cachepath, disp_filenames, phonon, atoms, ex
             parprint('Max equilibrium force during raman:', np.absolute(disp_forces).max())
         if world.rank == 0:
             np.save(force_filename, disp_forces)
+        world.barrier()
         ex.write(ex_filename)
 
     # combine force sets into one file
