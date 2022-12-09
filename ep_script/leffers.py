@@ -711,9 +711,6 @@ def _do_sum_over_bands_for_single_term(
     # For terms that don't depend on w, broadcast onto the w axis
     w_eff = slice(None) if w is None else w
 
-    # NOTE: in case you're wondering where the symmetry weight of 'k' is accounted for,
-    #       go look at how the elph array is obtained for InfoAtK
-
     # Here's the main thing we care about.
     if particle_type == 'electron':
         fac2_CC = fac2_nn[conduction_indices][:, conduction_indices]
