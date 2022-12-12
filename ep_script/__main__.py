@@ -132,6 +132,7 @@ def main():
             write_contributions=args.write_contributions,
             shift_type=args.shift_type,
             kpoint_symmetry_bug=args.kpoint_symmetry_bug,
+            particle_types=args.particles,
         )
 
     p = subs.add_parser('ep')
@@ -500,7 +501,7 @@ def main_elph__after_symmetry(
         structure_path,
         supercell,
         log,
-        raman_settings
+        raman_settings,
 ):
     # gqklnn, dip_vknm, and raman all don't support domain parallelism currently
     calc = _GPAW_without_domain_parallel(structure_path)
@@ -661,6 +662,7 @@ def elph_do_raman_spectra(
         write_plots,
         write_contributions,
         kpoint_symmetry_bug,
+        particle_types,
         phononname='phonons',
 ):
     from ase.units import _hplanck, _c, J
@@ -693,6 +695,7 @@ def elph_do_raman_spectra(
                     shift_step=shift_step, shift_type=shift_type,
                     write_mode_amplitudes=write_mode_amplitudes,
                     write_contributions=write_contributions,
+                    particle_types=particle_types,
                     kpoint_symmetry_bug=kpoint_symmetry_bug,
                 )
 
