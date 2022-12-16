@@ -560,8 +560,7 @@ def _add_raman_terms_at_k(
     # But first: Some parts common to many of the tensors.
     Ediff_el = E_el[None,:]-E_el[:,None]  # antisymmetric tensor that shows up in all denominators
     occu1 = f_n[:,None] * (1-f_n[None,:])  # occupation-based part that always appears in the 1st tensor
-    # FIXME: didn't I conclude earler that this should have f_n[None,:]?
-    occu3 = (1-f_n[:,None]) * np.ones((1, len(f_n)))  # occupation-based part that always appears in the 3rd tensor
+    occu3 = (1-f_n[:,None]) * f_n[None,:]  # occupation-based part that always appears in the 3rd tensor
 
     # Anti-stokes simply flips the sign of w_ph wherever it appears in the denominators.
     # We can represent this with an "effective" w_ph.
