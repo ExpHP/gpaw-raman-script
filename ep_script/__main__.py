@@ -103,6 +103,11 @@ def main():
             "account for complex conjugation of matrix elements under time-inversion symmetry "
             "when computing raman intensities. "
             "The new behavior is consistent with the implementation in GPAW.")
+        g.add_argument('--kpoint-symmetry-form', action='store_true', help=
+            "Simulate older versions of the script that handled kpoint symmetry "
+            "differently. for complex conjugation of matrix elements under time-inversion symmetry "
+            "when computing raman intensities. "
+            "The new behavior is consistent with the implementation in GPAW.")
         DEFAULT_LASER_FREQS = '488,532,633nm'
         g.add_argument('--laser-freqs',
             type=parse_laser_freqs, default=parse_laser_freqs(DEFAULT_LASER_FREQS), help=
@@ -503,15 +508,24 @@ def main_elph__after_symmetry(
         log,
         raman_settings,
 ):
-    # gqklnn, dip_vknm, and raman all don't support domain parallelism currently
+    # gsqklnn, mom_svknm, and raman all don't support domain parallelism currently
     calc = _GPAW_without_domain_parallel(structure_path)
 
-    if not os.path.exists('gqklnn.npy'):
+    if not os.path.exists('gsqklnn.npy'):
         supercell_atoms = GPAW('supercell.eq.gpw', txt=log).get_atoms()
-        leffers.get_elph_elements(calc.atoms, gpw_name=structure_path, calc_fd=supercell_atoms.calc, sc=supercell, phononname='elph')
+        g_sqklnn = leffers.get_elph_elements(calc_gs=calc, calc_fd=supercell_atoms.calc, supercell=supercell, phononname='elph')
+        if world.rank == 0:
+            print("Saving the electron-phonon coupling matrix")
+            np.save("gsqklnn.npy", np.array(g_sqklnn))
+        world.barrier()
 
-    if not os.path.isfile("dip_vknm.npy"):
-        leffers.get_dipole_transitions(calc)
+    if not os.path.isfile("mom_skvnm.npy"):
+        from gpaw.raman.dipoletransition import get_momentum_transitions
+        calc.initialize_positions(calc.get_atoms())
+        mom_skvnm = get_momentum_transitions(calc.wfs, savetofile=False)
+        if world.rank == 0:
+            np.save('mom_skvnm.npy', mom_skvnm)
+        world.barrier()
 
     elph_do_raman_spectra(calc, supercell, **raman_settings, phononname='elph')
 
@@ -663,7 +677,7 @@ def elph_do_raman_spectra(
         write_contributions,
         kpoint_symmetry_bug,
         particle_types,
-        phononname='phonons',
+        phononname,
 ):
     from ase.units import _hplanck, _c, J
 
@@ -675,6 +689,9 @@ def elph_do_raman_spectra(
     if calc.world.rank == 0:
         np.save('frequencies.npy', w_ph * 8065.544)  # frequencies in cm-1
     calc.world.barrier()
+
+    mom_skvnn = np.load("mom_skvnm.npy")
+    elph_sklnn = np.load("gsqklnn.npy")[:, 0]  # gamma point
 
     # And the Raman spectra are calculated
     for laser in lasers:
@@ -692,6 +709,7 @@ def elph_do_raman_spectra(
                     calc=calc, w_ph=w_ph, permutations=permutations,
                     w_l=w_l, ramanname=name, d_i=d_i, d_o=d_o,
                     gamma_l=laser_broadening, phonon_sigma=phonon_broadening,
+                    mom_skvnn=mom_skvnn, elph_sklnn=elph_sklnn,
                     shift_step=shift_step, shift_type=shift_type,
                     write_mode_amplitudes=write_mode_amplitudes,
                     write_contributions=write_contributions,

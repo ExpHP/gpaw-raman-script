@@ -11,179 +11,34 @@ from math import pi
 # GPAW/ASE
 from gpaw import GPAW, PW, FermiDirac
 from gpaw.fd_operators import Gradient
+import gpaw.kpoint
 
 from ase.phonons import Phonons
 from ase.parallel import parprint
 
-def get_elph_elements(atoms, gpw_name, calc_fd, sc=(1, 1, 1), basename=None, phononname='phonon'):
+def get_elph_elements(calc_gs, calc_fd, supercell, phononname='phonon'):
     """
         Evaluates the dipole transition matrix elements
 
         Input
         ----------
-        params_fd : Calculation parameters used for the phonon calculation
-        sc (tuple): Supercell, default is (1,1,1) used for gamma phonons
-        basename  : If you want give a specific name (gqklnn_{}.pckl)
+        calc_gs:    Ground state calculator on unit cell.
+        calc_fd:    Finite displacement calculator on supercell.
+        supercell (tuple): Supercell, default is (1,1,1) used for gamma phonons
 
         Output
         ----------
-        gqklnn.pckl, the electron-phonon matrix elements
+        g_sqklnn, the electron-phonon matrix elements
     """
     from ase.phonons import Phonons
-    from gpaw.elph.electronphonon import ElectronPhononCoupling
+    from gpaw.raman.elph import EPC
 
-    calc_gs = _GPAW_without_domain_parallel(gpw_name)
-    world = calc_gs.wfs.world
+    calc_gs.initialize_positions(calc_gs.get_atoms())
 
-    #calc_fd = GPAW(**params_fd)
-    calc_gs.initialize_positions(atoms)
-    kpts = calc_gs.get_ibz_k_points()
-    nk = len(kpts)
-    gamma_kpt = [[0, 0, 0]]
-    nbands = calc_gs.wfs.bd.nbands
-    qpts = gamma_kpt
-
-    # calc_fd.get_potential_energy()  # XXX needed to initialize C_nM ??????
-
-    # Phonon calculation, We'll read the forces from the elph.run function
-    # This only looks at gamma point phonons
-    ph = Phonons(atoms=atoms, name=phononname, supercell=sc)
-    ph.read()
-    frequencies, modes = ph.band_structure(qpts, modes=True)
-
-    if world.rank == 0:
-        print("Phonon frequencies are loaded.")
-
-    # Find el-ph matrix in the LCAO basis
-    elph = ElectronPhononCoupling(atoms, calc=None, supercell=sc)
-
-    elph.set_lcao_calculator(calc_fd)
-    elph.load_supercell_matrix()
-    if world.rank == 0:
-        print("Supercell matrix is loaded")
-
-    # Non-root processes on GD comm seem to be missing kpoint data.
-    assert calc_gs.wfs.gd.comm.size == 1, "domain parallelism not supported"  # not sure how to fix this, sorry
-
-    gcomm = calc_gs.wfs.gd.comm
-    kcomm = calc_gs.wfs.kd.comm
-    if gcomm.rank == 0:
-        # Find the bloch expansion coefficients
-        c_kn = np.empty((nk, nbands, calc_gs.wfs.setups.nao), dtype=complex)
-        for k in range(calc_gs.wfs.kd.nibzkpts):
-            c_k = calc_gs.wfs.collect_array("C_nM", k, 0)
-            if kcomm.rank == 0:
-                c_kn[k] = c_k
-        kcomm.broadcast(c_kn, 0)
-
-        # And we finally find the electron-phonon coupling matrix elements!
-        g_qklnn = elph.bloch_matrix(c_kn=c_kn, kpts=kpts, qpts=qpts, u_ql=modes)
-
-    if world.rank == 0:
-        print("Saving the elctron-phonon coupling matrix")
-        np.save("gqklnn{}.npy".format(make_suffix(basename)), np.array(g_qklnn))
-    world.barrier()
-
-def get_dipole_transitions(calc, momname=None, basename=None):
-    """
-    Finds the dipole matrix elements:
-    <\psi_n|\nabla|\psi_m> = <u_n|nabla|u_m> + ik<u_n|u_m> where psi_n = u_n(r)*exp(ikr).
-
-    Input:
-        atoms           Relevant ASE atoms object
-        momname         Suffix for the dipole transition file
-        basename        Suffix used for the gs.gpw file
-
-    Output:
-        dip_vknm.npy    Array with dipole matrix elements
-    """
-
-    # par = MPI4PY()  # FIXME: use a comm from gpaw
-    #calc = atoms.calc
-
-    # Non-root processes on GD comm seem to be missing kpoint data.
-    assert calc.wfs.gd.comm.size == 1, "domain parallelism not supported"  # not sure how to fix this, sorry
-
-    bzk_kc = calc.get_ibz_k_points()
-    n = calc.wfs.bd.nbands
-    nk = np.shape(bzk_kc)[0]
-
-    wfs = {}
-
-    parprint("Distributing wavefunctions.")
-
-    kcomm = calc.wfs.kd.comm
-    world = calc.wfs.world
-    if not calc.wfs.positions_set:
-        calc.initialize_positions()
-    for k in range(nk):
-        # Collects the wavefunctions and the projections to rank 0. Periodic -> u_n(r)
-        spin = 0 # FIXME
-        wf = np.array([calc.wfs.get_wave_function_array(
-            i, k, spin, realspace=True, periodic=True) for i in range(n)], dtype=complex)
-        P_nI = calc.wfs.collect_projections(k, spin)
-
-        # Distributes the information to rank k % size.
-        if kcomm.rank == 0:
-            if k % kcomm.size == kcomm.rank:
-                wfs[k] = wf, P_nI
-            else:
-                kcomm.send(P_nI, dest=k % kcomm.size, tag=nk+k)
-                kcomm.send(wf, dest=k % kcomm.size, tag=k)
-        else:
-            if k % kcomm.size == kcomm.rank:
-                nproj = sum(setup.ni for setup in calc.wfs.setups)
-                if not calc.wfs.collinear:
-                    nproj *= 2
-                P_nI = np.empty((calc.wfs.bd.nbands, nproj), calc.wfs.dtype)
-                shape = () if calc.wfs.collinear else(2,)
-                wf = np.tile(calc.wfs.empty(
-                    shape, global_array=True, realspace=True), (n, 1, 1, 1))
-
-                kcomm.receive(P_nI, src=0, tag=nk + k)
-                kcomm.receive(wf, src=0, tag=k)
-
-                wfs[k] = wf, P_nI
-
-    parprint("Evaluating dipole transition matrix elements.")
-
-    dip_vknm = np.zeros((3, nk, n, n), dtype=complex)
-    overlap_knm = np.zeros((nk, n, n), dtype=complex)
-
-    nabla_v = [Gradient(calc.wfs.gd, v, 1.0, 4,
-                        complex).apply for v in range(3)]
-    phases = np.ones((3, 2), dtype=complex)
-    grad_nv = calc.wfs.gd.zeros((n, 3), complex)
-
-    for k, (wf, P_nI) in wfs.items():
-        # Calculate <phit|nabla|phit> for the pseudo wavefunction
-        for v in range(3):
-            for i in range(n):
-                nabla_v[v](wf[i], grad_nv[i, v], phases)
-
-        dip_vknm[:, k] = np.transpose(
-            calc.wfs.gd.integrate(wf, grad_nv), (2, 0, 1))
-
-        overlap_knm[k] = [calc.wfs.gd.integrate(wf[i], wf) for i in range(n)]
-        k_v = np.dot(calc.wfs.kd.ibzk_kc[k], calc.wfs.gd.icell_cv) * 2 * pi
-        dip_vknm[:, k] += 1j*k_v[:, None, None]*overlap_knm[None, k, :, :]
-
-        # The PAW corrections are added - see https://wiki.fysik.dtu.dk/gpaw/dev/documentation/tddft/dielectric_response.html#paw-terms
-        I1 = 0
-        # np.einsum is slow but very memory efficient.
-        for a, setup in enumerate(calc.wfs.setups):
-            I2 = I1 + setup.ni
-            P_ni = P_nI[:, I1:I2]
-            dip_vknm[:, k, :, :] += np.einsum('ni,ijv,mj->vnm',
-                                              P_ni.conj(), setup.nabla_iiv, P_ni)
-            I1 = I2
-
-    world.sum(dip_vknm)
-
-    if world.rank == 0:
-        np.save('dip_vknm{}.npy'.format(make_suffix(momname)), dip_vknm)
-    world.barrier()
-
+    phonon = Phonons(atoms=calc_gs.get_atoms(), name=phononname, supercell=supercell)
+    epc = EPC(calc_gs.atoms, calc=calc_fd, supercell=supercell)
+    g_sqklnn = epc.get_elph_matrix(calc_gs, phonon, savetofile=False)
+    return g_sqklnn
 
 def L(w, gamma=10/8065.544):
     # Lorentzian
@@ -206,10 +61,11 @@ ParticleType = tp.Literal.__getitem__(tuple(PARTICLE_TYPES))
 @dataclass
 class RamanOutput:
     raman_lw: np.ndarray
-    contributions_lkptnnn_parts: tp.Optional[tp.List[sparse.GCXS]]
+    contributions_lksptnnn_parts: tp.Optional[tp.List[sparse.GCXS]]
     nphonons: int
     nibzkpts: int
     nbands: int
+    nspins: int
     # ordering of the term and particle axes
     terms_t: tp.List[TermId]
     particles_p: tp.List[ParticleType]
@@ -235,11 +91,11 @@ def calculate_raman(
     d_i,
     d_o,
     w_l,
+    mom_skvnn,
+    elph_sklnn,
     permutations='original',
     w_cm=None,
     ramanname=None,
-    momname=None,
-    basename=None,
     gamma_l=0.2,
     shift_step=1,
     shift_type='stokes',
@@ -256,8 +112,8 @@ def calculate_raman(
         w_ph            Gamma phonon energies in eV.
         permutations    Use only resonant term (None) or all terms ('original' or 'fast')
         ramanname       Suffix for the raman.npy file
-        momname         Suffix for the momentumfile
-        basename        Suffix for the gqklnn.npy files
+        mom_skvnn       Momentum transition elements
+        elph_sklnn      Elph elements for gamma phonons
         w_cm            Raman shift frequencies to compute at.
         w_l, gamma_l    Laser energy, broadening factor for the electron energies (eV)
         d_i, d_o        Laser polarization in, out (0, 1, 2 for x, y, z respectively)
@@ -271,7 +127,6 @@ def calculate_raman(
     parprint("Calculating the Raman spectra: Laser frequency = {}".format(w_l))
 
     bzk_kc = calc.get_ibz_k_points()
-    nbands = calc.wfs.bd.nbands
     nibzkpts = np.shape(bzk_kc)[0]
     cm = 1/8065.544
 
@@ -291,10 +146,11 @@ def calculate_raman(
     # l is the phonon mode and w is the raman shift
     output = RamanOutput(
         raman_lw = np.zeros((nphonons, len(w_shift)), dtype=complex),
-        contributions_lkptnnn_parts = [] if write_contributions else None,
+        contributions_lksptnnn_parts = [] if write_contributions else None,
         nphonons = nphonons,
         nibzkpts = nibzkpts,
-        nbands = nbands,
+        nbands = calc.wfs.bd.nbands,
+        nspins = calc.wfs.nspins,
         # ordering found in Dresselhaus
         terms_t = ['lps', 'lsp', 'spl', 'slp', 'pls', 'psl'],
         particles_p = ['electron', 'hole'],
@@ -304,25 +160,19 @@ def calculate_raman(
 
     kcomm = calc.wfs.kd.comm
     world = calc.wfs.world
-    if kcomm.rank == 0:
-        mom_vknn = np.load("dip_vknm{}.npy".format(make_suffix(momname)))  # [:,k,:,:]dim, k
-        elph_klnn = np.load("gqklnn{}.npy".format(make_suffix(basename)))[0]  # [0,k,l,n,m]
-    else:
-        mom_vknn = None
-        elph_klnn = None
 
     parprint("Evaluating Raman sum")
 
-    for info_at_k in _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons, kpoint_symmetry_bug):
-        print("For k = {}".format(info_at_k.k_index))
+    for info_at_k in _distribute_bands_by_k(calc, mom_skvnn=mom_skvnn, elph_sklnn=elph_sklnn, kpoint_symmetry_bug=kpoint_symmetry_bug):
+        print(f"For (k, s) = ({info_at_k.kpt.k}, {info_at_k.kpt.s})".format(info_at_k.kpt.s))
         _add_raman_terms_at_k(output, w_l, gamma_l, (d_i, d_o), w_ph, w_scatter, info_at_k, shift_type, permutations, particle_types)
 
     kcomm.sum(output.raman_lw)
 
-    contributions_lkptnnn = None
-    if output.contributions_lkptnnn_parts is not None:
-        contributions_lkptnnn = _sum_sparse_coo(output.contributions_lkptnnn_parts)
-        contributions_lkptnnn = _mpi_sum_sparse_coo(contributions_lkptnnn, kcomm)
+    contributions_lksptnnn = None
+    if output.contributions_lksptnnn_parts is not None:
+        contributions_lksptnnn = _sum_sparse_coo(output.contributions_lksptnnn_parts)
+        contributions_lksptnnn = _mpi_sum_sparse_coo(contributions_lksptnnn, kcomm)
 
     if write_mode_amplitudes:
         # write values without the gaussian on shift
@@ -339,12 +189,12 @@ def calculate_raman(
                 )
         world.barrier()
 
-    if contributions_lkptnnn is not None:
+    if contributions_lksptnnn is not None:
         if world.rank == 0:
             _write_raman_contributions(
                 "Contrib{}.npz".format(make_suffix(ramanname)),
                 calc,
-                contributions_lkptnnn,
+                contributions_lksptnnn,
                 output.terms_t,
                 particles_p=output.particles_p,
             )
@@ -407,22 +257,19 @@ def _sum_sparse_coo_impl(coords_parts: tp.Iterable[np.ndarray], data_parts: tp.I
     all_data = np.concatenate(list(data_parts), axis=0)
     return sparse.COO(all_coords, all_data, shape=shape)
 
-def _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons, kpoint_symmetry_bug: bool):
-    nibzkpts = np.shape(calc.get_ibz_k_points())[0]
-    nbands = calc.wfs.bd.nbands
-    kcomm = calc.wfs.kd.comm
-    E_kn = calc.band_structure().todict()["energies"][0]
+def _distribute_bands_by_k(calc, mom_skvnn, elph_sklnn, kpoint_symmetry_bug: bool):
+    E_skn = calc.band_structure().todict()["energies"]
 
-    def get_symmetry_applying_function(k, naive_weight):
+    def get_symmetry_applying_function(kpt):
         if kpoint_symmetry_bug:
             # naively account for multiplicity
-            return lambda value: value * naive_weight
+            return lambda value: value * kpt.weight
         else:
             # elph and moment matrix elements are both conjugated under time inversion
             assert not calc.symmetry.point_group, "general point group K-symmetry not supported"
             if (
                 calc.symmetry.time_reversal
-                and not np.allclose(calc.wfs.kd.ibzk_kc[k], [0, 0, 0])
+                and not np.allclose(calc.wfs.kd.ibzk_kc[kpt.k], [0, 0, 0])
             ):
                 # FIXME: This is still not technically correct!  In the denominators there is a `+ i gamma`
                 #        which does not get conjugated at -K.  So rather than  `2 * Re(numer / denom)`
@@ -433,89 +280,61 @@ def _distribute_bands_by_k(calc, mom_vknn, elph_klnn, nphonons, kpoint_symmetry_
 
     out = []
     parprint("Distributing coupling terms")
-    for k in range(nibzkpts):
-        is_mine = k % kcomm.size == kcomm.rank
-        weight = calc.wfs.collect_auxiliary("weight", k, 0)
-        f_n = calc.wfs.collect_occupations(k, 0)
+    for kpt in calc.wfs.kpt_u:
+        # NOTE: The reason for this '/ weight' is because the occupancies returned by collect_occupations() for any given 'k'
+        #       lie in the interval '[0, weight]', while we want values in the interval [0, 1].
+        #
+        #       Why does gpaw scale them like this?  Well, as far as I can tell:
+        #
+        #       - The kpoint weights are chosen to sum to 2.0 when summed over symmetry-reduced kpoints.
+        #       - The 'weight' of a given ibzkpoint k is  2 x (size of k's symmetry star) / (total number of kpoints).
+        #
+        #       The purpose of the scaling by gpaw thus appears to be in order to make is so that, when the occupancies are summed
+        #       over all symmetry-reduced kpoints and all bands, the total is equal to the number of valence electrons.
+        f_n = np.array(kpt.f_n / kpt.weight, dtype=float)
+        # NOTE: the original script accounted for symmetry multiplicity in elph
+        #       by multiplying in weight here, but we handle this after computing raman
+        #       to correctly handle matrix element conjugation
+        elph_lnn = np.array(elph_sklnn[kpt.s, kpt.k], dtype=complex)
+        mom_vnn = np.array(mom_skvnn[kpt.s, kpt.k], dtype=complex)
 
-        if kcomm.rank == 0:
-            # NOTE: The reason for this '/ weight' is because the occupancies returned by collect_occupations() for any given 'k'
-            #       lie in the interval '[0, weight]', while we want values in the interval [0, 1].
-            #
-            #       Why does gpaw scale them like this?  Well, as far as I can tell:
-            #
-            #       - The kpoint weights are chosen to sum to 2.0 when summed over symmetry-reduced kpoints.
-            #       - The 'weight' of a given ibzkpoint k is  2 x (size of k's symmetry star) / (total number of kpoints).
-            #
-            #       The purpose of the scaling by gpaw thus appears to be in order to make is so that, when the occupancies are summed
-            #       over all symmetry-reduced kpoints and all bands, the total is equal to the number of valence electrons.
-            f_n = np.array(f_n / weight, dtype=float)
-            # NOTE: the original script accounted for symmetry multiplicity in elph
-            #       by multiplying in weight here, but we handle this after computing raman
-            #       to correctly handle matrix element conjugation
-            elph_lnn = np.array(elph_klnn[k], dtype=complex)
-            mom_vnn = np.array(mom_vknn[:, k], dtype=complex)
-
-            if is_mine:
-                out.append(_InfoAtK(
-                    k_index=k,
-                    apply_sum_over_equivalent_k=get_symmetry_applying_function(k, weight),
-                    band_energy_n=E_kn[k],
-                    band_occupation_n=f_n,
-                    band_momentum_vnn=mom_vnn,
-                    band_elph_lnn=elph_lnn,
-                ))
-            else:
-                kcomm.send(elph_lnn, dest=k % kcomm.size, tag=k)
-                kcomm.send(mom_vnn, dest=k % kcomm.size, tag=nibzkpts + k)
-                kcomm.send(f_n, dest=k % kcomm.size, tag=2*nibzkpts + k)
-                kcomm.send(weight, dest=k % kcomm.size, tag=3*nibzkpts + k)
-        else:
-            if is_mine:
-                elph_lnn = np.empty((nphonons, nbands, nbands), dtype=complex)
-                mom_vnn = np.empty((3, nbands, nbands), dtype=complex)
-                f_n = np.empty(nbands, dtype=float)
-                weight = np.empty((), dtype=float)
-
-                kcomm.receive(elph_lnn, src=0, tag=k)
-                kcomm.receive(mom_vnn, src=0, tag=nibzkpts + k)
-                kcomm.receive(f_n, src=0, tag=2*nibzkpts + k)
-                kcomm.receive(weight, src=0, tag=3*nibzkpts + k)
-                out.append(_InfoAtK(
-                    k_index=k,
-                    apply_sum_over_equivalent_k=get_symmetry_applying_function(k, weight),
-                    band_energy_n=E_kn[k],
-                    band_occupation_n=f_n,
-                    band_momentum_vnn=mom_vnn,
-                    band_elph_lnn=elph_lnn,
-                ))
+        out.append(_InfoAtK(
+            kpt=kpt,
+            apply_sum_over_equivalent_k=get_symmetry_applying_function(kpt),
+            band_energy_n=E_skn[kpt.s, kpt.k],
+            band_occupation_n=f_n,
+            band_momentum_vnn=mom_vnn,
+            band_elph_lnn=elph_lnn,
+        ))
     return out
 
-def _write_raman_contributions(outpath, calc, contributions_lkptnnn: sparse.COO, terms_t: tp.List[TermId], particles_p: tp.List[ParticleType]):
+def _write_raman_contributions(outpath, calc, contributions_lksptnnn: sparse.COO, terms_t: tp.List[TermId], particles_p: tp.List[ParticleType]):
     np.savez_compressed(
         outpath,
         k_weight=calc.get_k_point_weights(),
         k_coords=calc.get_ibz_k_points(),
-        num_phonons=contributions_lkptnnn.shape[0],
-        num_ibzkpoints=contributions_lkptnnn.shape[1],
-        num_terms=contributions_lkptnnn.shape[2],
-        num_particles=contributions_lkptnnn.shape[3],
-        num_bands=contributions_lkptnnn.shape[4],
-        contrib_phonon=contributions_lkptnnn.coords[0, :],
-        contrib_band_k=contributions_lkptnnn.coords[1, :],
-        contrib_particle=contributions_lkptnnn.coords[2, :],
-        contrib_term=contributions_lkptnnn.coords[3, :],
-        contrib_band_1=contributions_lkptnnn.coords[4, :],
-        contrib_band_2=contributions_lkptnnn.coords[5, :],
-        contrib_band_3=contributions_lkptnnn.coords[6, :],
-        contrib_value=contributions_lkptnnn.data,
+        num_phonons=contributions_lksptnnn.shape[0],
+        num_ibzkpoints=contributions_lksptnnn.shape[1],
+        nun_spins=contributions_lksptnnn.shape[2],
+        num_particles=contributions_lksptnnn.shape[3],
+        num_terms=contributions_lksptnnn.shape[4],
+        num_bands=contributions_lksptnnn.shape[5],
+        contrib_phonon=contributions_lksptnnn.coords[0, :],
+        contrib_band_k=contributions_lksptnnn.coords[1, :],
+        contrib_band_spin=contributions_lksptnnn.coords[2, :],
+        contrib_particle=contributions_lksptnnn.coords[3, :],
+        contrib_term=contributions_lksptnnn.coords[4, :],
+        contrib_band_1=contributions_lksptnnn.coords[5, :],
+        contrib_band_2=contributions_lksptnnn.coords[6, :],
+        contrib_band_3=contributions_lksptnnn.coords[7, :],
+        contrib_value=contributions_lksptnnn.data,
         particle_str=particles_p,
         term_str=terms_t,
     )
 
 @dataclass
 class _InfoAtK:
-    k_index: int
+    kpt: gpaw.kpoint.KPoint
     apply_sum_over_equivalent_k: tp.Callable[[np.ndarray], np.ndarray]
     band_occupation_n: np.ndarray
     band_energy_n: np.ndarray
@@ -538,7 +357,8 @@ def _add_raman_terms_at_k(
     assert len(set(particle_types)) == len(particle_types), "duplicate particle type"
     assert not (set(particle_types) - set(PARTICLE_TYPES)), "bad particle type"
     d_i, d_o = polarizations
-    k = info_at_k.k_index
+    k = info_at_k.kpt.k
+    s = info_at_k.kpt.s
     E_el = info_at_k.band_energy_n
     f_n = info_at_k.band_occupation_n
     mom = info_at_k.band_momentum_vnn
@@ -636,9 +456,7 @@ def _add_raman_terms_at_k(
                 fac1_VC=fac1_VC,
                 fac2_nn=fac2_nn,
                 fac3_CV=fac3_CV,
-                k=k,
-                l=l,
-                w=w,
+                k=k, s=s, l=l, w=w,
                 particle_type=particle_type,
                 term_id=id,
                 conduction_indices=conduction_indices,
@@ -701,7 +519,7 @@ def _do_sum_over_bands_for_single_term(
     fac2_nn,   # not masked
     fac3_CV,   # already masked to [conduction, valence]
     # information about indices
-    k, l, w,
+    k, s, l, w,
     particle_type: ParticleType,
     term_id: TermId,
     conduction_indices,
@@ -727,7 +545,7 @@ def _do_sum_over_bands_for_single_term(
 
     # NOTE: This repeats the numerical work done by einsum but I'm not too concerned about
     #       the performance of recording contributions...
-    if output.contributions_lkptnnn_parts is not None:
+    if output.contributions_lksptnnn_parts is not None:
         assert w is None
 
         intermediate_truncate_threshold = 1e-13
@@ -767,11 +585,11 @@ def _do_sum_over_bands_for_single_term(
         # This can be done using kron with an array that has a single nonzero element.
         t = output.term_index_from_str(term_id)
         p = output.particle_index_from_str(particle_type)
-        delta_lkpt = np.zeros((output.nphonons, output.nibzkpts, output.nparticles, output.nterms))
-        delta_lkpt[l][k][p][t] = 1   # put our data at these fixed coordinates
-        output.contributions_lkptnnn_parts.append(sparse.kron(
-            delta_lkpt[:, :, :, :, None, None, None],
-            prod_nnn[None, None, None, None, :, :, :],
+        delta_lkspt = np.zeros((output.nphonons, output.nibzkpts, output.nspins, output.nparticles, output.nterms))
+        delta_lkspt[l][k][s][p][t] = 1   # put our data at these fixed coordinates
+        output.contributions_lksptnnn_parts.append(sparse.kron(
+            delta_lkspt[:, :, :, :, :, None, None, None],
+            prod_nnn[None, None, None, None, None, :, :, :],
         ))
 
 def _truncate_sparse(arr, abs=None, rel=None):
