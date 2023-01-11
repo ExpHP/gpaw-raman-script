@@ -709,7 +709,9 @@ def elph_do_raman_spectra(
                     calc=calc, w_ph=w_ph, permutations=permutations,
                     w_l=w_l, ramanname=name, d_i=d_i, d_o=d_o,
                     gamma_l=laser_broadening, phonon_sigma=phonon_broadening,
-                    mom_skvnn=mom_skvnn, elph_sklnn=elph_sklnn,
+                    # band indices in momentum file are flipped from what calculate_raman expects
+                    mom_skvnn=mom_skvnn.transpose((0, 1, 2, 4, 3)),
+                    elph_sklnn=elph_sklnn,
                     shift_step=shift_step, shift_type=shift_type,
                     write_mode_amplitudes=write_mode_amplitudes,
                     write_contributions=write_contributions,
