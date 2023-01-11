@@ -101,7 +101,7 @@ def calculate_raman(
     shift_type='stokes',
     phonon_sigma=3,
     particle_types=PARTICLE_TYPES,
-    kpoint_symmetry_bug=False,
+    kpoint_symmetry_form=False,
     write_mode_amplitudes=False,
     write_contributions=False,
 ):
@@ -163,7 +163,7 @@ def calculate_raman(
 
     parprint("Evaluating Raman sum")
 
-    for info_at_k in _distribute_bands_by_k(calc, mom_skvnn=mom_skvnn, elph_sklnn=elph_sklnn, kpoint_symmetry_bug=kpoint_symmetry_bug):
+    for info_at_k in _distribute_bands_by_k(calc, mom_skvnn=mom_skvnn, elph_sklnn=elph_sklnn, kpoint_symmetry_form=kpoint_symmetry_form):
         print(f"For (k, s) = ({info_at_k.kpt.k}, {info_at_k.kpt.s})".format(info_at_k.kpt.s))
         _add_raman_terms_at_k(output, w_l, gamma_l, (d_i, d_o), w_ph, w_scatter, info_at_k, shift_type, permutations, particle_types)
 
@@ -257,13 +257,14 @@ def _sum_sparse_coo_impl(coords_parts: tp.Iterable[np.ndarray], data_parts: tp.I
     all_data = np.concatenate(list(data_parts), axis=0)
     return sparse.COO(all_coords, all_data, shape=shape)
 
-def _distribute_bands_by_k(calc, mom_skvnn, elph_sklnn, kpoint_symmetry_bug: bool):
+def _distribute_bands_by_k(calc, mom_skvnn, elph_sklnn, kpoint_symmetry_form: bool):
     E_skn = calc.band_structure().todict()["energies"]
 
-    def get_symmetry_applying_function(kpt):
-        if kpoint_symmetry_bug:
+    def get_symmetry_data(kpt):
+        if kpoint_symmetry_form == 'mult':
             # naively account for multiplicity
-            return lambda value: value * kpt.weight
+            bad_func = lambda value: value * kpt.weight
+            do_proper_conj = False
         else:
             # elph and moment matrix elements are both conjugated under time inversion
             assert not calc.symmetry.point_group, "general point group K-symmetry not supported"
@@ -271,12 +272,22 @@ def _distribute_bands_by_k(calc, mom_skvnn, elph_sklnn, kpoint_symmetry_bug: boo
                 calc.symmetry.time_reversal
                 and not np.allclose(calc.wfs.kd.ibzk_kc[kpt.k], [0, 0, 0])
             ):
-                # FIXME: This is still not technically correct!  In the denominators there is a `+ i gamma`
-                #        which does not get conjugated at -K.  So rather than  `2 * Re(numer / denom)`
-                #        we should be doing `2 * Re(numer) / denom`.
-                return lambda tensor: 2 * tensor.real
+                if kpoint_symmetry_form == 'badconj':
+                    # Naively do tensor + tensor.conj(), which accidentally conjugates the denominator as well.
+                    bad_func = lambda tensor: 2 * tensor.real
+                    do_proper_conj = False
+                elif kpoint_symmetry_form == 'conj':
+                    # This one is handled differently.  We need a second einsum for the mirrored K.
+                    bad_func = lambda tensor: tensor
+                    do_proper_conj = True
+                else:
+                    assert False, kpoint_symmetry_form
             else:
-                return lambda tensor: tensor
+                # Point has no symmetry partner.
+                bad_func = lambda tensor: tensor
+                do_proper_conj = False
+
+        return bad_func, do_proper_conj
 
     out = []
     parprint("Distributing coupling terms")
@@ -293,14 +304,15 @@ def _distribute_bands_by_k(calc, mom_skvnn, elph_sklnn, kpoint_symmetry_bug: boo
         #       over all symmetry-reduced kpoints and all bands, the total is equal to the number of valence electrons.
         f_n = np.array(kpt.f_n / kpt.weight, dtype=float)
         # NOTE: the original script accounted for symmetry multiplicity in elph
-        #       by multiplying in weight here, but we handle this after computing raman
-        #       to correctly handle matrix element conjugation
+        #       by multiplying in weight here
         elph_lnn = np.array(elph_sklnn[kpt.s, kpt.k], dtype=complex)
         mom_vnn = np.array(mom_skvnn[kpt.s, kpt.k], dtype=complex)
 
+        apply_bad_sum_over_equivalent_k, do_proper_conj = get_symmetry_data(kpt)
         out.append(_InfoAtK(
             kpt=kpt,
-            apply_sum_over_equivalent_k=get_symmetry_applying_function(kpt),
+            apply_bad_sum_over_equivalent_k=apply_bad_sum_over_equivalent_k,
+            do_proper_conj=do_proper_conj,
             band_energy_n=E_skn[kpt.s, kpt.k],
             band_occupation_n=f_n,
             band_momentum_vnn=mom_vnn,
@@ -335,7 +347,8 @@ def _write_raman_contributions(outpath, calc, contributions_lksptnnn: sparse.COO
 @dataclass
 class _InfoAtK:
     kpt: gpaw.kpoint.KPoint
-    apply_sum_over_equivalent_k: tp.Callable[[np.ndarray], np.ndarray]
+    apply_bad_sum_over_equivalent_k: tp.Callable[[np.ndarray], np.ndarray]
+    do_proper_conj: bool
     band_occupation_n: np.ndarray
     band_energy_n: np.ndarray
     band_momentum_vnn: np.ndarray
@@ -420,26 +433,53 @@ def _add_raman_terms_at_k(
     # evaluate them at a single phonon/raman shift at a time.
     #
     # First event tensors
-    f1_in_ = lambda: mask1(occu1) * mask1(mom[d_i]) / (w_l-mask1(Ediff_el) + 1j*gamma_l)
-    f1_elph_ = lambda l: mask1(occu1) * mask1(elph[l]) / (-w_ph_eff[l]-mask1(Ediff_el) + 1j*gamma_l)
+    f1_in_ = lambda: (
+        mask1(occu1) * mask1(mom[d_i]),  # numerator
+        w_l-mask1(Ediff_el) + 1j*gamma_l,  # denominator
+    )
+    f1_elph_ = lambda l: (
+        mask1(occu1) * mask1(elph[l]),
+        -w_ph_eff[l]-mask1(Ediff_el) + 1j*gamma_l,
+    )
     f1_out_ = {
-        'original': lambda w: mask1(occu1) * mask1(mom[d_o]) / (-get_w_s(w=w)-mask1(Ediff_el) + 1j*gamma_l),
-        'fast': lambda l: mask1(occu1) * mask1(mom[d_o]) / (-get_w_s(l=l)-mask1(Ediff_el) + 1j*gamma_l),
+        'original': lambda w: (
+            mask1(occu1) * mask1(mom[d_o]),
+            -get_w_s(w=w)-mask1(Ediff_el) + 1j*gamma_l,
+        ),
+        'fast': lambda l: (
+            mask1(occu1) * mask1(mom[d_o]),
+            -get_w_s(l=l)-mask1(Ediff_el) + 1j*gamma_l,
+        ),
         None: cannot_compute,
     }[permutations]
 
     # Third event tensors
     f3_in_ = {
-        'original': lambda w, l: mask3(occu3) * mask3(mom[d_i]) / (-get_w_s(w=w)-w_ph_eff[l]-mask3(Ediff_el.T) + 1j*gamma_l),
-        'fast': lambda l: mask3(occu3) * mask3(mom[d_i]) / (-w_l-mask3(Ediff_el.T) + 1j*gamma_l),
+        'original': lambda w, l: (
+            mask3(occu3) * mask3(mom[d_i]),
+            -get_w_s(w=w)-w_ph_eff[l]-mask3(Ediff_el.T) + 1j*gamma_l,
+        ),
+        'fast': lambda l: (
+            mask3(occu3) * mask3(mom[d_i]),
+            -w_l-mask3(Ediff_el.T) + 1j*gamma_l,
+        ),
         None: cannot_compute,
     }[permutations]
     f3_elph_ = {
-        'original': lambda w, l: mask3(occu3) * mask3(elph[l]) / (w_l-get_w_s(w=w)-mask3(Ediff_el.T) + 1j*gamma_l),
-        'fast': lambda l: mask3(occu3) * mask3(elph[l]) / (w_ph_eff[l]-mask3(Ediff_el.T) + 1j*gamma_l),
+        'original': lambda w, l: (
+            mask3(occu3) * mask3(elph[l]),
+            w_l-get_w_s(w=w)-mask3(Ediff_el.T) + 1j*gamma_l,
+        ),
+        'fast': lambda l: (
+            mask3(occu3) * mask3(elph[l]),
+            w_ph_eff[l]-mask3(Ediff_el.T) + 1j*gamma_l,
+        ),
         None: cannot_compute,
     }[permutations]
-    f3_out_ = lambda l: mask3(occu3) * mask3(mom[d_o]) / (w_l-w_ph_eff[l]-mask3(Ediff_el.T) + 1j*gamma_l)
+    f3_out_ = lambda l: (
+        mask3(occu3) * mask3(mom[d_o]),
+        w_l-w_ph_eff[l]-mask3(Ediff_el.T) + 1j*gamma_l,
+    )
 
     # Second event tensors
     #
@@ -449,19 +489,20 @@ def _add_raman_terms_at_k(
     f2_elph_ = lambda l: elph[l]
     f2_out_ = lambda: mom[d_o]
 
-    def add_term(fac1_VC, fac2_nn, fac3_CV, l, w, id):
+    def add_term(tuple1_VC, fac2_nn, tuple3_CV, l, w, id):
         for particle_type in particle_types:
             _do_sum_over_bands_for_single_term(
                 output,
-                fac1_VC=fac1_VC,
+                tuple1_VC=tuple1_VC,
                 fac2_nn=fac2_nn,
-                fac3_CV=fac3_CV,
+                tuple3_CV=tuple3_CV,
                 k=k, s=s, l=l, w=w,
                 particle_type=particle_type,
                 term_id=id,
                 conduction_indices=conduction_indices,
                 valence_indices=valence_indices,
-                apply_sum_over_equivalent_k=info_at_k.apply_sum_over_equivalent_k,
+                apply_bad_sum_over_equivalent_k=info_at_k.apply_bad_sum_over_equivalent_k,
+                do_proper_conj=info_at_k.do_proper_conj,
             )
 
     # Some of these factors don't depend on anything and can be evaluated right now.
@@ -515,31 +556,45 @@ def _add_raman_terms_at_k(
 def _do_sum_over_bands_for_single_term(
     output: RamanOutput,
     # the three factors to be multiplied
-    fac1_VC,   # already masked to [valence, conduction]
+    tuple1_VC,   # tuple of (numer, denom), already masked to [valence, conduction]
     fac2_nn,   # not masked
-    fac3_CV,   # already masked to [conduction, valence]
+    tuple3_CV,   # tuple of (numer, denom), already masked to [conduction, valence]
     # information about indices
     k, s, l, w,
     particle_type: ParticleType,
     term_id: TermId,
     conduction_indices,
     valence_indices,
-    apply_sum_over_equivalent_k: tp.Callable[[np.ndarray], np.ndarray]
+    apply_bad_sum_over_equivalent_k,
+    do_proper_conj: bool,
 ):
     # For terms that don't depend on w, broadcast onto the w axis
     w_eff = slice(None) if w is None else w
 
+    numer1_VC, denom1_VC = tuple1_VC
+    numer3_CV, denom3_CV = tuple3_CV
+
     # Here's the main thing we care about.
     if particle_type == 'electron':
         fac2_CC = fac2_nn[conduction_indices][:, conduction_indices]
-        output.raman_lw[l, w_eff] += apply_sum_over_equivalent_k(
-            np.einsum('si,ij,js->', fac1_VC, fac2_CC, fac3_CV)
+        # FIXME Good god how do we factor out this logic
+        output.raman_lw[l, w_eff] += apply_bad_sum_over_equivalent_k(
+            np.einsum('si,ij,js->', numer1_VC / denom1_VC, fac2_CC, numer3_CV / denom3_CV)
         )
+        # FIXME good god how to factor out this logic
+        if do_proper_conj:
+            output.raman_lw[l, w_eff] += (
+                np.einsum('si,ij,js->', numer1_VC.conj() / denom1_VC, fac2_CC, numer3_CV.conj() / denom3_CV)
+            )
     elif particle_type == 'hole':
         fac2_VV = fac2_nn[valence_indices][:, valence_indices]
-        output.raman_lw[l, w_eff] -= apply_sum_over_equivalent_k(
-            np.einsum('si,ts,it->', fac1_VC, fac2_VV, fac3_CV)
+        output.raman_lw[l, w_eff] -= apply_bad_sum_over_equivalent_k(
+            np.einsum('si,ts,it->', numer1_VC / denom1_VC, fac2_VV, numer3_CV / denom3_CV)
         )
+        if do_proper_conj:
+            output.raman_lw[l, w_eff] -= (
+                np.einsum('si,ts,it->', numer1_VC.conj() / denom1_VC, fac2_VV, numer3_CV.conj() / denom3_CV)
+            )
     else:
         assert False, particle_type
 
@@ -565,21 +620,30 @@ def _do_sum_over_bands_for_single_term(
 
         if particle_type == 'electron':
             # make product whose indices are:   valence conduction1 conduction2
-            sparse1_nn = sparsify_factor(fac1_VC, valence_indices, conduction_indices)
+            sparse1_nn = sparsify_factor(numer1_VC / denom1_VC, valence_indices, conduction_indices)
             sparse2_nn = sparsify_factor(fac2_CC, conduction_indices, conduction_indices)
-            sparse3_nn = sparsify_factor(fac3_CV, conduction_indices, valence_indices)
+            sparse3_nn = sparsify_factor(numer3_CV / denom3_CV, conduction_indices, valence_indices)
+
             prod_nnn = sparse1_nn[:, :, None] * sparse2_nn[None, :, :] * sparse3_nn.T[:, None, :]
+            if do_proper_conj:
+                sparse1B_nn = sparsify_factor(numer1_VC.conj() / denom1_VC, valence_indices, conduction_indices)
+                sparse3B_nn = sparsify_factor(numer3_CV.conj() / denom3_CV, conduction_indices, valence_indices)
+                prod_nnn += sparse1B_nn[:, :, None] * sparse2_nn[None, :, :] * sparse3B_nn.T[:, None, :]
         elif particle_type == 'hole':
             # make product whose indices are:   valence1 conduction valence2
-            sparse1_nn = sparsify_factor(fac1_VC, valence_indices, conduction_indices)
+            sparse1_nn = sparsify_factor(numer1_VC / denom1_VC, valence_indices, conduction_indices)
             sparse2_nn = sparsify_factor(fac2_VV, valence_indices, valence_indices)
-            sparse3_nn = sparsify_factor(fac3_CV, conduction_indices, valence_indices)
+            sparse3_nn = sparsify_factor(numer3_CV / denom3_CV, conduction_indices, valence_indices)
             prod_nnn = -1 * sparse1_nn[:, :, None] * sparse2_nn.T[:, None, :] * sparse3_nn[None, :, :]
+            if do_proper_conj:
+                sparse1B_nn = sparsify_factor(numer1_VC.conj() / denom1_VC, valence_indices, conduction_indices)
+                sparse3B_nn = sparsify_factor(numer3_CV.conj() / denom3_CV, conduction_indices, valence_indices)
+                prod_nnn -= sparse1B_nn[:, :, None] * sparse2_nn.T[:, None, :] * sparse3B_nn[None, :, :]
         else:
             assert False, particle_type
         prod_nnn = prod_nnn.tocoo()
         prod_nnn = _truncate_sparse(prod_nnn, rel=intermediate_truncate_threshold)
-        prod_nnn = apply_sum_over_equivalent_k(prod_nnn)
+        prod_nnn = apply_bad_sum_over_equivalent_k(prod_nnn)
 
         # Add in the remaining axes by prepending constant indices.
         # This can be done using kron with an array that has a single nonzero element.

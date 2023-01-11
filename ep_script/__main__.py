@@ -98,16 +98,14 @@ def main():
             " nonresonant terms but is SIGNIFICANTLY slower than the default setting as it expresses some terms"
             " as a function of the raman shift.")
         g.add_argument('--no-permutations', dest='permutations', action='store_const', const='none', help='alias for --permutations=none')
-        g.add_argument('--kpoint-symmetry-bug', action='store_true', help=
+        g.add_argument('--kpoint-symmetry-bug', action='store_const', dest='kpoint_symmetry_form', const='mult', help=
             "Simulate a bug in old versions of the script that did not correctly "
             "account for complex conjugation of matrix elements under time-inversion symmetry "
-            "when computing raman intensities. "
-            "The new behavior is consistent with the implementation in GPAW.")
-        g.add_argument('--kpoint-symmetry-form', action='store_true', help=
+            "when computing raman intensities.")
+        g.set_defaults(kpoint_symmetry_form='conj')
+        g.add_argument('--kpoint-symmetry-form', choices=['badconj', 'conj', 'mult'], help=
             "Simulate older versions of the script that handled kpoint symmetry "
-            "differently. for complex conjugation of matrix elements under time-inversion symmetry "
-            "when computing raman intensities. "
-            "The new behavior is consistent with the implementation in GPAW.")
+            "differently.")
         DEFAULT_LASER_FREQS = '488,532,633nm'
         g.add_argument('--laser-freqs',
             type=parse_laser_freqs, default=parse_laser_freqs(DEFAULT_LASER_FREQS), help=
@@ -136,7 +134,7 @@ def main():
             write_plots=args.write_spectrum_plots,
             write_contributions=args.write_contributions,
             shift_type=args.shift_type,
-            kpoint_symmetry_bug=args.kpoint_symmetry_bug,
+            kpoint_symmetry_form=args.kpoint_symmetry_form,
             particle_types=args.particles,
         )
 
@@ -675,7 +673,7 @@ def elph_do_raman_spectra(
         write_mode_amplitudes,
         write_plots,
         write_contributions,
-        kpoint_symmetry_bug,
+        kpoint_symmetry_form,
         particle_types,
         phononname,
 ):
@@ -716,7 +714,7 @@ def elph_do_raman_spectra(
                     write_mode_amplitudes=write_mode_amplitudes,
                     write_contributions=write_contributions,
                     particle_types=particle_types,
-                    kpoint_symmetry_bug=kpoint_symmetry_bug,
+                    kpoint_symmetry_form=kpoint_symmetry_form,
                 )
 
             # And plotted
