@@ -327,7 +327,7 @@ def _write_raman_contributions(outpath, calc, contributions_lksptnnn: sparse.COO
         k_coords=calc.get_ibz_k_points(),
         num_phonons=contributions_lksptnnn.shape[0],
         num_ibzkpoints=contributions_lksptnnn.shape[1],
-        nun_spins=contributions_lksptnnn.shape[2],
+        num_spins=contributions_lksptnnn.shape[2],
         num_particles=contributions_lksptnnn.shape[3],
         num_terms=contributions_lksptnnn.shape[4],
         num_bands=contributions_lksptnnn.shape[5],
