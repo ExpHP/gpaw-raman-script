@@ -187,7 +187,7 @@ def calculate_raman(
                     "ModeA_l{}.npy".format(make_suffix(ramanname)),
                     output.raman_lw[:, 0],
                 )
-        world.barrier()
+    world.barrier()
 
     if contributions_lksptnnn is not None:
         if world.rank == 0:
@@ -198,7 +198,7 @@ def calculate_raman(
                 output.terms_t,
                 particles_p=output.particles_p,
             )
-        world.barrier()
+    world.barrier()
 
     RI = np.zeros(len(w_shift))
     for l in range(nphonons):
